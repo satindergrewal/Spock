@@ -93,6 +93,32 @@ def map_model(model):
     return DEFAULT_MODEL
 
 
+def is_reasoning_model(model):
+    """xAI rejects stop / presence_penalty / frequency_penalty on reasoning models."""
+    m = (strip_ctx_suffix(model) or "").lower()
+    if not m:
+        return False
+    if m in ("grok-4.5", "grok-4.3"):
+        return True
+    if "reasoning" in m or "multi-agent" in m:
+        return True
+    # Default main model is grok-4.5 (reasoning). Treat unknown mapped targets
+    # the same when they equal DEFAULT_MODEL.
+    if m == (strip_ctx_suffix(DEFAULT_MODEL) or "").lower():
+        return True
+    return False
+
+
+def sanitize_upstream(req):
+    """Drop OpenAI params that xAI rejects for the selected model."""
+    model = req.get("model")
+    if is_reasoning_model(model):
+        req.pop("stop", None)
+        req.pop("presence_penalty", None)
+        req.pop("frequency_penalty", None)
+    return req
+
+
 def model_card(model_id, owned_by="spox"):
     return {
         "id": model_id,
@@ -270,7 +296,10 @@ def anthropic_to_openai(a):
     for key in ("temperature", "top_p"):
         if key in a:
             req[key] = a[key]
-    if a.get("stop_sequences"):
+    # Anthropic stop_sequences → OpenAI stop. xAI reasoning models (grok-4.5
+    # etc.) 400 on `stop` — Auto Mode's classifier always sends stop sequences
+    # for XML tags, which is why Auto Mode failed closed through SpoX.
+    if a.get("stop_sequences") and not is_reasoning_model(req["model"]):
         req["stop"] = a["stop_sequences"]
     if a.get("tools"):
         req["tools"] = [
@@ -293,16 +322,37 @@ def anthropic_to_openai(a):
     effort = thinking_effort(a)
     if effort is not None:
         req["reasoning_effort"] = effort
-    return req
+    return sanitize_upstream(req)
 
 
-def openai_to_anthropic(o, req_model):
+def wants_thinking(a):
+    """Whether to surface Grok reasoning as Anthropic thinking blocks.
+
+    - Explicit thinking.type=enabled/adaptive → yes
+    - Explicit thinking.type=disabled → no
+    - Auto Mode classifier always sends stop_sequences (XML tags like
+      </block>); suppress thinking there so plain-text XML parses cleanly
+    - Otherwise default ON so the Claude Code UI can show reasoning
+    """
+    t = a.get("thinking") if isinstance(a, dict) else None
+    if isinstance(t, dict):
+        kind = t.get("type")
+        if kind in (None, "disabled"):
+            return False
+        if kind in ("enabled", "adaptive"):
+            return True
+    if a.get("stop_sequences"):
+        return False
+    return True
+
+
+def openai_to_anthropic(o, req_model, include_thinking=True):
     choice = (o.get("choices") or [{}])[0]
     msg = choice.get("message", {})
     content = []
     # Anthropic order: thinking → text → tool_use
     reasoning = msg.get("reasoning_content")
-    if reasoning:
+    if include_thinking and reasoning:
         content.append({"type": "thinking", "thinking": reasoning})
     if msg.get("content"):
         content.append({"type": "text", "text": msg["content"]})
@@ -448,6 +498,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_openai(self, body):
         body["model"] = map_model(body.get("model"))
+        sanitize_upstream(body)
         resp = upstream(body, stream=bool(body.get("stream")))
         if body.get("stream"):
             self.send_response(200)
@@ -466,9 +517,10 @@ class Handler(BaseHTTPRequestHandler):
     def handle_messages(self, a):
         oai = anthropic_to_openai(a)
         req_model = a.get("model", DEFAULT_MODEL)
+        include_thinking = wants_thinking(a)
         if not a.get("stream"):
             o = json.loads(upstream(oai).read())
-            return self._json(200, openai_to_anthropic(o, req_model))
+            return self._json(200, openai_to_anthropic(o, req_model, include_thinking))
 
         oai["stream"] = True
         resp = upstream(oai, stream=True)
@@ -497,7 +549,8 @@ class Handler(BaseHTTPRequestHandler):
                 finish = choice["finish_reason"]
 
             # xAI streams reasoning first as delta.reasoning_content, then content.
-            reasoning = delta.get("reasoning_content")
+            # Only emit Anthropic thinking blocks when the client enabled thinking.
+            reasoning = delta.get("reasoning_content") if include_thinking else None
             if reasoning:
                 if block != "thinking":
                     if block:

@@ -152,16 +152,24 @@ math uses `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
 
 ### Auto Mode (permission classifier)
 
-Claude Code Auto Mode classifies tool calls with a fixed model id
-(`claude-opus-4-8` and friends). Through SpoX:
+Claude Code Auto Mode classifies tool calls (often with `stop_sequences` for
+XML tags like `</block>`). Through SpoX:
 
-1. `GET /v1/models` / `GET /v1/models/{id}` advertise those ids as available
-   (synthetic aliases → Grok under the hood).
+1. `GET /v1/models` / `GET /v1/models/{id}` advertise Claude aliases so the
+   client does not treat the classifier model as missing.
 2. `POST /v1/messages` maps any non-`grok*` / non-`*haiku*` id to `GROK_MODEL`.
+3. **Critical:** xAI reasoning models (`grok-4.5`, `grok-4.3`, …) **reject**
+   OpenAI `stop` / `presence_penalty` / `frequency_penalty`. SpoX drops those
+   before upstream. Without that drop you get:
+   `400 Model grok-4.5 does not support parameter stop` → Auto Mode fails
+   closed with "`… is temporarily unavailable, so auto mode cannot determine
+   the safety of Bash`".
 
-If Auto Mode still says the model is "temporarily unavailable", restart the
-proxy after upgrading and start a **new** Claude Code session so it re-fetches
-the model list.
+Ollama / llama.cpp accept `stop`, which is why the same Auto Mode path worked
+there and not here until this strip was added.
+
+If Auto Mode still fails after upgrading, restart the proxy and start a
+**new** Claude Code session.
 
 ## Endpoints
 
@@ -207,9 +215,11 @@ GROK_MODEL=grok-4.5 GROK_SMALL_MODEL=grok-4.3-mini python3 grok_proxy.py
 
 ## Limitations
 
-- Grok `reasoning_content` is mapped to Anthropic `thinking` blocks (stream +
-  non-stream). Inbound thinking is re-sent as `reasoning_content`; Anthropic
-  `thinking.budget_tokens` maps to xAI `reasoning_effort` when present.
+- Grok `reasoning_content` maps to Anthropic `thinking` blocks only when the
+  client enables `thinking` (stream + non-stream). Auto Mode classifier calls
+  do not enable it, so they get plain text. Inbound thinking is re-sent as
+  `reasoning_content`; `thinking.budget_tokens` maps to xAI `reasoning_effort`.
+  `stop_sequences` are dropped for reasoning models (xAI rejects `stop`).
   `cache_control` is dropped; `count_tokens` is an estimate.
 - The Batch, Files, and Admin APIs are not implemented (Claude Code doesn't
   use them).
