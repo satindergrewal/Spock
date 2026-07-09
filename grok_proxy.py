@@ -24,9 +24,11 @@ XAI_API_BASE (upstream, for testing), XAI_TOKEN (skip OAuth, e.g. API key).
 
 import json
 import os
+import re
 import shutil
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,6 +41,26 @@ DEFAULT_MODEL = os.environ.get("GROK_MODEL", "grok-4.5")
 SMALL_MODEL = os.environ.get("GROK_SMALL_MODEL", DEFAULT_MODEL)
 
 STOP_MAP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+# Claude Code appends [1m]/[200k]/[500k] etc. as a context-window hint — not an
+# xAI model id. Strip before upstream; keep the original id in Anthropic responses.
+CTX_SUFFIX_RE = re.compile(r"\[[^\]]*\]$")
+
+# IDs Claude Code / Auto Mode may request. Listed on GET /v1/models so the client
+# does not treat them as "temporarily unavailable" when ANTHROPIC_BASE_URL is us.
+CLAUDE_ALIASES = (
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5-20251001",
+    "claude-haiku-4-5",
+    "claude-fable-5",
+    "claude-3-5-haiku-20241022",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-7-sonnet-20250219",
+)
 
 _token = {"value": None, "until": 0}
 
@@ -55,12 +77,55 @@ def token():
     return _token["value"]
 
 
-def map_model(model):
-    if model and model.startswith("grok"):
+def strip_ctx_suffix(model):
+    """Remove Claude Code context hints like [1m] / [1] / [500k]."""
+    if not model:
         return model
-    if model and "haiku" in model:
+    return CTX_SUFFIX_RE.sub("", model).strip() or model
+
+
+def map_model(model):
+    base = strip_ctx_suffix(model)
+    if base and base.startswith("grok"):
+        return base
+    if base and "haiku" in base:
         return SMALL_MODEL
     return DEFAULT_MODEL
+
+
+def model_card(model_id, owned_by="spox"):
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": owned_by,
+        # Claude Code uses this for Auto Mode / model picker availability.
+        "display_name": model_id,
+        "type": "model",
+    }
+
+
+def alias_models():
+    """Synthetic entries so Claude Code sees its usual model names as available."""
+    out = []
+    seen = set()
+    # Context-window flavoured ids (client-side only; stripped before xAI).
+    for mid in (DEFAULT_MODEL, SMALL_MODEL):
+        if not mid:
+            continue
+        for cand in (mid, f"{mid}[1m]", f"{mid}[500k]"):
+            if cand not in seen:
+                seen.add(cand)
+                out.append(model_card(cand, owned_by="xai"))
+    for mid in CLAUDE_ALIASES:
+        if mid not in seen:
+            seen.add(mid)
+            out.append(model_card(mid, owned_by="spox-alias"))
+        tagged = f"{mid}[1m]"
+        if tagged not in seen:
+            seen.add(tagged)
+            out.append(model_card(tagged, owned_by="spox-alias"))
+    return out
 
 
 class UpstreamError(Exception):
@@ -121,6 +186,26 @@ def blocks_text(content):
     return "\n".join(parts)
 
 
+def thinking_effort(a):
+    """Map Anthropic thinking config → xAI reasoning_effort, if any."""
+    t = a.get("thinking")
+    if not isinstance(t, dict):
+        return None
+    kind = t.get("type")
+    if kind in (None, "disabled"):
+        return "none"
+    if kind not in ("enabled", "adaptive"):
+        return None
+    budget = t.get("budget_tokens")
+    if not isinstance(budget, int):
+        return "high"
+    if budget < 5000:
+        return "low"
+    if budget < 15000:
+        return "medium"
+    return "high"
+
+
 def anthropic_to_openai(a):
     msgs = []
     system = blocks_text(a.get("system"))
@@ -132,7 +217,7 @@ def anthropic_to_openai(a):
         if isinstance(content, str):
             msgs.append({"role": role, "content": content})
             continue
-        texts, images, tool_calls, tool_results = [], [], [], []
+        texts, images, tool_calls, tool_results, reasoning = [], [], [], [], []
         for b in content or []:
             kind = b.get("type")
             if kind == "text":
@@ -158,15 +243,21 @@ def anthropic_to_openai(a):
                 tool_results.append({"role": "tool",
                                      "tool_call_id": b.get("tool_use_id", ""),
                                      "content": text})
-            # thinking / redacted_thinking blocks are dropped
+            elif kind == "thinking":
+                # Round-trip prior thinking as xAI reasoning_content.
+                if b.get("thinking"):
+                    reasoning.append(b["thinking"])
+            # redacted_thinking has no recoverable text — skip
 
         msgs.extend(tool_results)
         text = "\n".join(texts)
         if role == "assistant":
-            if text or tool_calls:
+            if text or tool_calls or reasoning:
                 msg = {"role": "assistant", "content": text or None}
                 if tool_calls:
                     msg["tool_calls"] = tool_calls
+                if reasoning:
+                    msg["reasoning_content"] = "\n".join(reasoning)
                 msgs.append(msg)
         elif images:
             parts = ([{"type": "text", "text": text}] if text else []) + images
@@ -199,6 +290,9 @@ def anthropic_to_openai(a):
         req["tool_choice"] = "none"
     elif kind == "auto":
         req["tool_choice"] = "auto"
+    effort = thinking_effort(a)
+    if effort is not None:
+        req["reasoning_effort"] = effort
     return req
 
 
@@ -206,6 +300,10 @@ def openai_to_anthropic(o, req_model):
     choice = (o.get("choices") or [{}])[0]
     msg = choice.get("message", {})
     content = []
+    # Anthropic order: thinking → text → tool_use
+    reasoning = msg.get("reasoning_content")
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning})
     if msg.get("content"):
         content.append({"type": "text", "text": msg["content"]})
     for tc in msg.get("tool_calls") or []:
@@ -218,6 +316,11 @@ def openai_to_anthropic(o, req_model):
                         "id": tc.get("id") or "toolu_" + uuid.uuid4().hex[:12],
                         "name": fn.get("name", ""), "input": args})
     usage = o.get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
+    out = usage.get("completion_tokens", 0)
+    # Prefer total completion tokens; reasoning is already inside that count on xAI.
+    if not out and details.get("reasoning_tokens"):
+        out = details["reasoning_tokens"]
     return {
         "id": o.get("id") or "msg_" + uuid.uuid4().hex[:16],
         "type": "message",
@@ -227,7 +330,7 @@ def openai_to_anthropic(o, req_model):
         "stop_reason": STOP_MAP.get(choice.get("finish_reason"), "end_turn"),
         "stop_sequence": None,
         "usage": {"input_tokens": usage.get("prompt_tokens", 0),
-                  "output_tokens": usage.get("completion_tokens", 0)},
+                  "output_tokens": out},
     }
 
 
@@ -249,12 +352,57 @@ class Handler(BaseHTTPRequestHandler):
         self._json(status, {"type": "error",
                             "error": {"type": err_type, "message": message}})
 
+    def handle_models(self, path):
+        """Serve /v1/models[/{id}] with xAI list + Claude/Grok aliases.
+
+        Auto Mode asks for claude-opus-4-8 (and friends). Messages already map
+        those to Grok, but a 404 on GET /v1/models/{id} makes Claude Code treat
+        the classifier model as 'temporarily unavailable'.
+        """
+        rest = path[len("/v1/models"):].lstrip("/")
+        model_id = urllib.parse.unquote(rest) if rest else ""
+
+        if model_id:
+            # Prefer a synthetic card for anything we can map; only hit xAI for
+            # bare upstream ids so aliases never 404.
+            upstream_id = map_model(model_id)
+            try:
+                data = upstream_request(f"/models/{urllib.parse.quote(upstream_id, safe='')}").read()
+                card = json.loads(data)
+                # Echo the id the client asked for (incl. [1m] / claude-*).
+                if isinstance(card, dict):
+                    card = dict(card)
+                    card["id"] = model_id
+                    if "display_name" not in card:
+                        card["display_name"] = model_id
+                return self._json(200, card)
+            except UpstreamError:
+                return self._json(200, model_card(model_id))
+
+        # List: xAI models + our aliases (dedup by id, aliases win display).
+        try:
+            raw = json.loads(upstream_request("/models").read())
+        except UpstreamError as e:
+            # Still advertise aliases so Auto Mode has something to resolve.
+            raw = {"object": "list", "data": []}
+            detail = e.body.get("error", e.body) if isinstance(e.body, dict) else e.body
+            print(f"  models upstream failed: {detail}")
+        data = list(raw.get("data") or [])
+        by_id = {m.get("id"): m for m in data if isinstance(m, dict) and m.get("id")}
+        for card in alias_models():
+            by_id[card["id"]] = card
+        raw["object"] = raw.get("object") or "list"
+        raw["data"] = list(by_id.values())
+        return self._json(200, raw)
+
     def do_GET(self):
         path = self.path.split("?")[0]
         try:
             if path in ("/", "/health"):
                 self._json(200, {"status": "ok", "backend": API_BASE, "model": DEFAULT_MODEL})
-            elif path.startswith(("/v1/models", "/v1/language-models")):
+            elif path == "/v1/models" or path.startswith("/v1/models/"):
+                self.handle_models(path)
+            elif path.startswith("/v1/language-models"):
                 data = upstream_request(path[len("/v1"):]).read()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -348,6 +496,19 @@ class Handler(BaseHTTPRequestHandler):
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
 
+            # xAI streams reasoning first as delta.reasoning_content, then content.
+            reasoning = delta.get("reasoning_content")
+            if reasoning:
+                if block != "thinking":
+                    if block:
+                        emit("content_block_stop", {"type": "content_block_stop", "index": index})
+                    index, block = index + 1, "thinking"
+                    emit("content_block_start", {"type": "content_block_start", "index": index,
+                                                 "content_block": {"type": "thinking", "thinking": ""}})
+                emit("content_block_delta", {"type": "content_block_delta", "index": index,
+                                             "delta": {"type": "thinking_delta", "thinking": reasoning}})
+                chunks_out += 1
+
             if delta.get("content"):
                 if block != "text":
                     if block:
@@ -377,10 +538,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if block:
             emit("content_block_stop", {"type": "content_block_stop", "index": index})
+        out_tokens = usage.get("completion_tokens", chunks_out)
         emit("message_delta", {"type": "message_delta",
                                "delta": {"stop_reason": STOP_MAP.get(finish, "end_turn"),
                                          "stop_sequence": None},
-                               "usage": {"output_tokens": usage.get("completion_tokens", chunks_out)}})
+                               "usage": {"output_tokens": out_tokens}})
         emit("message_stop", {"type": "message_stop"})
 
 

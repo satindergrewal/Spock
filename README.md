@@ -71,18 +71,32 @@ curl -s http://localhost:8048/v1/language-models | jq   # pricing + capabilities
 ### CLI
 
 ```bash
-./claude-grok.sh          # starts the proxy if needed, then launches claude
+./claude-grok.sh          # starts the proxy if needed, then launches claude on Grok
 ```
 
-`claude-grok.sh` passes any arguments straight to `claude` and sets the compact
-window (see [Context window](#context-window-500k) below). Manual equivalent:
+`claude-grok.sh` starts the proxy if needed, forces the model to
+`grok-4.5[1m]` (override with `GROK_MODEL_ID` or `ANTHROPIC_MODEL`), and sets
+the compact window (see [Context window](#context-window-500k) below). Extra
+args are passed through to `claude`. Manual equivalent:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8048
 export ANTHROPIC_AUTH_TOKEN=dummy   # required by clients, ignored by the proxy
+export ANTHROPIC_MODEL=grok-4.5[1m]
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000
-claude
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90
+claude --model "$ANTHROPIC_MODEL"
 ```
+
+On launch it prints a one-liner so you can confirm routing:
+
+```text
+SpoX → http://localhost:8048  model=grok-4.5[1m]  compact=500000@90%
+```
+
+If the UI still shows `fable`/`opus`/`sonnet`, the model was not overridden —
+use `./claude-grok.sh` (or pass `--model grok-4.5[1m]`) rather than bare
+`claude` after exporting only the base URL.
 
 ### VSCodium / VS Code extension
 
@@ -128,9 +142,26 @@ Recommended:
 - `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000` so compact math uses 500k
 - Optional: `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90` → fire at ~450k (headroom)
 
+The proxy **strips** Claude's `[1m]` / `[1]` / `[500k]` suffix before calling
+xAI (those tags are client-side context hints, not real model ids). Without
+that strip you get `400 Model not found: grok-4.5[1m]`.
+
 Keep auto-compact enabled (default). Do not set `DISABLE_AUTO_COMPACT`.
 Status-line `% used` still reflects the full assumed window; only compaction
 math uses `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+
+### Auto Mode (permission classifier)
+
+Claude Code Auto Mode classifies tool calls with a fixed model id
+(`claude-opus-4-8` and friends). Through SpoX:
+
+1. `GET /v1/models` / `GET /v1/models/{id}` advertise those ids as available
+   (synthetic aliases → Grok under the hood).
+2. `POST /v1/messages` maps any non-`grok*` / non-`*haiku*` id to `GROK_MODEL`.
+
+If Auto Mode still says the model is "temporarily unavailable", restart the
+proxy after upgrading and start a **new** Claude Code session so it re-fetches
+the model list.
 
 ## Endpoints
 
@@ -146,10 +177,15 @@ math uses `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
 
 ## Model mapping
 
-- Model names starting with `grok` pass through unchanged.
-- Names containing `haiku` (Claude Code's cheap background calls) map to
-  `GROK_SMALL_MODEL`.
-- Everything else (`claude-sonnet-5`, etc.) maps to `GROK_MODEL`.
+- Claude Code context suffixes (`[1m]`, `[1]`, `[500k]`, …) are stripped before
+  the upstream call. Client-facing `model` in responses keeps the original id.
+- Bare names starting with `grok` pass through to xAI.
+- Names containing `haiku` (Claude Code's cheap background / Auto Mode helper
+  calls) map to `GROK_SMALL_MODEL`.
+- Everything else (`claude-opus-4-8`, `claude-sonnet-5`, `fable`, …) maps to
+  `GROK_MODEL`.
+- `GET /v1/models` merges the live xAI list with synthetic Claude/Grok aliases
+  so Auto Mode and the model picker do not 404.
 
 ## Configuration (env vars)
 
@@ -171,8 +207,10 @@ GROK_MODEL=grok-4.5 GROK_SMALL_MODEL=grok-4.3-mini python3 grok_proxy.py
 
 ## Limitations
 
-- Anthropic-only features are ignored gracefully: `thinking` blocks and
-  `cache_control` are dropped, `count_tokens` is an estimate.
+- Grok `reasoning_content` is mapped to Anthropic `thinking` blocks (stream +
+  non-stream). Inbound thinking is re-sent as `reasoning_content`; Anthropic
+  `thinking.budget_tokens` maps to xAI `reasoning_effort` when present.
+  `cache_control` is dropped; `count_tokens` is an estimate.
 - The Batch, Files, and Admin APIs are not implemented (Claude Code doesn't
   use them).
 - The proxy binds to `127.0.0.1` only — it is not meant to be exposed to a
