@@ -119,7 +119,7 @@ def sanitize_upstream(req):
     return req
 
 
-def model_card(model_id, owned_by="spox"):
+def model_card(model_id, owned_by="spock"):
     return {
         "id": model_id,
         "object": "model",
@@ -146,11 +146,11 @@ def alias_models():
     for mid in CLAUDE_ALIASES:
         if mid not in seen:
             seen.add(mid)
-            out.append(model_card(mid, owned_by="spox-alias"))
+            out.append(model_card(mid, owned_by="spock-alias"))
         tagged = f"{mid}[1m]"
         if tagged not in seen:
             seen.add(tagged)
-            out.append(model_card(tagged, owned_by="spox-alias"))
+            out.append(model_card(tagged, owned_by="spock-alias"))
     return out
 
 
@@ -298,7 +298,7 @@ def anthropic_to_openai(a):
             req[key] = a[key]
     # Anthropic stop_sequences → OpenAI stop. xAI reasoning models (grok-4.5
     # etc.) 400 on `stop` — Auto Mode's classifier always sends stop sequences
-    # for XML tags, which is why Auto Mode failed closed through SpoX.
+    # for XML tags, which is why Auto Mode failed closed through Spock.
     if a.get("stop_sequences") and not is_reasoning_model(req["model"]):
         req["stop"] = a["stop_sequences"]
     if a.get("tools"):

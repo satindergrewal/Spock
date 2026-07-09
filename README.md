@@ -91,7 +91,7 @@ claude --model "$ANTHROPIC_MODEL"
 On launch it prints a one-liner so you can confirm routing:
 
 ```text
-SpoX → http://localhost:8048  model=grok-4.5[1m]  compact=500000@90%
+Spock → http://localhost:8048  model=grok-4.5[1m]  compact=500000@90%
 ```
 
 If the UI still shows `fable`/`opus`/`sonnet`, the model was not overridden —
@@ -153,13 +153,13 @@ math uses `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
 ### Auto Mode (permission classifier)
 
 Claude Code Auto Mode classifies tool calls (often with `stop_sequences` for
-XML tags like `</block>`). Through SpoX:
+XML tags like `</block>`). Through Spock:
 
 1. `GET /v1/models` / `GET /v1/models/{id}` advertise Claude aliases so the
    client does not treat the classifier model as missing.
 2. `POST /v1/messages` maps any non-`grok*` / non-`*haiku*` id to `GROK_MODEL`.
 3. **Critical:** xAI reasoning models (`grok-4.5`, `grok-4.3`, …) **reject**
-   OpenAI `stop` / `presence_penalty` / `frequency_penalty`. SpoX drops those
+   OpenAI `stop` / `presence_penalty` / `frequency_penalty`. Spock drops those
    before upstream. Without that drop you get:
    `400 Model grok-4.5 does not support parameter stop` → Auto Mode fails
    closed with "`… is temporarily unavailable, so auto mode cannot determine
