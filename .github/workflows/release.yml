@@ -1,0 +1,185 @@
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#v}"
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG cargo=$CARGO_VER"
+          test "$VER" = "$CARGO_VER"
+
+  build-cli:
+    needs: version-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            name: darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-14
+            name: darwin-x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-arm64
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+      - name: Linux arm64 cross toolchain
+        if: matrix.cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package CLI (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ needs.version-check.outputs.version }}"
+          NAME="${{ matrix.name }}"
+          TARGET="${{ matrix.target }}"
+          mkdir -p dist
+          STAGE="dist/spock-${VER}-${NAME}"
+          mkdir -p "$STAGE"
+          cp "target/${TARGET}/release/spock" "$STAGE/spock"
+          tar -C dist -czf "dist/spock-${VER}-${NAME}.tar.gz" "spock-${VER}-${NAME}"
+          (cd dist && shasum -a 256 "spock-${VER}-${NAME}.tar.gz" > "spock-${VER}-${NAME}.tar.gz.sha256")
+      - name: Package CLI (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $VER = "${{ needs.version-check.outputs.version }}"
+          $NAME = "${{ matrix.name }}"
+          $TARGET = "${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $stage = "dist/spock-$VER-$NAME"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/$TARGET/release/spock.exe" "$stage/spock.exe"
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/spock-$VER-$NAME.zip"
+          Get-FileHash "dist/spock-$VER-$NAME.zip" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  spock-$VER-$NAME.zip" } |
+            Set-Content "dist/spock-$VER-$NAME.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.name }}
+          path: dist/*
+
+  build-app:
+    needs: version-check
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app
+      - name: Build Spock.app
+        run: ./packaging/macos/build-app.sh
+      - name: Package App zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ needs.version-check.outputs.version }}"
+          mkdir -p dist
+          (cd dist && zip -ry "Spock-${VER}-darwin-arm64.zip" Spock.app)
+          (cd dist && shasum -a 256 "Spock-${VER}-darwin-arm64.zip" > "Spock-${VER}-darwin-arm64.zip.sha256")
+          ls -la dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-darwin-arm64
+          path: dist/Spock-*.zip*
+
+  publish:
+    needs: [version-check, build-cli, build-app]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release-assets/ \;
+          cd release-assets
+          cat *.sha256 > checksums.txt
+          ls -la
+      - name: Release notes
+        run: |
+          VER="${{ needs.version-check.outputs.version }}"
+          cat > RELEASE_BODY.md <<EOF
+          ## Install (macOS App — Apple Silicon)
+
+          1. Download \`Spock-${VER}-darwin-arm64.zip\`
+          2. Unzip → drag **Spock.app** to **Applications**
+          3. First open: right-click → **Open** if Gatekeeper blocks (ad-hoc signed)
+          4. Menu bar → **Login xAI…** or paste an API key in **Settings**
+
+          Claude Code: set \`ANTHROPIC_BASE_URL=http://127.0.0.1:8048\`
+
+          ## CLI
+
+          | Platform | Asset |
+          |---|---|
+          | macOS arm64 | \`spock-${VER}-darwin-arm64.tar.gz\` |
+          | macOS x64 | \`spock-${VER}-darwin-x64.tar.gz\` |
+          | Linux x64 | \`spock-${VER}-linux-x64.tar.gz\` |
+          | Linux arm64 | \`spock-${VER}-linux-arm64.tar.gz\` |
+          | Windows x64 | \`spock-${VER}-windows-x64.zip\` |
+
+          \`\`\`bash
+          tar -xzf spock-${VER}-darwin-arm64.tar.gz
+          sudo mv spock-${VER}-darwin-arm64/spock /usr/local/bin/
+          spock serve
+          \`\`\`
+
+          Config: \`~/.config/spock/config.toml\`
+          OAuth: \`~/.config/grok-test/auth.json\` · or API key / \`XAI_TOKEN\`
+
+          SHA-256: see \`checksums.txt\`.
+
+          ---
+          EOF
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          body_path: RELEASE_BODY.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true

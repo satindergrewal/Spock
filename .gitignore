@@ -1,6 +1,10 @@
+/target/
+/dist/
 __pycache__/
 *.py[cod]
 .DS_Store
 *.log
 .env
 auth.json
+*.icns
+!packaging/macos/AppIcon.icns

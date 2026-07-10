@@ -1,0 +1,30 @@
+[package]
+name = "spock"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Grok subscription → Anthropic-API-compatible local proxy (multi-backend)"
+license = "MIT"
+repository = "https://github.com/satindergrewal/Spock"
+readme = "README.md"
+keywords = ["grok", "xai", "anthropic", "proxy", "claude"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "spock"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# macOS UI is a native Swift app (macos/). No wry/WebView tray in Rust.
+[features]
+default = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

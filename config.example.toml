@@ -1,0 +1,52 @@
+# Spock multi-backend config
+# Copy to ~/.config/spock/config.toml (spock serve creates a default on first run)
+
+[server]
+bind = "127.0.0.1"
+port = 8048
+# Active profile name
+profile = "xai-only"
+
+# --- Backends ---
+
+[backends.xai]
+type = "xai"
+# base_url = "https://api.x.ai/v1"
+# Optional console API key (console.x.ai). When set, Spock uses it instead of OAuth.
+# Priority: api_key → env XAI_TOKEN → OAuth device login (spock login).
+# api_key = "xai-..."
+
+# OpenAI-compatible (Ollama, llama.cpp, vLLM, …)
+[backends.ollama]
+type = "openai"
+base_url = "http://127.0.0.1:11434/v1"
+# api_key = ""
+
+# Example LAN endpoint (use your own host; do not commit real IPs to public repos)
+# [backends.lan]
+# type = "openai"
+# base_url = "http://10.0.0.5:8080/v1"
+
+# --- Profiles: map Claude roles → backend:model ---
+
+[profiles.xai-only]
+default = "xai:grok-4.5"
+
+[profiles.hybrid]
+# Profile rows own routing. Bare grok-* client ids use `default` (no xAI passthrough).
+default = "ollama:glm-5.2:cloud"
+haiku = "ollama:kimi-k2.7-code:cloud"
+sonnet = "ollama:kimi-k2.7-code:cloud"
+opus = "xai:grok-4.5"
+fable = "ollama:glm-5.2:cloud"
+
+[profiles.local-only]
+default = "ollama:qwen2.5:14b"
+haiku = "ollama:qwen2.5:7b"
+sonnet = "ollama:qwen2.5:14b"
+opus = "ollama:qwen2.5:14b"
+fable = "ollama:qwen2.5:14b"
+
+# Optional exact overrides:
+# [profiles.hybrid.exact]
+# "claude-haiku-4-5" = "ollama:qwen2.5:7b"

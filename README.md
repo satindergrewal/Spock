@@ -1,264 +1,371 @@
-# Grok Subscription Proxy
+# Spock
 
-Use your Grok subscription as an **Anthropic-API-compatible** endpoint — no xAI API key.
+**Local multi-backend proxy** that speaks the **Anthropic Messages API** so [Claude Code](https://claude.com/claude-code) (CLI + VSCodium/VS Code) can run on:
 
-Two files, zero dependencies (Python 3.9+ stdlib only):
+- **xAI Grok** — subscription OAuth *or* console API key  
+- **Ollama / llama-server / any OpenAI-compatible API** — localhost or LAN  
 
-| File | What it does |
+Claude Code always points at Spock (`http://127.0.0.1:8048`). Spock maps Haiku / Sonnet / Opus / Fable (and any model id) to different backends via profiles — without changing Claude settings when you switch vendors.
+
+| Piece | Role |
 |---|---|
-| `grok_test.py` | One-time OAuth login (device-code flow) + quick prompt tester |
-| `grok_proxy.py` | Local server on `http://localhost:8048` that speaks the Anthropic Messages API (and OpenAI chat completions) backed by xAI |
+| **Spock.app** | macOS menu bar app — proxy, Settings, Chat, profile switch, status icon |
+| `spock` CLI | `serve`, `login`, `logout`, `chat`, `status`, `reload` (all platforms) |
+| Config | `~/.config/spock/config.toml` |
+| xAI OAuth tokens | `~/.config/grok-test/auth.json` (same path as the original Python tool) |
 
-## Prerequisites
+---
 
-- **Python 3.9+** (`python3 --version`) — stdlib only; no `pip install`, no venv
-- **Grok / X subscription** — browser must be logged into that account for the one-time OAuth approve
-- Optional: `curl` (health checks + `claude-grok.sh`), Claude Code CLI or the VSCodium/VS Code extension
+## Install
 
-## How it works
+### macOS App (recommended)
 
-xAI runs a standard OAuth 2.0 device-code flow (RFC 8628) on `auth.x.ai` with a
-shared public client — the same one grok-cli and OpenClaw use (the consent
-screen may say "Grok Build"). The granted token carries the `api:access` scope,
-so it works as a plain Bearer token against `https://api.x.ai/v1`, billed to
-your subscription. The proxy translates Anthropic Messages API requests to xAI
-chat completions and back, including streaming and tool calls.
+1. From [Releases](https://github.com/satindergrewal/Spock/releases), download  
+   `Spock-VERSION-darwin-arm64.zip` (Apple Silicon) or `…-darwin-x64.zip`
+2. Unzip → drag **Spock.app** to **Applications**
+3. First launch: right-click → **Open** if Gatekeeper warns (ad-hoc signed until Developer ID is set)
+4. Menu bar icon appears (no Dock icon — menu bar agent)
+5. **Login xAI…** *or* paste an xAI API key in **Settings → Backends**
 
-Both files must stay in the same directory — the proxy imports the OAuth logic
-from `grok_test.py`.
+Build from source:
+
+```bash
+./packaging/macos/build-app.sh   # → dist/Spock.app
+open dist/Spock.app
+```
+
+### CLI (macOS / Linux / Windows)
+
+```bash
+# From a release tarball
+tar -xzf spock-VERSION-darwin-arm64.tar.gz
+sudo mv spock-VERSION-darwin-arm64/spock /usr/local/bin/
+
+# From source
+cargo build --release
+# binary: target/release/spock
+```
+
+---
 
 ## Quick start
 
 ```bash
-# 1. Log in (once) — prints a URL + code, approve in your browser
-python3 grok_test.py
+# Option A — macOS app (starts proxy automatically)
+open dist/Spock.app   # or Spock from Applications
 
-# 2. Start the proxy
-python3 grok_proxy.py
+# Option B — CLI
+spock login           # once, if using OAuth (skip if using API key)
+spock serve           # http://127.0.0.1:8048
 ```
 
-Tokens are cached in `~/.config/grok-test/auth.json` (chmod 600) and
-auto-refreshed. `python3 grok_test.py --logout` forgets them. If that file
-already exists from a previous login, skip step 1.
-
-## Test it
-
-Anthropic format:
+Smoke test:
 
 ```bash
-curl http://localhost:8048/v1/messages \
-  -H "content-type: application/json" \
-  -d '{"model":"grok-4.5","max_tokens":256,"messages":[{"role":"user","content":"hello, what can you do?"}]}' | jq
+curl -s http://127.0.0.1:8048/health | jq
+curl http://127.0.0.1:8048/v1/messages \
+  -H 'content-type: application/json' \
+  -d '{"model":"grok-4.5","max_tokens":256,"messages":[{"role":"user","content":"hello"}]}' | jq
 ```
 
-OpenAI format (same port):
+---
 
-```bash
-curl http://localhost:8048/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"grok-4.5","messages":[{"role":"user","content":"hello"}],"max_tokens":256}' | jq
-```
+## macOS app
 
-List available models:
+Menu bar only (`LSUIElement` / activation policy `.accessory`):
 
-```bash
-curl -s http://localhost:8048/v1/models | jq            # standard list
-curl -s http://localhost:8048/v1/language-models | jq   # pricing + capabilities
-```
+| Menu | Action |
+|---|---|
+| Status line | Profile · port · proxy state |
+| **Chat…** | Native chat window against the proxy |
+| **Settings…** | Full config UI (backends, profiles, routes, API keys) |
+| **Profile** | Switch active profile live |
+| **Reload config** | Re-read `config.toml` |
+| **Login xAI…** / **Logout xAI** | OAuth device flow |
+| **Quit Spock** | Stop proxy (if app started it) and exit |
 
-## Use with Claude Code
+**Status icon color**
 
-### CLI
+| Color | Meaning |
+|---|---|
+| Green | Proxy healthy |
+| Orange | Starting |
+| Gray | Stopped |
+| Red | Error |
 
-```bash
-./claude-grok.sh          # starts the proxy if needed, then launches claude on Grok
-```
+Closing Settings/Chat **does not** quit the app (no Dock icon stuck around). Only **Quit Spock** exits.
 
-`claude-grok.sh` starts the proxy if needed, forces the model to
-`grok-4.5[1m]` (override with `GROK_MODEL_ID` or `ANTHROPIC_MODEL`), and sets
-the compact window (see [Context window](#context-window-500k) below). Extra
-args are passed through to `claude`. Manual equivalent:
+**Settings highlights**
 
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8048
-export ANTHROPIC_AUTH_TOKEN=dummy   # required by clients, ignored by the proxy
-export ANTHROPIC_MODEL=grok-4.5[1m]
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000
-export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90
-claude --model "$ANTHROPIC_MODEL"
-```
+- Active profile (persists immediately on change)
+- Backends: `xai` or `openai`, base URL, optional API key  
+- **Fetch models** — pulls model ids from Ollama (`/v1/models` then `/api/tags`) or xAI  
+- Profiles & routes — `backend:model` per role, with dropdowns from fetched models  
+- **Save & Apply** — writes TOML and hot-reloads the proxy  
 
-On launch it prints a one-liner so you can confirm routing:
+---
+
+## xAI authentication
+
+Three options (**first wins**):
+
+1. **API key in config / Settings**  
+   ```toml
+   [backends.xai]
+   type = "xai"
+   api_key = "xai-..."    # from console.x.ai
+   ```  
+   Or Settings → Backends → `xai` → API key field → Save & Apply.
+
+2. **Environment**  
+   ```bash
+   export XAI_TOKEN=xai-...
+   ```
+
+3. **OAuth (subscription)**  
+   ```bash
+   spock login            # browser device flow
+   # or menu: Login xAI…
+   ```  
+   Tokens: `~/.config/grok-test/auth.json` (mode `0600`).
+
+With an API key set, device login is skipped. OAuth remains available when the key is empty.
+
+---
+
+## Multi-backend routing
+
+Claude Code keeps a single base URL:
 
 ```text
-Spock → http://localhost:8048  model=grok-4.5[1m]  compact=500000@90%
+ANTHROPIC_BASE_URL=http://127.0.0.1:8048
 ```
 
-If the UI still shows `fable`/`opus`/`sonnet`, the model was not overridden —
-use `./claude-grok.sh` (or pass `--model grok-4.5[1m]`) rather than bare
-`claude` after exporting only the base URL.
+Spock resolves each request’s **model id** using the **active profile**:
 
-### VSCodium / VS Code extension
-
-The IDE path does **not** auto-start the proxy — run it yourself first:
-
-```bash
-python3 grok_proxy.py
+```text
+exact id override
+  → role (haiku / sonnet / opus / fable) if the id contains that word
+  → profile default
+  → backend:upstream_model
 ```
 
-Then set Claude Code env vars in your editor settings
-(`claudeCode.environmentVariables` in VSCodium/VS Code user settings):
+There is **no** automatic `grok*` → xAI shortcut. A client id like `grok-4.5[1m]` uses the profile **default** (or a role row if you map it). Context suffixes (`[1m]`, `[500k]`, …) are stripped before the upstream call; Claude Code still sees the original id in responses.
+
+Example (`config.example.toml`):
+
+```toml
+[server]
+profile = "hybrid"
+
+[backends.xai]
+type = "xai"
+# api_key = "xai-..."
+
+[backends.ollama]
+type = "openai"
+base_url = "http://127.0.0.1:11434/v1"
+
+[profiles.hybrid]
+default = "ollama:glm-5.2:cloud"
+haiku   = "ollama:kimi-k2.7-code:cloud"
+sonnet  = "ollama:kimi-k2.7-code:cloud"
+opus    = "xai:grok-4.5"
+fable   = "ollama:glm-5.2:cloud"
+```
+
+| Claude Code sends (examples) | Hybrid row used |
+|---|---|
+| id containing `haiku` | `haiku` |
+| id containing `sonnet` | `sonnet` |
+| id containing `opus` | `opus` |
+| id containing `fable` | `fable` |
+| `grok-4.5[1m]`, other unmatched ids | `default` |
+
+**Tip:** Different backends have different “personalities.” Grok often follows Claude Code’s “you are Claude” system prompt; other models may answer as themselves (or in another language). For a single-brain session, point **default + fable + main roles** at the same `backend:model`.
+
+Switch profiles live: app menu **Profile**, Settings active profile, or edit TOML + **Reload** / `spock reload`.
+
+Config path: `~/.config/spock/config.toml` (created on first run). Full sample: [`config.example.toml`](config.example.toml).
+
+---
+
+## Claude Code
+
+### Minimal VSCodium / VS Code env
+
+Let Spock own models via the profile (recommended for hybrid):
 
 ```json
 "claudeCode.environmentVariables": [
-  { "name": "ANTHROPIC_BASE_URL", "value": "http://localhost:8048" },
+  { "name": "ANTHROPIC_BASE_URL", "value": "http://127.0.0.1:8048" },
   { "name": "ANTHROPIC_API_KEY", "value": "xai" },
   { "name": "ANTHROPIC_AUTH_TOKEN", "value": "xai" },
-  { "name": "ANTHROPIC_MODEL", "value": "grok-4.5[1m]" },
-  { "name": "ANTHROPIC_DEFAULT_FABLE_MODEL", "value": "grok-4.5[1m]" },
   { "name": "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "value": "500000" },
   { "name": "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "value": "90" },
   { "name": "API_TIMEOUT_MS", "value": "3000000" }
 ]
 ```
 
-Start a **new** Claude Code session after changing those values (env is read at
-session start). Every request then runs on your Grok subscription.
+Optional model env overrides (only if you want Claude Code to send fixed ids):
 
-### Context window (500k)
+```json
+{ "name": "ANTHROPIC_MODEL", "value": "claude-fable-5[1m]" },
+{ "name": "ANTHROPIC_DEFAULT_FABLE_MODEL", "value": "claude-fable-5[1m]" },
+{ "name": "ANTHROPIC_DEFAULT_OPUS_MODEL", "value": "claude-opus-4-8" },
+{ "name": "ANTHROPIC_DEFAULT_SONNET_MODEL", "value": "claude-sonnet-5" },
+{ "name": "ANTHROPIC_DEFAULT_HAIKU_MODEL", "value": "claude-haiku-4-5" }
+```
 
-Grok-4.5's real context limit is about **500k tokens**. Claude Code decides when
-to auto-compact from its **assumed** model window, not from xAI:
+Those ids are **role tags** for Spock routing — not necessarily the real upstream model names.
 
-| Client assumption | What happens |
-|---|---|
-| Default / unknown model (~200k) | Compacts far too early |
-| `…[1m]` only (1M window) | Compacts too late; can overflow Grok |
-| `…[1m]` + `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000` | Compacts near 500k (correct) |
+Start a **new** Claude Code session after changing env.
 
-Recommended:
+### CLI helper
 
-- Model id: `grok-4.5[1m]` so Claude Code does not clamp to ~200k
-- `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000` so compact math uses 500k
-- Optional: `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90` → fire at ~450k (headroom)
+```bash
+./claude-grok.sh
+```
 
-The proxy **strips** Claude's `[1m]` / `[1]` / `[500k]` suffix before calling
-xAI (those tags are client-side context hints, not real model ids). Without
-that strip you get `400 Model not found: grok-4.5[1m]`.
+Starts `spock serve` if needed, sets compact window env, launches `claude`. Override model with `GROK_MODEL_ID` / `ANTHROPIC_MODEL` if you want.
 
-Keep auto-compact enabled (default). Do not set `DISABLE_AUTO_COMPACT`.
-Status-line `% used` still reflects the full assumed window; only compaction
-math uses `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+### Context window (~500k for Grok)
 
-### Auto Mode (permission classifier)
+- Pair a `[1m]`-flavoured client id with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000` so compact math matches Grok’s ~500k window.  
+- Spock strips `[1m]` / `[500k]` before calling upstream.  
+- Optional: `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90`.
 
-Claude Code Auto Mode classifies tool calls (often with `stop_sequences` for
-XML tags like `</block>`). Through Spock:
+### Auto Mode
 
-1. `GET /v1/models` / `GET /v1/models/{id}` advertise Claude aliases so the
-   client does not treat the classifier model as missing.
-2. `POST /v1/messages` maps any non-`grok*` / non-`*haiku*` id to `GROK_MODEL`.
-3. **Critical:** xAI reasoning models (`grok-4.5`, `grok-4.3`, …) **reject**
-   OpenAI `stop` / `presence_penalty` / `frequency_penalty`. Spock drops those
-   before upstream. Without that drop you get:
-   `400 Model grok-4.5 does not support parameter stop` → Auto Mode fails
-   closed with "`… is temporarily unavailable, so auto mode cannot determine
-   the safety of Bash`".
+xAI reasoning models reject OpenAI `stop`. Spock drops `stop` / presence / frequency penalties on **xAI** reasoning routes and keeps them for **Ollama**.  
+`GET /v1/models` always includes Claude aliases so Auto Mode does not treat the classifier model as missing.
 
-Ollama / llama.cpp accept `stop`, which is why the same Auto Mode path worked
-there and not here until this strip was added.
+---
 
-If Auto Mode still fails after upgrading, restart the proxy and start a
-**new** Claude Code session.
+## CLI reference
 
-## Endpoints
+```text
+spock serve [--port N]     Headless proxy on 127.0.0.1 (default 8048)
+spock app                  Open Spock.app (macOS)
+spock login [--no-open]    xAI OAuth device login
+spock logout               Forget OAuth tokens
+spock chat [prompt] [-m model]
+spock status               Profile, backends, auth source, proxy health
+spock reload               Re-read config.toml
+spock -V | --version
+spock help
+```
 
-| Endpoint | Notes |
-|---|---|
-| `POST /v1/messages` | Anthropic Messages API — streaming + non-streaming, system prompts, images, tool use |
-| `POST /v1/messages/count_tokens` | Rough estimate (chars / 4) |
-| `POST /v1/chat/completions` | OpenAI-style passthrough |
-| `GET /v1/models` | Model list (xAI passthrough) |
-| `GET /v1/models/{id}` | Single model details |
-| `GET /v1/language-models` | xAI extended list: pricing, modalities |
-| `GET /health` | Proxy status |
-
-## Model mapping
-
-- Claude Code context suffixes (`[1m]`, `[1]`, `[500k]`, …) are stripped before
-  the upstream call. Client-facing `model` in responses keeps the original id.
-- Bare names starting with `grok` pass through to xAI.
-- Names containing `haiku` (Claude Code's cheap background / Auto Mode helper
-  calls) map to `GROK_SMALL_MODEL`.
-- Everything else (`claude-opus-4-8`, `claude-sonnet-5`, `fable`, …) maps to
-  `GROK_MODEL`.
-- `GET /v1/models` merges the live xAI list with synthetic Claude/Grok aliases
-  so Auto Mode and the model picker do not 404.
-
-## Configuration (env vars)
+### Environment
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PORT` | `8048` | Proxy listen port |
-| `GROK_MODEL` | `grok-4.5` | Default / main model |
-| `GROK_SMALL_MODEL` | = `GROK_MODEL` | Target for `*haiku*` requests |
-| `XAI_TOKEN` | — | Skip OAuth entirely (e.g. use a real API key) |
-| `XAI_API_BASE` | `https://api.x.ai/v1` | Upstream override (testing) |
+| `PORT` | `8048` | Listen port |
+| `GROK_MODEL` | `grok-4.5` | Legacy default / alias helper |
+| `GROK_SMALL_MODEL` | = `GROK_MODEL` | Haiku-style alias helper |
+| `XAI_TOKEN` | — | xAI API key (skips OAuth if set) |
+| `XAI_API_BASE` | `https://api.x.ai/v1` | Upstream override |
 
-Example — big model for main turns, cheap one for background chatter:
+---
+
+## HTTP API
+
+### Claude / OpenAI compatible
+
+| Endpoint | Notes |
+|---|---|
+| `POST /v1/messages` | Anthropic Messages (stream + tools + thinking) |
+| `POST /v1/messages/count_tokens` | Rough estimate (chars/4) |
+| `POST /v1/chat/completions` | OpenAI-style (raw stream passthrough) |
+| `GET /v1/models` | Merged backend lists + Claude aliases |
+| `GET /v1/models/{id}` | Never 404s for aliases |
+| `GET /v1/language-models*` | xAI extended list when available |
+| `GET /health` | Status, profile, backends, version |
+
+### Local admin (loopback only — used by Spock.app)
+
+| Endpoint | Notes |
+|---|---|
+| `GET /spock/v1/status` | Profile, auth source, paths |
+| `GET /spock/v1/config` | Settings document |
+| `PUT /spock/v1/config` | Save & apply full config |
+| `POST /spock/v1/profile` | `{"profile":"hybrid"}` |
+| `POST /spock/v1/reload` | Reload from disk |
+| `POST /spock/v1/logout` | Clear OAuth file |
+| `GET /spock/v1/backends/{name}/models` | Discover models (Ollama / xAI) |
+
+---
+
+## Build
 
 ```bash
-GROK_MODEL=grok-4.5 GROK_SMALL_MODEL=grok-4.3-mini python3 grok_proxy.py
+# Tests + headless binary
+cargo test
+cargo build --release
+
+# macOS app (Rust proxy + SwiftUI shell)
+./packaging/macos/build-app.sh
+# → dist/Spock.app
 ```
 
-(Pick real IDs from `curl -s localhost:8048/v1/models | jq -r '.data[].id'`.)
+### Release (GitHub Actions)
 
-### Effort (`xhigh` / ultracode)
+Tag `vX.Y.Z` must match `Cargo.toml` `version`. Pushing the tag builds:
 
-Claude Code session effort (`--effort`, `effortLevel`, ultracode) is sent as
-Anthropic `output_config.effort`. Spock maps that to xAI `reasoning_effort`:
+- CLI archives: darwin-arm64/x64, linux-x64/arm64, windows-x64  
+- macOS App zips: `Spock-VERSION-darwin-arm64.zip` / `…-x64.zip`  
+- `checksums.txt` + release notes  
 
-| Claude `output_config.effort` | xAI `reasoning_effort` |
-|---|---|
-| `low` / `medium` / `high` / `xhigh` | same |
-| `max` | `xhigh` (xAI has no `max`) |
+Workflows: [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
-Legacy `thinking.budget_tokens` still maps when `output_config.effort` is
-absent: &lt;5k → low, &lt;15k → medium, &lt;40k → high, else xhigh. Adaptive
-thinking with no budget defaults to high. `thinking.type=disabled` forces
-`none` (keeps Auto Mode classifiers clean).
+---
 
-**Local vs cloud multi-agent:** Claude Code **Workflow / Agent / ultracode**
-orchestration runs in the client and only needs `/v1/messages` — it works
-through Spock. Cloud-only Anthropic products (**Managed Agents** sandbox API,
-**ultrareview** cloud fleet, Task Budgets on Anthropic infra) do **not** — they
-hit Anthropic-hosted control planes Spock does not implement. Local Workflow
-is the sovereign equivalent for almost all coding work.
+## Security
 
-## Limitations
+- Binds **127.0.0.1 only** — anyone who can reach the port can use your backends  
+- OAuth token file `0600` on Unix  
+- Do not commit real API keys, LAN IPs, or tokens to public files  
+- Admin API is unauthenticated by design (loopback only)  
 
-- Grok `reasoning_content` maps to Anthropic `thinking` blocks only when the
-  client enables `thinking` (stream + non-stream). Auto Mode classifier calls
-  do not enable it, so they get plain text. Inbound thinking is re-sent as
-  `reasoning_content`; `output_config.effort` and `thinking.budget_tokens` map
-  to xAI `reasoning_effort` (see [Effort](#effort-xhigh--ultracode)).
-  `stop_sequences` are dropped for reasoning models (xAI rejects `stop`).
-  `cache_control` is dropped; `count_tokens` is an estimate.
-- The Batch, Files, Admin, and Managed Agents APIs are not implemented
-  (Claude Code local Workflow does not need them).
-- The proxy binds to `127.0.0.1` only — it is not meant to be exposed to a
-  network; anyone who can reach it can spend your subscription.
-- The login rides xAI's shared OAuth client; if xAI ever restricts that client
-  to their own tools, the login step stops working.
+---
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `401 … token rejected` | `python3 grok_test.py --logout && python3 grok_test.py` |
-| `Address already in use` | Another instance is running: `lsof -nP -iTCP:8048` — kill it or set `PORT` |
-| Connection refused / Claude Code can't reach API | Start the proxy: `python3 grok_proxy.py` (IDE path does not auto-start it) |
-| Compacts too early (~200k) | Set `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000` and use `grok-4.5[1m]` |
-| Hits Grok context limit / overflows | Ensure compact window is 500k, not bare `[1m]` alone; optional `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=90` |
-| Login URL never approves | Code expires in ~30 min; re-run, make sure the browser is logged in to your Grok/X account |
-| Env changes ignored in IDE | Start a **new** Claude Code session after editing settings |
+| `401` / SuperGrok / usage on xAI | Check API key, `XAI_TOKEN`, or `spock logout && spock login`; quota on the xAI side |
+| Claude opens “log in to Anthropic” | Often a **misread upstream error** — check Spock logs; use a valid key/OAuth; prefer latest Spock (upstream 401 → 502 with clear message) |
+| Active profile snaps back in Settings | Use latest app (profile switch persists immediately); Save & Apply |
+| Hybrid hits wrong model | Check **active** profile rows; fable/default often drive main chat; empty role fields fall through to default |
+| Ollama `*:cloud` fails | Sign in / enable that model in Ollama cloud |
+| Address already in use | `lsof -nP -iTCP:8048` — quit old Spock or Python proxy |
+| Gatekeeper blocks app | Right-click → Open |
+| Auto Mode “temporarily unavailable” | Upgrade Spock; ensure stop is dropped for xAI reasoning; aliases on `/v1/models` |
+| Compacts too early | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000` + optional `[1m]` client id |
+
+Proxy logs each request with the resolved route, e.g.:
+
+```text
+  POST /v1/messages
+  route claude-fable-5[1m] → ollama:glm-5.2:cloud (openai)
+```
+
+---
+
+## Architecture (short)
+
+- **Rust** proxy: minimal deps (`ureq`, `serde`, `toml`), threaded `TcpListener`, Anthropic ↔ OpenAI translation  
+- **SwiftUI** macOS shell: menu bar + Settings + Chat; talks to proxy admin API  
+- **Profiles** hot-reload without restarting Claude Code  
+
+Python implementation has been removed; this repo is Rust + Swift only.
+
+---
+
+## License
+
+MIT
+
+---
+
+Thanks for using Spock — run Claude Code on the models *you* choose, locally.
