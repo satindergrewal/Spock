@@ -7,6 +7,8 @@
 
 Claude Code always points at Spock (`http://127.0.0.1:8048`). Spock maps Haiku / Sonnet / Opus / Fable (and any model id) to different backends via profiles — without changing Claude settings when you switch vendors.
 
+![Spock Settings — multi-backend profiles and model routing](spock_settings.png)
+
 | Piece | Role |
 |---|---|
 | **Spock.app** | macOS menu bar app — proxy, Settings, Chat, profile switch, status icon |
