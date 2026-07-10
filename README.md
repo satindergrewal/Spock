@@ -213,16 +213,39 @@ GROK_MODEL=grok-4.5 GROK_SMALL_MODEL=grok-4.3-mini python3 grok_proxy.py
 
 (Pick real IDs from `curl -s localhost:8048/v1/models | jq -r '.data[].id'`.)
 
+### Effort (`xhigh` / ultracode)
+
+Claude Code session effort (`--effort`, `effortLevel`, ultracode) is sent as
+Anthropic `output_config.effort`. Spock maps that to xAI `reasoning_effort`:
+
+| Claude `output_config.effort` | xAI `reasoning_effort` |
+|---|---|
+| `low` / `medium` / `high` / `xhigh` | same |
+| `max` | `xhigh` (xAI has no `max`) |
+
+Legacy `thinking.budget_tokens` still maps when `output_config.effort` is
+absent: &lt;5k → low, &lt;15k → medium, &lt;40k → high, else xhigh. Adaptive
+thinking with no budget defaults to high. `thinking.type=disabled` forces
+`none` (keeps Auto Mode classifiers clean).
+
+**Local vs cloud multi-agent:** Claude Code **Workflow / Agent / ultracode**
+orchestration runs in the client and only needs `/v1/messages` — it works
+through Spock. Cloud-only Anthropic products (**Managed Agents** sandbox API,
+**ultrareview** cloud fleet, Task Budgets on Anthropic infra) do **not** — they
+hit Anthropic-hosted control planes Spock does not implement. Local Workflow
+is the sovereign equivalent for almost all coding work.
+
 ## Limitations
 
 - Grok `reasoning_content` maps to Anthropic `thinking` blocks only when the
   client enables `thinking` (stream + non-stream). Auto Mode classifier calls
   do not enable it, so they get plain text. Inbound thinking is re-sent as
-  `reasoning_content`; `thinking.budget_tokens` maps to xAI `reasoning_effort`.
+  `reasoning_content`; `output_config.effort` and `thinking.budget_tokens` map
+  to xAI `reasoning_effort` (see [Effort](#effort-xhigh--ultracode)).
   `stop_sequences` are dropped for reasoning models (xAI rejects `stop`).
   `cache_control` is dropped; `count_tokens` is an estimate.
-- The Batch, Files, and Admin APIs are not implemented (Claude Code doesn't
-  use them).
+- The Batch, Files, Admin, and Managed Agents APIs are not implemented
+  (Claude Code local Workflow does not need them).
 - The proxy binds to `127.0.0.1` only — it is not meant to be exposed to a
   network; anyone who can reach it can spend your subscription.
 - The login rides xAI's shared OAuth client; if xAI ever restricts that client

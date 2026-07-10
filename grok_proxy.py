@@ -212,14 +212,46 @@ def blocks_text(content):
     return "\n".join(parts)
 
 
+def map_output_effort(effort):
+    """Map Anthropic output_config.effort → xAI reasoning_effort.
+
+    xAI accepts low/medium/high/xhigh. Claude's `max` has no xAI peer — clamp
+    to xhigh (probed 2026-07-10: max/ultra → 400 Invalid reasoning effort).
+    """
+    if not isinstance(effort, str):
+        return None
+    e = effort.strip().lower()
+    if e in ("low", "medium", "high", "xhigh"):
+        return e
+    if e == "max":
+        return "xhigh"
+    return None
+
+
 def thinking_effort(a):
-    """Map Anthropic thinking config → xAI reasoning_effort, if any."""
-    t = a.get("thinking")
+    """Map Anthropic thinking / output_config → xAI reasoning_effort.
+
+    Priority:
+      1. thinking.type disabled/absent-null → "none" (Auto Mode classifiers)
+      2. output_config.effort (Claude Code --effort / effortLevel path)
+      3. thinking.budget_tokens buckets (legacy extended-thinking)
+      4. thinking enabled/adaptive without budget → "high"
+    """
+    t = a.get("thinking") if isinstance(a, dict) else None
+    if isinstance(t, dict):
+        kind = t.get("type")
+        if kind in (None, "disabled"):
+            return "none"
+
+    oc = a.get("output_config") if isinstance(a, dict) else None
+    if isinstance(oc, dict):
+        mapped = map_output_effort(oc.get("effort"))
+        if mapped:
+            return mapped
+
     if not isinstance(t, dict):
         return None
     kind = t.get("type")
-    if kind in (None, "disabled"):
-        return "none"
     if kind not in ("enabled", "adaptive"):
         return None
     budget = t.get("budget_tokens")
@@ -229,7 +261,9 @@ def thinking_effort(a):
         return "low"
     if budget < 15000:
         return "medium"
-    return "high"
+    if budget < 40000:
+        return "high"
+    return "xhigh"
 
 
 def anthropic_to_openai(a):
