@@ -20,6 +20,9 @@ use config::{
 use error::Result;
 use serde_json::json;
 use state::AppState;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -75,7 +78,10 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
-        Command::Serve { port } => {
+        Command::Serve { port, log_file } => {
+            if let Some(path) = log_file {
+                install_log_file(&path)?;
+            }
             let mut cfg = Config::load_or_init()?;
             if let Some(p) = port {
                 cfg.server.port = p;
@@ -93,6 +99,89 @@ fn run() -> Result<()> {
             tray::run_app(state)
         }
     }
+}
+
+/// Redirect stdout+stderr into `path` for `tail -f` (Unix).
+fn install_log_file(path: &str) -> Result<()> {
+    let p = PathBuf::from(path);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let file = OpenOptions::new().create(true).append(true).open(&p)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let fd = file.as_raw_fd();
+        let mut log = unsafe { std::fs::File::from_raw_fd(libc_dup(fd)) };
+        let _ = writeln!(log, "\n--- spock log start unix={} ---", epoch_secs());
+        let (r, w) = pipe_pair().map_err(|e| error::Error::Msg(format!("log pipe: {e}")))?;
+        if unsafe { libc_dup2(w.as_raw_fd(), 2) } < 0 {
+            return Err(error::Error::Msg("dup2 stderr failed".into()));
+        }
+        if unsafe { libc_dup2(w.as_raw_fd(), 1) } < 0 {
+            return Err(error::Error::Msg("dup2 stdout failed".into()));
+        }
+        drop(w);
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(r);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::BufRead::read_line(&mut reader, &mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let _ = log.write_all(line.as_bytes());
+                        let _ = log.flush();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        std::mem::forget(file);
+        eprintln!("logging to {}", p.display());
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        eprintln!("--log-file is only supported on Unix; ignoring {path}");
+        Ok(())
+    }
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn pipe_pair() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::unix::io::FromRawFd;
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc_pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    })
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "pipe"]
+    fn libc_pipe(fds: *mut i32) -> i32;
+    #[link_name = "dup"]
+    fn libc_dup(fd: i32) -> i32;
+    #[link_name = "dup2"]
+    fn libc_dup2(old: i32, new: i32) -> i32;
 }
 
 fn cmd_chat(model: Option<String>, prompt: String) -> Result<()> {
@@ -163,8 +252,22 @@ fn cmd_status() -> Result<()> {
     if let Ok(p) = cfg.active_profile() {
         println!("  routes:  {}", route::profile_summary(p));
     }
-    println!("  advisor:    {}", if cfg.advisor.enabled { "enabled" } else { "disabled" });
-    println!("  web_search: {}", if cfg.web_search.enabled { "enabled" } else { "disabled" });
+    println!(
+        "  advisor:    {}",
+        if cfg.advisor.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "  web_search: {}",
+        if cfg.web_search.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     // Same priority as proxy: config api_key → XAI_TOKEN → OAuth file.
     let has_cfg_key = cfg.backends.values().any(|b| {
         matches!(
@@ -201,15 +304,30 @@ fn cmd_status() -> Result<()> {
         }
         Err(_) => println!("  proxy:   down"),
     }
+    // last upstream error from live proxy if available
+    let status_url = format!("http://127.0.0.1:{port}/spock/v1/status");
+    if let Ok(resp) = ureq::get(&status_url)
+        .timeout(std::time::Duration::from_secs(1))
+        .call()
+    {
+        if let Ok(v) = resp.into_json::<serde_json::Value>() {
+            if let Some(err) = v.get("last_upstream_error") {
+                if !err.is_null() {
+                    println!(
+                        "  last_err: {}",
+                        err.get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or(&err.to_string())
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
 fn ctrlc_handler(shutdown: Arc<AtomicBool>) {
-    // std-only: spawn a thread that waits is hard without signal crate.
-    // Use a simple approach — on Unix, set a flag via ctrlc is not in std.
-    // Document Ctrl-C kills process; for clean stop, tray Quit or kill.
-    // Attempt: ignore — OS will SIGINT the process. Nonblocking accept loop
-    // means kill is fine. Optionally install via libc — skip for minimal deps.
+    // std-only: Ctrl-C kills process; nonblocking accept loop is fine.
     let _ = shutdown;
     let _ = Ordering::SeqCst;
 }

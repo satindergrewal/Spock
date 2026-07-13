@@ -35,7 +35,11 @@ pub fn chat(
 ) -> Result<UpstreamBody> {
     if use_responses {
         return Err(Error::Msg(
-            "OpenAI Responses API (use_responses_api=true) is not fully implemented yet; use Chat Completions (default)".into(),
+            "OpenAI Responses API is not implemented in Spock. Set use_responses_api=false \
+             (default) and use Chat Completions. Responses/Codex shape needs a separate adapter \
+             (different request/SSE). Tracked as Tier B — not planned until Chat Completions is \
+             insufficient for your models."
+                .into(),
         ));
     }
     let base = base_url.trim_end_matches('/');

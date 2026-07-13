@@ -22,31 +22,51 @@ struct SettingsView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Spock Settings")
-                    .font(.headline)
-                Text(model.configPath.isEmpty ? "127.0.0.1:\(model.port)" : model.configPath)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Spock Settings")
+                        .font(.headline)
+                    Text(model.configPath.isEmpty ? "127.0.0.1:\(model.port)" : model.configPath)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                if !model.statusMessage.isEmpty && !model.statusIsError {
+                    Text(model.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .lineLimit(2)
+                        .frame(maxWidth: 280, alignment: .trailing)
+                }
+                Button("Reload") { model.reloadFromDisk() }
+                Button("Save & Apply") { model.saveConfig() }
+                    .keyboardShortcut("s", modifiers: .command)
+                    .buttonStyle(.borderedProminent)
             }
-            Spacer()
-            if !model.statusMessage.isEmpty {
-                Text(model.statusMessage)
-                    .font(.caption)
-                    .foregroundStyle(model.statusIsError ? .red : .green)
-                    .lineLimit(2)
-                    .frame(maxWidth: 280, alignment: .trailing)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            if model.statusIsError && !model.statusMessage.isEmpty {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(model.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button("Dismiss") {
+                        model.dismissStatus()
+                    }
+                    .buttonStyle(.borderless)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Color.red.opacity(0.08))
             }
-            Button("Reload") { model.reloadFromDisk() }
-            Button("Save & Apply") { model.saveConfig() }
-                .keyboardShortcut("s", modifiers: .command)
-                .buttonStyle(.borderedProminent)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
     }
 
     private var serverSection: some View {

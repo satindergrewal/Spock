@@ -4,6 +4,7 @@
 pub enum Command {
     Serve {
         port: Option<u16>,
+        log_file: Option<String>,
     },
     App,
     Login {
@@ -31,6 +32,7 @@ pub fn parse(args: &[String]) -> Command {
     match args[0].as_str() {
         "serve" => {
             let mut port = None;
+            let mut log_file = None;
             let mut i = 1;
             while i < args.len() {
                 if args[i] == "--port" || args[i] == "-p" {
@@ -40,9 +42,16 @@ pub fn parse(args: &[String]) -> Command {
                         continue;
                     }
                 }
+                if args[i] == "--log-file" || args[i] == "-l" {
+                    if let Some(v) = args.get(i + 1) {
+                        log_file = Some(v.clone());
+                        i += 2;
+                        continue;
+                    }
+                }
                 i += 1;
             }
-            Command::Serve { port }
+            Command::Serve { port, log_file }
         }
         "app" => Command::App,
         "login" => {
@@ -89,7 +98,7 @@ pub fn print_help() {
 Spock {ver} — multi-backend Anthropic-compatible proxy
 
 Usage:
-  spock serve [--port N]     Start headless proxy (127.0.0.1)
+  spock serve [--port N] [--log-file PATH]
   spock app                  Open Spock.app (macOS menu bar + chat)
   spock login [--no-open]    xAI OAuth device login
   spock logout               Forget cached xAI tokens
@@ -97,6 +106,9 @@ Usage:
   spock status               Active profile + backends
   spock reload               Re-read ~/.config/spock/config.toml
   spock -V                   Version
+
+  --log-file PATH            Append proxy logs to PATH (Unix)
+                             App default: ~/Library/Logs/Spock/spock.log
 
 Config:  ~/.config/spock/config.toml
 Tokens:  ~/.config/grok-test/auth.json

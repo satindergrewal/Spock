@@ -301,6 +301,255 @@ fn apply_tools_and_choice(a: &Value, obj: &mut Map<String, Value>) {
     }
 }
 
+/// Anthropic Messages-only keys that must never reach OpenAI-compat / xAI chat.
+/// `anthropic_to_openai` rebuilds the body, but server-tool loops and future
+/// paths may clone the client request — strip defensively.
+const ANTHROPIC_ONLY_KEYS: &[&str] = &[
+    "betas",
+    "context_management",
+    "container",
+    "mcp_servers",
+    "anthropic_beta",
+    "anthropic_version",
+    "metadata", // Anthropic request metadata; not OpenAI chat
+];
+
+/// Drop Anthropic-only top-level keys. Safe on any Messages-shaped body.
+pub fn strip_anthropic_only_fields(a: &mut Value) {
+    if let Some(obj) = a.as_object_mut() {
+        for k in ANTHROPIC_ONLY_KEYS {
+            obj.remove(*k);
+        }
+    }
+}
+
+/// Apply Claude Code `context_management` edits client-side so long sessions
+/// stay within OpenAI-compat context windows. Anthropic applies these on the
+/// server; Grok/Ollama never see the field, so Spock must do the work.
+///
+/// Supported strategies (from Claude Code `apiMicrocompact.ts`):
+/// - `clear_thinking_20251015` — drop older thinking blocks
+/// - `clear_tool_uses_20250919` — blank older tool_result (and optionally tool_use input)
+pub fn apply_context_management(a: &mut Value) {
+    let edits = match a
+        .get("context_management")
+        .and_then(|c| c.get("edits"))
+        .and_then(|e| e.as_array())
+        .cloned()
+    {
+        Some(e) if !e.is_empty() => e,
+        _ => return,
+    };
+
+    for edit in &edits {
+        let kind = edit.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match kind {
+            "clear_thinking_20251015" => apply_clear_thinking(a, edit),
+            "clear_tool_uses_20250919" => apply_clear_tool_uses(a, edit),
+            _ => {}
+        }
+    }
+}
+
+fn apply_clear_thinking(a: &mut Value, edit: &Value) {
+    // keep: "all" | { type: "thinking_turns", value: N }
+    let keep_all = edit.get("keep").and_then(|k| k.as_str()) == Some("all");
+    if keep_all {
+        return;
+    }
+    let keep_n = edit
+        .pointer("/keep/value")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as usize;
+    let keep_n = keep_n.max(1);
+
+    let Some(messages) = a.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+
+    // Collect indices of assistant messages that have thinking blocks (newest last).
+    let mut thinking_turns: Vec<usize> = Vec::new();
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+            if arr.iter().any(|b| {
+                matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            }) {
+                thinking_turns.push(i);
+            }
+        }
+    }
+    if thinking_turns.len() <= keep_n {
+        return;
+    }
+    let drop_count = thinking_turns.len() - keep_n;
+    let drop_idxs: std::collections::HashSet<usize> =
+        thinking_turns.into_iter().take(drop_count).collect();
+
+    for (i, msg) in messages.iter_mut().enumerate() {
+        if !drop_idxs.contains(&i) {
+            continue;
+        }
+        if let Some(arr) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+            arr.retain(|b| {
+                !matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            });
+        }
+    }
+}
+
+fn apply_clear_tool_uses(a: &mut Value, edit: &Value) {
+    // Optional trigger: only run when estimated input tokens >= value.
+    if let Some(trigger) = edit
+        .pointer("/trigger/value")
+        .and_then(|v| v.as_u64())
+    {
+        let est = count_tokens_estimate(a);
+        if est < trigger {
+            return;
+        }
+    }
+
+    let clear_inputs = edit.get("clear_tool_inputs");
+    let clear_all_inputs = clear_inputs.and_then(|v| v.as_bool()) == Some(true);
+    let clear_input_tools: Option<Vec<String>> = clear_inputs.and_then(|v| {
+        v.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+    });
+
+    let exclude: std::collections::HashSet<String> = edit
+        .get("exclude_tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Keep last N tool_uses (by encounter order). Default: keep last 5.
+    let keep_n = edit
+        .pointer("/keep/value")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5) as usize;
+    let keep_n = keep_n.max(1);
+
+    // Optional clear_at_least: if set, keep clearing until est drops by that much
+    // (we approximate by clearing all but keep_n when over trigger — already gated).
+
+    let Some(messages) = a.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+
+    // Map tool_use_id → tool name; collect tool_use ids in order.
+    let mut use_order: Vec<(String, String)> = Vec::new(); // (id, name)
+    for msg in messages.iter() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+            for b in arr {
+                if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    let id = b.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    let name = b
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !id.is_empty() {
+                        use_order.push((id, name));
+                    }
+                }
+            }
+        }
+    }
+    if use_order.len() <= keep_n {
+        return;
+    }
+
+    let drop_ids: std::collections::HashSet<String> = use_order
+        .iter()
+        .take(use_order.len() - keep_n)
+        .filter(|(_, name)| !exclude.contains(name))
+        .map(|(id, _)| id.clone())
+        .collect();
+    if drop_ids.is_empty() {
+        return;
+    }
+
+    // Blank tool_result content for dropped ids; optionally blank tool_use inputs.
+    for msg in messages.iter_mut() {
+        let role = msg
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(arr) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for b in arr.iter_mut() {
+            let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            if ty == "tool_result" {
+                let id = b
+                    .get("tool_use_id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if drop_ids.contains(&id) {
+                    if let Some(obj) = b.as_object_mut() {
+                        obj.insert(
+                            "content".into(),
+                            json!("[tool result cleared by Spock microcompact]"),
+                        );
+                    }
+                }
+            } else if ty == "tool_use" && role == "assistant" {
+                let id = b
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = b
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !drop_ids.contains(&id) {
+                    continue;
+                }
+                let should_clear = clear_all_inputs
+                    || clear_input_tools
+                        .as_ref()
+                        .map(|list| list.iter().any(|n| n == &name))
+                        .unwrap_or(false);
+                if should_clear {
+                    if let Some(obj) = b.as_object_mut() {
+                        obj.insert("input".into(), json!({}));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Prepare a Messages request for non-Anthropic upstreams: apply microcompact,
+/// then strip Anthropic-only fields. Call before `anthropic_to_openai`.
+pub fn prepare_for_openai_compat(a: &mut Value) {
+    apply_context_management(a);
+    strip_anthropic_only_fields(a);
+}
+
 pub fn anthropic_to_openai(
     a: &Value,
     upstream_model: &str,
@@ -658,5 +907,114 @@ mod tests {
         let c = a["content"].as_array().unwrap();
         assert_eq!(c[0]["type"], "thinking");
         assert_eq!(c[1]["type"], "text");
+    }
+
+    #[test]
+    fn strip_anthropic_only_fields_drops_betas() {
+        let mut a = json!({
+            "model": "x",
+            "betas": ["advisor-tool-2026", "context-management-2025"],
+            "context_management": {"edits": []},
+            "metadata": {"user_id": "u"},
+            "messages": [{"role":"user","content":"hi"}]
+        });
+        strip_anthropic_only_fields(&mut a);
+        assert!(a.get("betas").is_none());
+        assert!(a.get("context_management").is_none());
+        assert!(a.get("metadata").is_none());
+        assert!(a.get("messages").is_some());
+    }
+
+    #[test]
+    fn clear_thinking_keeps_last_n() {
+        let mut a = json!({
+            "messages": [
+                {"role":"assistant","content":[{"type":"thinking","thinking":"t1"},{"type":"text","text":"a1"}]},
+                {"role":"user","content":"u2"},
+                {"role":"assistant","content":[{"type":"thinking","thinking":"t2"},{"type":"text","text":"a2"}]},
+                {"role":"user","content":"u3"},
+                {"role":"assistant","content":[{"type":"thinking","thinking":"t3"},{"type":"text","text":"a3"}]},
+            ],
+            "context_management": {
+                "edits": [{
+                    "type": "clear_thinking_20251015",
+                    "keep": {"type": "thinking_turns", "value": 1}
+                }]
+            }
+        });
+        apply_context_management(&mut a);
+        let msgs = a["messages"].as_array().unwrap();
+        // first two thinking turns dropped; last kept
+        let c0 = msgs[0]["content"].as_array().unwrap();
+        assert!(c0.iter().all(|b| b["type"] != "thinking"), "{c0:?}");
+        let c2 = msgs[2]["content"].as_array().unwrap();
+        assert!(c2.iter().all(|b| b["type"] != "thinking"), "{c2:?}");
+        let c4 = msgs[4]["content"].as_array().unwrap();
+        assert!(c4.iter().any(|b| b["type"] == "thinking"), "{c4:?}");
+    }
+
+    #[test]
+    fn clear_tool_uses_blanks_old_results() {
+        let mut a = json!({
+            "messages": [
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":"file1\nfile2\n".repeat(50)}
+                ]},
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"t2","name":"Bash","input":{"command":"pwd"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t2","content":"/tmp"}
+                ]},
+            ],
+            "context_management": {
+                "edits": [{
+                    "type": "clear_tool_uses_20250919",
+                    "keep": {"type": "tool_uses", "value": 1},
+                    "clear_tool_inputs": true
+                }]
+            }
+        });
+        apply_context_management(&mut a);
+        let msgs = a["messages"].as_array().unwrap();
+        let r1 = &msgs[1]["content"][0];
+        assert!(
+            r1["content"].as_str().unwrap().contains("cleared"),
+            "{:?}",
+            r1["content"]
+        );
+        // kept tool_result intact
+        assert_eq!(msgs[3]["content"][0]["content"], "/tmp");
+        // cleared input on dropped tool_use
+        assert_eq!(msgs[0]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn prepare_for_openai_compat_strips_after_microcompact() {
+        let mut a = json!({
+            "betas": ["x"],
+            "context_management": {
+                "edits": [{
+                    "type": "clear_thinking_20251015",
+                    "keep": {"type": "thinking_turns", "value": 1}
+                }]
+            },
+            "messages": [
+                {"role":"assistant","content":[{"type":"thinking","thinking":"old"},{"type":"text","text":"a"}]},
+                {"role":"assistant","content":[{"type":"thinking","thinking":"new"},{"type":"text","text":"b"}]},
+            ]
+        });
+        prepare_for_openai_compat(&mut a);
+        assert!(a.get("betas").is_none());
+        assert!(a.get("context_management").is_none());
+        let msgs = a["messages"].as_array().unwrap();
+        assert!(msgs[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "thinking"));
     }
 }

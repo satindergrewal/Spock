@@ -24,6 +24,7 @@ Spock is protocol-compatible with Claude Code’s Anthropic Messages client. Ver
 
 | Spock | Claude Code CLI | Claude Code IDE extension | Host (example) | Status | Notes |
 |---|---|---|---|---|---|
+| **0.2.0** | **2.1.207** | **2.1.207** (`cc_version=2.1.207.6dd`) | VSCodium **1.128.0** (also VS Code) | **OK** | Microcompact + mid-SSE errors + log-file + webview text server tools (2026-07-13) |
 | **0.2.0** | **2.1.206** | **2.1.206** (`cc_version=2.1.206.87c`) | VSCodium **1.128.0** (also VS Code) | **OK** | Server-tool emulation + presets + Auto Mode reasoning_effort fix (2026-07-13) |
 | **0.1.0** | **2.1.206** | **2.1.206** | VSCodium **1.128.0** | **OK** | Baseline Rust multi-backend release (2026-07-11) |
 
@@ -46,7 +47,9 @@ If something breaks after a Claude Code upgrade: note **both** Spock and Claude 
 **Known limits on the verified stack (not full breakage)**
 
 - Server-tool emulation is **opt-in** via `[advisor]` / `[web_search]` in config (defaults off). Without them, `advisor_20260301` / `web_search_*` schemas are stripped for OpenAI-compat upstreams.
-- OpenAI Responses API flag exists but is not fully implemented — use Chat Completions.
+- Advisor/web_search results are rendered as **plain text** in the IDE webview (webview 2.1.207 has no `advisor_tool_result` renderer); CLI TUI still works either way.
+- OpenAI Responses API flag exists but is **not implemented** — leave `use_responses_api = false` (Chat Completions).
+- Client-side microcompact runs when Claude Code sends `context_management` edits; Anthropic passthrough leaves them for real Anthropic.
 
 ---
 
@@ -390,6 +393,8 @@ Workflows: [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/wor
 
 | Symptom | Fix |
 |---|---|
+| Need proxy logs | App: `tail -f ~/Library/Logs/Spock/spock.log` · CLI: `spock serve --log-file /tmp/spock.log` |
+| Upstream quota / 401 in IDE | Settings error banner / `spock status` → `last_err`; fix backend key/credits (not Anthropic login) |
 | `401` / SuperGrok / usage on xAI | Check API key, `XAI_TOKEN`, or `spock logout && spock login`; quota on the xAI side |
 | Claude opens “log in to Anthropic” | Often a **misread upstream error** — check Spock logs; use a valid key/OAuth; prefer latest Spock (upstream 401 → 502 with clear message) |
 | Active profile snaps back in Settings | Use latest app (profile switch persists immediately); Save & Apply |

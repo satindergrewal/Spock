@@ -7,7 +7,7 @@
 # Spock — next plan (review when back)
 
 **Written:** 2026-07-11 (NZST)  
-**Status:** WAITING for Satinder go — research + README done; **no implementation yet** for new backends or advisor.  
+**Status:** Phases 0–2 + polish largely **SHIPPED** (2026-07-13). Deferred: Responses API dialect, server-tool zoo. Hygiene batch (betas strip, microcompact, mid-SSE, log-file, last-error toast) shipped.  
 **Constraint:** Do **not** modify Claude Code / VSCode / VSCodium extension sources. Spock-only.  
 **Related:** [[spock-claude-code-compat]] [[spock-advisor-research]] [[spock-rust-port]]
 
@@ -193,7 +193,7 @@ Answer these and implementation can start without more research:
 - On every Spock release or confirmed session after Claude Code upgrade → append row to [[spock-claude-code-compat]] **and** README table  
 - On break → **Broken** row with versions + symptom before fix  
 
-Current baseline: Spock **0.1.0** + Claude Code **2.1.206**.
+Current baseline: Spock **0.2.0** + Claude Code **2.1.207** (also verified 2.1.206).
 
 ---
 
@@ -249,7 +249,7 @@ When Satinder says “add code_execution / server web_fetch / …”, check `spo
 
 ## Addendum 2026-07-12 — llama-server Settings (lan-step)
 
-**Correction:** Base URL was already `http://192.168.0.101:8081/v1` (not `/models`). Earlier misread of curl example.
+**Correction:** Base URL was already `http://10.0.0.50:8081/v1` (documentation example; not `/models`). Earlier misread of curl example.
 
 **Real issues:**
 
@@ -259,3 +259,21 @@ When Satinder says “add code_execution / server web_fetch / …”, check `spo
 4. UI: Add backend no longer defaults every row to name `ollama`; help text notes root URL + Save before Fetch.
 
 **Model id** from llama-server may be a full GGUF path — use as route target after Fetch.
+
+
+---
+
+## Addendum 2026-07-13 — hygiene batch (authorized + shipped)
+
+Satinder approved “worth doing soon” + microcompact + Settings toast; deferred zoo stays parked.
+
+| Item | Status |
+|---|---|
+| Strip Anthropic `betas` / only-keys for non-Anthropic | ✅ `prepare_for_openai_compat` |
+| Client microcompact (`clear_tool_uses` / `clear_thinking`) | ✅ |
+| Mid-SSE upstream error → SSE `error` event | ✅ |
+| `--log-file` + App `~/Library/Logs/Spock/spock.log` | ✅ |
+| Settings last-upstream-error banner | ✅ `/spock/v1/status` + toast |
+| Responses API | Honest stub only (not implemented) |
+| Server-tool zoo (code_execution, …) | **Parked** until asked |
+

@@ -8,7 +8,7 @@ use crate::route;
 use crate::state::AppState;
 use crate::translate::{
     anthropic_to_openai, count_tokens_estimate, new_msg_id, new_tool_id, openai_to_anthropic,
-    wants_thinking, BackendFamily,
+    prepare_for_openai_compat, wants_thinking, BackendFamily,
 };
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -341,6 +341,11 @@ fn handle_admin_status(stream: &mut TcpStream, state: &AppState) -> Result<()> {
             "config_path": crate::config::config_path().display().to_string(),
             "auth_path": crate::config::auth_path().display().to_string(),
             "xai_auth": auth,
+            "last_upstream_error": state.last_error_snapshot().map(|e| json!({
+                "message": e.message,
+                "status": e.status,
+                "at_unix": e.at_unix,
+            })),
         }),
     )
 }
@@ -486,7 +491,7 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
     )
 }
 
-fn handle_messages(sock: &mut TcpStream, state: &AppState, a: Value) -> Result<()> {
+fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Result<()> {
     let client_model = a
         .get("model")
         .and_then(|m| m.as_str())
@@ -514,6 +519,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, a: Value) -> Result<(
 
     let env = EnvOverrides::from_env();
     // Anthropic passthrough: forward Messages JSON with only model rewritten to upstream id.
+    // Keep betas / context_management — real Anthropic understands them.
     if be.family == BackendFamily::Anthropic {
         let mut body = a.clone();
         if let Some(obj) = body.as_object_mut() {
@@ -543,9 +549,12 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, a: Value) -> Result<(
                 }
                 Ok(())
             }
-            Err(e) => write_upstream_err(sock, e),
+            Err(e) => write_upstream_err(sock, state, e),
         };
     }
+
+    // Microcompact + drop Anthropic-only keys before OpenAI-compat / xAI translation.
+    prepare_for_openai_compat(&mut a);
 
     let oai = anthropic_to_openai(&a, &resolved.upstream_model, be.family, &env.grok_model);
     let include_thinking = wants_thinking(&a);
@@ -611,7 +620,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, a: Value) -> Result<(
                 }
                 return write_json(sock, 200, &resp);
             }
-            Err(e) => return write_upstream_err(sock, e),
+            Err(e) => return write_upstream_err(sock, state, e),
         }
     }
 
@@ -625,18 +634,18 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, a: Value) -> Result<(
                 let (st, err) = anthropic_error(500, "api_error", "unexpected stream");
                 write_json(sock, st, &err)
             }
-            Err(e) => write_upstream_err(sock, e),
+            Err(e) => write_upstream_err(sock, state, e),
         }
     } else {
         match be.chat(&oai, true, &state.tokens) {
             Ok(UpstreamBody::Stream(reader)) => {
-                stream_anthropic(sock, reader, &client_model, include_thinking)
+                stream_anthropic(sock, reader, &client_model, include_thinking, state)
             }
             Ok(UpstreamBody::Json(o)) => {
                 let resp = openai_to_anthropic(&o, &client_model, include_thinking);
                 write_json(sock, 200, &resp)
             }
-            Err(e) => write_upstream_err(sock, e),
+            Err(e) => write_upstream_err(sock, state, e),
         }
     }
 }
@@ -777,6 +786,7 @@ fn stream_anthropic(
     reader: Box<dyn Read + Send>,
     req_model: &str,
     include_thinking: bool,
+    state: &AppState,
 ) -> Result<()> {
     write_sse_headers(stream)?;
     let msg_id = new_msg_id();
@@ -803,12 +813,16 @@ fn stream_anthropic(
     let mut chunks_out: u64 = 0;
     let mut finish: Option<String> = None;
     let mut usage = json!({});
+    let mut mid_stream_err: Option<String> = None;
 
     let buffered = BufReader::new(reader);
     for line in buffered.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break,
+            Err(e) => {
+                mid_stream_err = Some(format!("stream read error: {e}"));
+                break;
+            }
         };
         let line = line.trim();
         if !line.starts_with("data:") {
@@ -822,6 +836,18 @@ fn stream_anthropic(
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // Some OpenAI-compat servers emit error objects mid-SSE after 200 headers.
+        if let Some(err) = chunk.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| err.to_string());
+            mid_stream_err = Some(format!("upstream stream error: {msg}"));
+            break;
+        }
+
         if let Some(u) = chunk.get("usage") {
             usage = u.clone();
         }
@@ -960,6 +986,24 @@ fn stream_anthropic(
         }
     }
 
+    if let Some(err_msg) = mid_stream_err {
+        // Close open content block, then emit Anthropic error event so the IDE
+        // shows a real failure instead of a silent truncated stream.
+        if block.is_some() {
+            let _ = emit_sse(
+                stream,
+                "content_block_stop",
+                &json!({"type":"content_block_stop","index": index}),
+            );
+        }
+        state.record_upstream_error(502, &err_msg);
+        let (_st, err_body) = anthropic_error(502, "api_error", &format!("Spock {err_msg}"));
+        let _ = emit_sse(stream, "error", &err_body);
+        let _ = emit_sse(stream, "message_stop", &json!({"type": "message_stop"}));
+        eprintln!("  mid-SSE error: {err_msg}");
+        return Ok(());
+    }
+
     if block.is_some() {
         emit_sse(
             stream,
@@ -1044,21 +1088,23 @@ fn handle_openai(sock: &mut TcpStream, state: &AppState, mut body: Value) -> Res
             }
             Ok(())
         }
-        Err(e) => write_upstream_err(sock, e),
+        Err(e) => write_upstream_err(sock, state, e),
     }
 }
 
-fn write_upstream_err(stream: &mut TcpStream, e: Error) -> Result<()> {
+fn write_upstream_err(stream: &mut TcpStream, state: &AppState, e: Error) -> Result<()> {
     match e {
         Error::Http(code, body) => {
             let raw = extract_err_msg(&body);
             let (out_status, err_type, msg) = classify_upstream_http(code, &raw);
+            state.record_upstream_error(out_status, &msg);
             let (st, err) = anthropic_error(out_status, err_type, &msg);
             write_json(stream, st, &err)
         }
         other => {
-            let (st, err) =
-                anthropic_error(502, "api_error", &format!("spock backend error: {other}"));
+            let msg = format!("spock backend error: {other}");
+            state.record_upstream_error(502, &msg);
+            let (st, err) = anthropic_error(502, "api_error", &msg);
             write_json(stream, st, &err)
         }
     }

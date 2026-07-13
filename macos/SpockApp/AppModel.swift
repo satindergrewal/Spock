@@ -61,6 +61,11 @@ final class AppModel: ObservableObject {
     @Published var webSearchApiKeyEnv = ""
     @Published var webSearchMaxResults: Int = 5
 
+    /// Last upstream error from proxy (quota / 401 / mid-SSE) for Settings toast.
+    @Published var lastUpstreamError: String = ""
+    @Published var lastUpstreamErrorAt: TimeInterval = 0
+    private var lastSeenErrorAt: TimeInterval = 0
+
     /// Tray should repaint when status color changes.
     var onStatusChange: (() -> Void)?
 
@@ -85,8 +90,13 @@ final class AppModel: ObservableObject {
         }
         let proc = Process()
         proc.executableURL = bin
-        proc.arguments = ["serve", "--port", "\(port)"]
-        let log = FileManager.default.temporaryDirectory.appendingPathComponent("spock-app.log")
+        // Prefer ~/Library/Logs/Spock/spock.log for easy `tail -f`
+        let logDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/Spock", isDirectory: true)
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        let log = logDir.appendingPathComponent("spock.log")
+        proc.arguments = ["serve", "--port", "\(port)", "--log-file", log.path]
+        // Also capture any pre-log-file stderr into the same path.
         FileManager.default.createFile(atPath: log.path, contents: nil)
         if let fh = try? FileHandle(forWritingTo: log) {
             proc.standardOutput = fh
@@ -152,6 +162,17 @@ final class AppModel: ObservableObject {
                 } else {
                     authPresent = false
                     authSource = "none"
+                }
+                // Surface last upstream error as a Settings toast once per new event.
+                if let err = status["last_upstream_error"] as? [String: Any],
+                   let msg = err["message"] as? String, !msg.isEmpty {
+                    let at = (err["at_unix"] as? Double) ?? 0
+                    lastUpstreamError = msg
+                    lastUpstreamErrorAt = at
+                    if at > lastSeenErrorAt {
+                        lastSeenErrorAt = at
+                        setStatus(msg, error: true)
+                    }
                 }
             }
         } else {
@@ -634,6 +655,11 @@ final class AppModel: ObservableObject {
     private func setStatus(_ msg: String, error: Bool) {
         statusMessage = msg
         statusIsError = error
+    }
+
+    func dismissStatus() {
+        statusMessage = ""
+        statusIsError = false
     }
 }
 
