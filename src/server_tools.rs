@@ -239,15 +239,6 @@ pub fn inject_emulated_function_tools(
     }
 }
 
-fn short_id(prefix: &str) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{prefix}{:x}", t % 0xffff_ffff)
-}
-
 /// Run advisor review via a nested chat completion.
 pub fn run_advisor_review(
     state: &AppState,
@@ -656,7 +647,13 @@ pub fn run_with_server_tools(
                 .unwrap_or("{}");
             let args: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
 
-            let (tool_result_content, server_blocks) = match name {
+            // Emit plain text blocks (not server_tool_use / advisor_tool_result).
+                // Claude Code CLI has AdvisorMessage; the VSCodium/VS Code webview
+                // (2.1.207) has no renderer for those types and prints
+                // "Unsupported content type: server_tool_use|advisor_tool_result".
+                // Text is rendered everywhere; the multi-round OAI tool loop still
+                // feeds the model the full review via role=tool messages.
+                let (tool_result_content, server_blocks) = match name {
                 "advisor" if want_advisor => {
                     let review = run_advisor_review(
                         state,
@@ -664,20 +661,12 @@ pub fn run_with_server_tools(
                         &advisor_hint,
                         advisor_cfg.max_tokens,
                     )?;
-                    let sid = short_id("srvtoolu_");
-                    let blocks = vec![
-                        json!({
-                            "type": "server_tool_use",
-                            "id": sid,
-                            "name": "advisor",
-                            "input": {}
-                        }),
-                        json!({
-                            "type": "advisor_tool_result",
-                            "tool_use_id": sid,
-                            "content": {"type": "advisor_result", "text": review}
-                        }),
-                    ];
+                    let display = if review.trim().is_empty() {
+                        "Advisor reviewed the conversation (empty response).".to_string()
+                    } else {
+                        format!("Advisor review:\n\n{review}")
+                    };
+                    let blocks = vec![json!({"type": "text", "text": display})];
                     (review, blocks)
                 }
                 "web_search" if want_web => {
@@ -687,21 +676,13 @@ pub fn run_with_server_tools(
                         .unwrap_or("")
                         .to_string();
                     let results = run_web_search(web_cfg, &query)?;
-                    let sid = short_id("srvtoolu_");
                     let text = results.to_string();
-                    let blocks = vec![
-                        json!({
-                            "type": "server_tool_use",
-                            "id": sid,
-                            "name": "web_search",
-                            "input": {"query": query}
-                        }),
-                        json!({
-                            "type": "web_search_tool_result",
-                            "tool_use_id": sid,
-                            "content": results
-                        }),
-                    ];
+                    let display = if query.is_empty() {
+                        format!("Web search results:\n{text}")
+                    } else {
+                        format!("Web search for “{query}”:\n{text}")
+                    };
+                    let blocks = vec![json!({"type": "text", "text": display})];
                     (text, blocks)
                 }
                 // Unreachable (filtered above) — defensive.
