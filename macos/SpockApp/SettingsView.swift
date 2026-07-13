@@ -281,10 +281,13 @@ struct SettingsView: View {
                         .help("When Claude Code sends advisor_20260301, Spock runs a nested review on another model route.")
                     HStack(spacing: 12) {
                         labeled("Advisor model (optional)") {
-                            TextField("e.g. xai:grok-4.5 or leave empty for fable route", text: $model.advisorModel)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(minWidth: 280)
-                                .disabled(!model.advisorEnabled)
+                            // Same route picker style as Profiles & routes
+                            routeField(
+                                text: $model.advisorModel,
+                                placeholder: "backend:model or leave empty"
+                            )
+                            .frame(minWidth: 280)
+                            .disabled(!model.advisorEnabled)
                         }
                         labeled("Max tokens") {
                             TextField("4096", value: $model.advisorMaxTokens, format: .number)
@@ -293,7 +296,7 @@ struct SettingsView: View {
                                 .disabled(!model.advisorEnabled)
                         }
                     }
-                    Text("Empty model → Claude’s tools[].model / Spock fable role / profile default.")
+                    Text("Pick a fetched backend:model (Fetch models first), or leave empty for Claude tools[].model / fable / profile default.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -307,12 +310,13 @@ struct SettingsView: View {
                     HStack(spacing: 12) {
                         labeled("Provider") {
                             Picker("", selection: $model.webSearchProvider) {
-                                Text("duckduckgo (no key)").tag("duckduckgo")
+                                Text("searxng (local, recommended)").tag("searxng")
+                                Text("duckduckgo (no key, limited)").tag("duckduckgo")
                                 Text("brave").tag("brave")
                                 Text("serper").tag("serper")
                             }
                             .labelsHidden()
-                            .frame(minWidth: 180)
+                            .frame(minWidth: 220)
                             .disabled(!model.webSearchEnabled)
                         }
                         labeled("Max results") {
@@ -322,26 +326,56 @@ struct SettingsView: View {
                                 .disabled(!model.webSearchEnabled)
                         }
                     }
-                    HStack(spacing: 12) {
-                        labeled("API key (optional)") {
-                            SecureField("Brave / Serper key", text: $model.webSearchApiKey)
+                    if model.webSearchProvider == "searxng" || model.webSearchProvider == "searx" {
+                        labeled("SearXNG base URL") {
+                            TextField("http://127.0.0.1:8888", text: $model.webSearchBaseURL)
                                 .textFieldStyle(.roundedBorder)
-                                .frame(minWidth: 200)
+                                .frame(minWidth: 300)
                                 .disabled(!model.webSearchEnabled)
+                                .help("Root of your SearXNG instance (no /search path). JSON format must be enabled.")
                         }
-                        labeled("Or env var name") {
-                            TextField("BRAVE_API_KEY", text: $model.webSearchApiKeyEnv)
+                    }
+                    if model.webSearchProvider == "brave" || model.webSearchProvider == "serper" {
+                        HStack(spacing: 12) {
+                            labeled("API key") {
+                                SecureField("API key", text: $model.webSearchApiKey)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(minWidth: 200)
+                                    .disabled(!model.webSearchEnabled)
+                            }
+                            labeled("Or env var name") {
+                                TextField(
+                                    model.webSearchProvider == "brave" ? "BRAVE_API_KEY" : "SERPER_API_KEY",
+                                    text: $model.webSearchApiKeyEnv
+                                )
                                 .textFieldStyle(.roundedBorder)
                                 .frame(minWidth: 160)
                                 .disabled(!model.webSearchEnabled)
+                            }
                         }
                     }
-                    Text("DuckDuckGo Instant Answer is keyless but limited. Prefer Brave (BRAVE_API_KEY) for better results.")
+                    Text(webSearchHelp)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(8)
+        }
+    }
+
+    private var webSearchHelp: String {
+        switch model.webSearchProvider {
+        case "searxng", "searx":
+            return "Uses your local SearXNG JSON API (no cloud key). Ensure format=json is allowed. Best option if you already run SearXNG."
+        case "duckduckgo":
+            return "Keyless DuckDuckGo Instant Answer — works with only Enable, but often thin results. Prefer SearXNG if you have it."
+        case "brave":
+            return "Brave Search API — set API key or BRAVE_API_KEY."
+        case "serper":
+            return "Serper.dev Google proxy — set API key or SERPER_API_KEY."
+        default:
+            return "Choose a provider and Save & Apply."
         }
     }
 

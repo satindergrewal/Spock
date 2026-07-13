@@ -39,6 +39,9 @@ pub struct WebSearchDoc {
     pub enabled: bool,
     #[serde(default = "default_ws_provider_doc")]
     pub provider: String,
+    /// SearXNG (or custom) base URL, e.g. http://127.0.0.1:8888
+    #[serde(default)]
+    pub base_url: String,
     #[serde(default)]
     pub api_key: String,
     #[serde(default)]
@@ -59,6 +62,7 @@ impl Default for WebSearchDoc {
         Self {
             enabled: false,
             provider: default_ws_provider_doc(),
+            base_url: String::new(),
             api_key: String::new(),
             api_key_env: String::new(),
             max_results: default_ws_max_doc(),
@@ -186,6 +190,7 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
             } else {
                 cfg.web_search.provider.clone()
             },
+            base_url: cfg.web_search.base_url.clone().unwrap_or_default(),
             api_key: cfg.web_search.api_key.clone().unwrap_or_default(),
             api_key_env: cfg.web_search.api_key_env.clone().unwrap_or_default(),
             max_results: if cfg.web_search.max_results == 0 {
@@ -371,6 +376,7 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
                     p.to_string()
                 }
             },
+            base_url: opt_str(&doc.web_search.base_url),
             api_key: opt_str(&doc.web_search.api_key),
             api_key_env: opt_str(&doc.web_search.api_key_env),
             max_results: if doc.web_search.max_results == 0 {

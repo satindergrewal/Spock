@@ -81,6 +81,9 @@ pub struct WebSearchSection {
     pub enabled: bool,
     #[serde(default = "default_ws_provider")]
     pub provider: String,
+    /// SearXNG (or custom) base, e.g. http://127.0.0.1:8888 — no path.
+    #[serde(default)]
+    pub base_url: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
@@ -101,6 +104,7 @@ impl Default for WebSearchSection {
         Self {
             enabled: false,
             provider: default_ws_provider(),
+            base_url: None,
             api_key: None,
             api_key_env: None,
             max_results: default_ws_max(),

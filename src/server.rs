@@ -564,6 +564,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, a: Value) -> Result<(
         crate::server_tools::WebSearchConfig {
             enabled: c.web_search.enabled,
             provider: c.web_search.provider.clone(),
+            base_url: c.web_search.base_url.clone(),
             api_key: c.web_search.api_key.clone(),
             api_key_env: c.web_search.api_key_env.clone(),
             max_results: c.web_search.max_results,

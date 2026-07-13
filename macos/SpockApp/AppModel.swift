@@ -56,6 +56,7 @@ final class AppModel: ObservableObject {
     @Published var advisorMaxTokens: Int = 4096
     @Published var webSearchEnabled = false
     @Published var webSearchProvider = "duckduckgo"
+    @Published var webSearchBaseURL = "http://127.0.0.1:8888"
     @Published var webSearchApiKey = ""
     @Published var webSearchApiKeyEnv = ""
     @Published var webSearchMaxResults: Int = 5
@@ -232,6 +233,8 @@ final class AppModel: ObservableObject {
             webSearchEnabled = ws["enabled"] as? Bool ?? false
             let prov = (ws["provider"] as? String ?? "duckduckgo").trimmingCharacters(in: .whitespacesAndNewlines)
             webSearchProvider = prov.isEmpty ? "duckduckgo" : prov
+            let bu = (ws["base_url"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            webSearchBaseURL = bu.isEmpty ? "http://127.0.0.1:8888" : bu
             webSearchApiKey = ws["api_key"] as? String ?? ""
             webSearchApiKeyEnv = ws["api_key_env"] as? String ?? ""
             if let mr = ws["max_results"] as? Int {
@@ -242,6 +245,7 @@ final class AppModel: ObservableObject {
         } else {
             webSearchEnabled = false
             webSearchProvider = "duckduckgo"
+            webSearchBaseURL = "http://127.0.0.1:8888"
             webSearchApiKey = ""
             webSearchApiKeyEnv = ""
             webSearchMaxResults = 5
@@ -258,8 +262,10 @@ final class AppModel: ObservableObject {
         advisorModel = advisorModel.trimmingCharacters(in: .whitespacesAndNewlines)
         webSearchApiKey = webSearchApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         webSearchApiKeyEnv = webSearchApiKeyEnv.trimmingCharacters(in: .whitespacesAndNewlines)
+        webSearchBaseURL = webSearchBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let prov = webSearchProvider.trimmingCharacters(in: .whitespacesAndNewlines)
         webSearchProvider = prov.isEmpty ? "duckduckgo" : prov
+        if webSearchBaseURL.isEmpty { webSearchBaseURL = "http://127.0.0.1:8888" }
         if advisorMaxTokens <= 0 { advisorMaxTokens = 4096 }
         if webSearchMaxResults <= 0 { webSearchMaxResults = 5 }
 
@@ -299,6 +305,7 @@ final class AppModel: ObservableObject {
             "web_search": [
                 "enabled": webSearchEnabled,
                 "provider": webSearchProvider,
+                "base_url": webSearchBaseURL,
                 "api_key": webSearchApiKey,
                 "api_key_env": webSearchApiKeyEnv,
                 "max_results": webSearchMaxResults,

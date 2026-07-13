@@ -32,6 +32,7 @@ impl Default for AdvisorConfig {
 pub struct WebSearchConfig {
     pub enabled: bool,
     pub provider: String,
+    pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub max_results: u32,
@@ -42,6 +43,7 @@ impl Default for WebSearchConfig {
         Self {
             enabled: false,
             provider: "duckduckgo".into(),
+            base_url: None,
             api_key: None,
             api_key_env: None,
             max_results: 5,
@@ -74,6 +76,10 @@ impl WebSearchConfig {
                 .and_then(|v| v.as_str())
                 .unwrap_or("duckduckgo")
                 .to_string(),
+            base_url: t
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             api_key: t
                 .get("api_key")
                 .and_then(|v| v.as_str())
@@ -337,6 +343,15 @@ pub fn run_web_search(cfg: &WebSearchConfig, query: &str) -> Result<Value> {
     let provider = cfg.provider.to_ascii_lowercase();
     let key = cfg.resolve_key();
 
+    if provider == "searxng" || provider == "searx" {
+        let base = cfg
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("http://127.0.0.1:8888");
+        return searxng_search(base, q, max);
+    }
     if (provider == "brave" || key.as_ref().map(|k| k.starts_with("BSA")).unwrap_or(false))
         && key.is_some()
     {
@@ -400,6 +415,40 @@ fn serper_search(key: &str, q: &str, max: usize) -> Result<Value> {
                 "snippet": r.get("snippet").and_then(|t| t.as_str()).unwrap_or(""),
             }));
         }
+    }
+    Ok(json!(results))
+}
+
+fn searxng_search(base: &str, q: &str, max: usize) -> Result<Value> {
+    let base = base.trim_end_matches('/');
+    let url = format!(
+        "{base}/search?q={}&format=json",
+        urlencoding_lite(q)
+    );
+    let resp = agent()
+        .get(&url)
+        .set("Accept", "application/json")
+        .call()
+        .map_err(|e| Error::Msg(format!("searxng: {e}")))?;
+    let v: Value = resp
+        .into_json()
+        .map_err(|e| Error::Msg(format!("searxng json: {e}")))?;
+    let mut results = Vec::new();
+    if let Some(arr) = v.get("results").and_then(|r| r.as_array()) {
+        for r in arr.iter().take(max) {
+            results.push(json!({
+                "title": r.get("title").and_then(|t| t.as_str()).unwrap_or(""),
+                "url": r.get("url").and_then(|t| t.as_str()).unwrap_or(""),
+                "snippet": r.get("content").and_then(|t| t.as_str()).unwrap_or(""),
+            }));
+        }
+    }
+    if results.is_empty() {
+        results.push(json!({
+            "title": "No results",
+            "url": format!("{base}/search?q={}", urlencoding_lite(q)),
+            "snippet": "SearXNG returned no results for this query."
+        }));
     }
     Ok(json!(results))
 }
@@ -691,10 +740,26 @@ mod tests {
     }
 
     #[test]
+    fn searxng_results_extraction() {
+        let cfg = WebSearchConfig {
+            enabled: true,
+            provider: "searxng".into(),
+            base_url: Some("http://127.0.0.1:8888".into()),
+            api_key: None,
+            api_key_env: None,
+            max_results: 3,
+        };
+        // Provider must route to searxng branch (no key required).
+        assert_eq!(cfg.provider, "searxng");
+        assert_eq!(cfg.base_url.as_deref(), Some("http://127.0.0.1:8888"));
+    }
+
+    #[test]
     fn empty_query_errors() {
         let cfg = WebSearchConfig {
             enabled: true,
             provider: "duckduckgo".into(),
+            base_url: None,
             api_key: None,
             api_key_env: None,
             max_results: 3,
