@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-/// Menu-bar agent entry. No persistent Dock icon (LSUIElement + .accessory).
+/// Menu-bar agent entry. Dock + Cmd+Tab only while Settings/Chat are open.
 @main
 struct SpockApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -22,7 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var menuRefreshTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Force menu-bar agent behavior even if Info.plist is stale.
+        // Start as menu-bar agent (no Dock). Windows promote to .regular.
         NSApp.setActivationPolicy(.accessory)
         AppModel.shared.startProxyIfNeeded()
         setupStatusItem()
@@ -39,8 +39,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         false
     }
 
+    /// Dock / Cmd+Tab re-activation while a window exists: bring it forward.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if hasOpenDocumentWindows {
+            if settingsWindow?.isVisible == true || settingsWindow?.isMiniaturized == true {
+                showWindow(settingsWindow)
+            } else if chatWindow?.isVisible == true || chatWindow?.isMiniaturized == true {
+                showWindow(chatWindow)
+            }
+            return true
+        }
+        // No windows — stay accessory (menu bar only).
+        return false
+    }
+
     func applicationDidBecomeActive(_ notification: Notification) {
-        enforceAccessoryIfNoWindows()
+        // If user Cmd+Tabbed to us with no windows, drop back to accessory.
+        if !hasOpenDocumentWindows {
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
+    private var hasOpenDocumentWindows: Bool {
+        let settingsOpen =
+            settingsWindow.map { $0.isVisible || $0.isMiniaturized } ?? false
+        let chatOpen =
+            chatWindow.map { $0.isVisible || $0.isMiniaturized } ?? false
+        return settingsOpen || chatOpen
     }
 
     private func setupStatusItem() {
@@ -162,7 +187,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let hosting = NSHostingController(rootView: view)
             let window = NSWindow(contentViewController: hosting)
             window.title = "Spock Settings"
-            window.setContentSize(NSSize(width: 760, height: 620))
+            // Taller for Server tools section (advisor / web search).
+            window.setContentSize(NSSize(width: 780, height: 760))
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             window.isReleasedWhenClosed = false
             window.delegate = self
@@ -173,15 +199,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         AppModel.shared.refresh()
     }
 
-    /// Show window while staying a menu-bar agent (no Dock icon).
+    /// Show Settings/Chat as a normal app window: Dock + Cmd+Tab while open.
     private func showWindow(_ window: NSWindow?) {
         guard let window else { return }
-        NSApp.setActivationPolicy(.accessory)
+        // .regular → appears in Dock and Cmd+Tab. Menu bar status item stays.
+        NSApp.setActivationPolicy(.regular)
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async {
-            NSApp.setActivationPolicy(.accessory)
-        }
     }
 
     @objc private func reloadConfig() {
@@ -199,19 +226,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - NSWindowDelegate
 
     func windowWillClose(_ notification: Notification) {
+        // Defer until after the window is actually gone from isVisible.
         DispatchQueue.main.async { [weak self] in
             self?.enforceAccessoryIfNoWindows()
         }
     }
 
+    func windowDidMiniaturize(_ notification: Notification) {
+        // Keep .regular so user can Cmd+Tab / Dock back to the minimized window.
+        NSApp.setActivationPolicy(.regular)
+    }
+
+    /// When no Settings/Chat windows remain, hide Dock icon again — do not quit.
     private func enforceAccessoryIfNoWindows() {
-        let anyVisible =
-            (settingsWindow?.isVisible == true) || (chatWindow?.isVisible == true)
-        if !anyVisible {
-            NSApp.setActivationPolicy(.accessory)
-            // Drop focus chrome; status item stays.
-            NSApp.hide(nil)
+        guard !hasOpenDocumentWindows else {
+            NSApp.setActivationPolicy(.regular)
+            return
         }
+        NSApp.setActivationPolicy(.accessory)
+        // Drop app focus chrome; menu bar status item + proxy keep running.
+        // Do not terminate.
     }
 }
 
