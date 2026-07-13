@@ -12,6 +12,7 @@ struct SettingsView: View {
                     serverSection
                     backendsSection
                     profilesSection
+                    serverToolsSection
                 }
                 .padding(20)
             }
@@ -259,6 +260,85 @@ struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                }
+            }
+            .padding(8)
+        }
+    }
+
+    /// Spock-native server tools (advisor + web search). Not Claude Code / VSCodium settings.
+    private var serverToolsSection: some View {
+        GroupBox("Server tools (Spock)") {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Emulates Anthropic server tools on Spock. Off by default. Save & Apply writes [advisor] / [web_search] in config.toml.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // Advisor
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle("Enable advisor", isOn: $model.advisorEnabled)
+                        .help("When Claude Code sends advisor_20260301, Spock runs a nested review on another model route.")
+                    HStack(spacing: 12) {
+                        labeled("Advisor model (optional)") {
+                            TextField("e.g. xai:grok-4.5 or leave empty for fable route", text: $model.advisorModel)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 280)
+                                .disabled(!model.advisorEnabled)
+                        }
+                        labeled("Max tokens") {
+                            TextField("4096", value: $model.advisorMaxTokens, format: .number)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 90)
+                                .disabled(!model.advisorEnabled)
+                        }
+                    }
+                    Text("Empty model → Claude’s tools[].model / Spock fable role / profile default.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Divider()
+
+                // Web search
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle("Enable web search", isOn: $model.webSearchEnabled)
+                        .help("Emulates web_search_20250305 for Claude Code WebSearch nested calls.")
+                    HStack(spacing: 12) {
+                        labeled("Provider") {
+                            Picker("", selection: $model.webSearchProvider) {
+                                Text("duckduckgo (no key)").tag("duckduckgo")
+                                Text("brave").tag("brave")
+                                Text("serper").tag("serper")
+                            }
+                            .labelsHidden()
+                            .frame(minWidth: 180)
+                            .disabled(!model.webSearchEnabled)
+                        }
+                        labeled("Max results") {
+                            TextField("5", value: $model.webSearchMaxResults, format: .number)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 70)
+                                .disabled(!model.webSearchEnabled)
+                        }
+                    }
+                    HStack(spacing: 12) {
+                        labeled("API key (optional)") {
+                            SecureField("Brave / Serper key", text: $model.webSearchApiKey)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 200)
+                                .disabled(!model.webSearchEnabled)
+                        }
+                        labeled("Or env var name") {
+                            TextField("BRAVE_API_KEY", text: $model.webSearchApiKeyEnv)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 160)
+                                .disabled(!model.webSearchEnabled)
+                        }
+                    }
+                    Text("DuckDuckGo Instant Answer is keyless but limited. Prefer Brave (BRAVE_API_KEY) for better results.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(8)

@@ -50,6 +50,16 @@ final class AppModel: ObservableObject {
     @Published var discoveredModels: [String: [String]] = [:]
     @Published var discoveringBackend: String? = nil
 
+    // Server-tool emulation (Spock 0.2.0+) — saved under [advisor] / [web_search]
+    @Published var advisorEnabled = false
+    @Published var advisorModel = ""
+    @Published var advisorMaxTokens: Int = 4096
+    @Published var webSearchEnabled = false
+    @Published var webSearchProvider = "duckduckgo"
+    @Published var webSearchApiKey = ""
+    @Published var webSearchApiKeyEnv = ""
+    @Published var webSearchMaxResults: Int = 5
+
     /// Tray should repaint when status color changes.
     var onStatusChange: (() -> Void)?
 
@@ -205,6 +215,37 @@ final class AppModel: ObservableObject {
             }
             profiles = profileRows.map(\.name).sorted()
         }
+        if let adv = raw["advisor"] as? [String: Any] {
+            advisorEnabled = adv["enabled"] as? Bool ?? false
+            advisorModel = adv["model"] as? String ?? ""
+            if let mt = adv["max_tokens"] as? Int {
+                advisorMaxTokens = mt > 0 ? mt : 4096
+            } else if let mt = adv["max_tokens"] as? Double {
+                advisorMaxTokens = mt > 0 ? Int(mt) : 4096
+            }
+        } else {
+            advisorEnabled = false
+            advisorModel = ""
+            advisorMaxTokens = 4096
+        }
+        if let ws = raw["web_search"] as? [String: Any] {
+            webSearchEnabled = ws["enabled"] as? Bool ?? false
+            let prov = (ws["provider"] as? String ?? "duckduckgo").trimmingCharacters(in: .whitespacesAndNewlines)
+            webSearchProvider = prov.isEmpty ? "duckduckgo" : prov
+            webSearchApiKey = ws["api_key"] as? String ?? ""
+            webSearchApiKeyEnv = ws["api_key_env"] as? String ?? ""
+            if let mr = ws["max_results"] as? Int {
+                webSearchMaxResults = mr > 0 ? mr : 5
+            } else if let mr = ws["max_results"] as? Double {
+                webSearchMaxResults = mr > 0 ? Int(mr) : 5
+            }
+        } else {
+            webSearchEnabled = false
+            webSearchProvider = "duckduckgo"
+            webSearchApiKey = ""
+            webSearchApiKeyEnv = ""
+            webSearchMaxResults = 5
+        }
     }
 
     func saveConfig() {
@@ -214,8 +255,16 @@ final class AppModel: ObservableObject {
             backends[i].baseURL = backends[i].baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             backends[i].apiKey = backends[i].apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        advisorModel = advisorModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        webSearchApiKey = webSearchApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        webSearchApiKeyEnv = webSearchApiKeyEnv.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prov = webSearchProvider.trimmingCharacters(in: .whitespacesAndNewlines)
+        webSearchProvider = prov.isEmpty ? "duckduckgo" : prov
+        if advisorMaxTokens <= 0 { advisorMaxTokens = 4096 }
+        if webSearchMaxResults <= 0 { webSearchMaxResults = 5 }
+
         let body: [String: Any] = [
-            "version": "0.1.0",
+            "version": "0.2.0",
             "config_path": configPath,
             "server": [
                 "bind": bind,
@@ -228,6 +277,8 @@ final class AppModel: ObservableObject {
                     "type": b.type,
                     "base_url": b.baseURL,
                     "api_key": b.apiKey,
+                    "api_key_env": "",
+                    "extra_headers_text": "",
                 ] as [String: Any]
             },
             "profiles": profileRows.map { p in
@@ -240,6 +291,18 @@ final class AppModel: ObservableObject {
                     "fable": p.fable,
                 ] as [String: Any]
             },
+            "advisor": [
+                "enabled": advisorEnabled,
+                "model": advisorModel,
+                "max_tokens": advisorMaxTokens,
+            ] as [String: Any],
+            "web_search": [
+                "enabled": webSearchEnabled,
+                "provider": webSearchProvider,
+                "api_key": webSearchApiKey,
+                "api_key_env": webSearchApiKeyEnv,
+                "max_results": webSearchMaxResults,
+            ] as [String: Any],
         ]
         if let resp = putJSON(path: "/spock/v1/config", body: body) {
             if let ok = resp["ok"] as? Bool, ok {

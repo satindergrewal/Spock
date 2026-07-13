@@ -13,6 +13,57 @@ pub struct SettingsDoc {
     pub server: ServerDoc,
     pub backends: Vec<BackendDoc>,
     pub profiles: Vec<ProfileDoc>,
+    #[serde(default)]
+    pub advisor: AdvisorDoc,
+    #[serde(default)]
+    pub web_search: WebSearchDoc,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AdvisorDoc {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "default_advisor_max_tokens")]
+    pub max_tokens: u32,
+}
+
+fn default_advisor_max_tokens() -> u32 {
+    4096
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WebSearchDoc {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ws_provider_doc")]
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_key_env: String,
+    #[serde(default = "default_ws_max_doc")]
+    pub max_results: u32,
+}
+
+fn default_ws_provider_doc() -> String {
+    "duckduckgo".into()
+}
+fn default_ws_max_doc() -> u32 {
+    5
+}
+
+impl Default for WebSearchDoc {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_ws_provider_doc(),
+            api_key: String::new(),
+            api_key_env: String::new(),
+            max_results: default_ws_max_doc(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -119,6 +170,30 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
         },
         backends,
         profiles,
+        advisor: AdvisorDoc {
+            enabled: cfg.advisor.enabled,
+            model: cfg.advisor.model.clone().unwrap_or_default(),
+            max_tokens: if cfg.advisor.max_tokens == 0 {
+                4096
+            } else {
+                cfg.advisor.max_tokens
+            },
+        },
+        web_search: WebSearchDoc {
+            enabled: cfg.web_search.enabled,
+            provider: if cfg.web_search.provider.trim().is_empty() {
+                "duckduckgo".into()
+            } else {
+                cfg.web_search.provider.clone()
+            },
+            api_key: cfg.web_search.api_key.clone().unwrap_or_default(),
+            api_key_env: cfg.web_search.api_key_env.clone().unwrap_or_default(),
+            max_results: if cfg.web_search.max_results == 0 {
+                5
+            } else {
+                cfg.web_search.max_results
+            },
+        },
     }
 }
 
@@ -256,6 +331,15 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
         bind
     };
 
+    let opt_str = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+
     Ok(Config {
         server: crate::config::ServerConfig {
             bind,
@@ -268,13 +352,33 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
         },
         backends,
         profiles,
-        // Settings UI does not edit these yet — preserve from disk when present.
-        advisor: crate::config::Config::load(&crate::config::config_path())
-            .map(|c| c.advisor)
-            .unwrap_or_default(),
-        web_search: crate::config::Config::load(&crate::config::config_path())
-            .map(|c| c.web_search)
-            .unwrap_or_default(),
+        advisor: crate::config::AdvisorSection {
+            enabled: doc.advisor.enabled,
+            model: opt_str(&doc.advisor.model),
+            max_tokens: if doc.advisor.max_tokens == 0 {
+                4096
+            } else {
+                doc.advisor.max_tokens
+            },
+        },
+        web_search: crate::config::WebSearchSection {
+            enabled: doc.web_search.enabled,
+            provider: {
+                let p = doc.web_search.provider.trim();
+                if p.is_empty() {
+                    "duckduckgo".into()
+                } else {
+                    p.to_string()
+                }
+            },
+            api_key: opt_str(&doc.web_search.api_key),
+            api_key_env: opt_str(&doc.web_search.api_key_env),
+            max_results: if doc.web_search.max_results == 0 {
+                5
+            } else {
+                doc.web_search.max_results
+            },
+        },
     })
 }
 
