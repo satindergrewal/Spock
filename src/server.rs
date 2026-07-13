@@ -677,21 +677,76 @@ fn stream_json_as_anthropic_sse(stream: &mut TcpStream, resp: &Value) -> Result<
         .cloned()
         .unwrap_or_default();
     for (i, block) in blocks.iter().enumerate() {
+        let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // Anthropic streaming clients (Claude Code) expect tool_use / server_tool_use
+        // to start with empty input and receive arguments via input_json_delta.
+        // Dumping the full input only in content_block_start leaves input={} →
+        // "missing parameter" on every client tool when advisor/web_search force
+        // this synthetic-SSE path.
+        let start_block = match kind {
+            "tool_use" | "server_tool_use" => {
+                let mut b = block.clone();
+                if let Some(obj) = b.as_object_mut() {
+                    obj.insert("input".into(), json!({}));
+                }
+                b
+            }
+            _ => block.clone(),
+        };
         emit_sse(
             stream,
             "content_block_start",
-            &json!({"type":"content_block_start","index": i, "content_block": block}),
+            &json!({"type":"content_block_start","index": i, "content_block": start_block}),
         )?;
-        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-            emit_sse(
-                stream,
-                "content_block_delta",
-                &json!({
-                    "type":"content_block_delta",
-                    "index": i,
-                    "delta": {"type":"text_delta","text": text}
-                }),
-            )?;
+        match kind {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        emit_sse(
+                            stream,
+                            "content_block_delta",
+                            &json!({
+                                "type":"content_block_delta",
+                                "index": i,
+                                "delta": {"type":"text_delta","text": text}
+                            }),
+                        )?;
+                    }
+                }
+            }
+            "thinking" => {
+                if let Some(th) = block.get("thinking").and_then(|t| t.as_str()) {
+                    if !th.is_empty() {
+                        emit_sse(
+                            stream,
+                            "content_block_delta",
+                            &json!({
+                                "type":"content_block_delta",
+                                "index": i,
+                                "delta": {"type":"thinking_delta","thinking": th}
+                            }),
+                        )?;
+                    }
+                }
+            }
+            "tool_use" | "server_tool_use" => {
+                let input = block.get("input").cloned().unwrap_or(json!({}));
+                let partial = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+                if partial != "{}" {
+                    emit_sse(
+                        stream,
+                        "content_block_delta",
+                        &json!({
+                            "type":"content_block_delta",
+                            "index": i,
+                            "delta": {"type":"input_json_delta","partial_json": partial}
+                        }),
+                    )?;
+                }
+            }
+            // advisor_tool_result / web_search_tool_result / other full blocks:
+            // start already carried the whole payload; no delta needed.
+            _ => {}
         }
         emit_sse(
             stream,

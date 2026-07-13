@@ -163,6 +163,8 @@ fn cmd_status() -> Result<()> {
     if let Ok(p) = cfg.active_profile() {
         println!("  routes:  {}", route::profile_summary(p));
     }
+    println!("  advisor:    {}", if cfg.advisor.enabled { "enabled" } else { "disabled" });
+    println!("  web_search: {}", if cfg.web_search.enabled { "enabled" } else { "disabled" });
     // Same priority as proxy: config api_key → XAI_TOKEN → OAuth file.
     let has_cfg_key = cfg.backends.values().any(|b| {
         matches!(
