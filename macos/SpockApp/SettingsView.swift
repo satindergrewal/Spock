@@ -401,20 +401,27 @@ struct SettingsView: View {
 
     /// Text field + optional menu of discovered backend:model routes.
     private func routeField(text: Binding<String>, placeholder: String) -> some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 4) {
             TextField(placeholder, text: text)
                 .textFieldStyle(.roundedBorder)
             if !model.routeSuggestions.isEmpty {
+                // Hide the system Menu disclosure triangle — it stacks on top of our
+                // SF Symbol and reads as a stray odd down-arrow next to the field.
                 Menu {
                     ForEach(model.routeSuggestions, id: \.self) { route in
                         Button(route) { text.wrappedValue = route }
                     }
                 } label: {
-                    Image(systemName: "chevron.down.circle")
+                    Image(systemName: "chevron.down.circle.fill")
+                        .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.secondary)
+                        .font(.system(size: 14))
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
                 }
                 .menuStyle(.borderlessButton)
-                .frame(width: 22)
+                .menuIndicator(.hidden)
+                .fixedSize()
                 .help("Pick a fetched model")
             }
         }
