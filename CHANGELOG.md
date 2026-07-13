@@ -2,6 +2,11 @@
 
 All notable changes to Spock are documented here.
 
+## [Unreleased]
+
+### Changed
+- Product framing: multi-backend Anthropic Messages proxy (not Grok-only) — Cargo description, GitHub About/topics, macOS Get Info string, Chat empty-state copy
+
 ## [0.2.0] - 2026-07-13
 
 ### Added

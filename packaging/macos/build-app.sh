@@ -83,6 +83,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Satinder Grewal</string>
+	<key>CFBundleGetInfoString</key>
+	<string>Spock ${VERSION} — local multi-backend Anthropic Messages proxy for Claude Code</string>
 </dict>
 </plist>
 EOF

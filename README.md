@@ -62,7 +62,7 @@ If something breaks after a Claude Code upgrade: note **both** Spock and Claude 
 2. Unzip → drag **Spock.app** to **Applications**
 3. First launch: right-click → **Open** if Gatekeeper warns (ad-hoc signed until Developer ID is set)
 4. Menu bar icon appears (no Dock icon — menu bar agent)
-5. **Login xAI…** *or* paste an xAI API key in **Settings → Backends**
+5. **Settings…** — backends + profiles (xAI / Ollama / OpenAI-compat / …). Optional: **Login xAI…** or paste an xAI API key if you use Grok.
 
 Build from source:
 

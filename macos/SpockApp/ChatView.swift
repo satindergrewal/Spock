@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Grok-style chat: dark bubble thread, streaming assistant replies via Spock → xAI/Ollama.
+/// Dark bubble chat: streaming assistant replies via Spock → routed backends.
 struct ChatView: View {
     @EnvironmentObject var model: AppModel
     @StateObject private var chat = ChatSession()
@@ -109,7 +109,7 @@ struct ChatView: View {
                 .foregroundStyle(.secondary)
             Text("Chat with your routed models")
                 .font(.title3.weight(.semibold))
-            Text("Same Spock backends as Claude Code — Grok, Ollama, or both.")
+            Text("Same Spock backends as Claude Code — Grok, Ollama, OpenAI-compat, or mixed profiles.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -120,7 +120,7 @@ struct ChatView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 10) {
-            TextField("Message Grok…", text: $chat.draft, axis: .vertical)
+            TextField("Message…", text: $chat.draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...8)
                 .padding(12)

@@ -3,11 +3,11 @@ name = "spock"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Grok subscription → Anthropic-API-compatible local proxy (multi-backend)"
+description = "Local multi-backend Anthropic Messages proxy for Claude Code — xAI Grok, OpenAI-compat, Ollama, and more"
 license = "MIT"
 repository = "https://github.com/satindergrewal/Spock"
 readme = "README.md"
-keywords = ["grok", "xai", "anthropic", "proxy", "claude"]
+keywords = ["anthropic", "claude-code", "proxy", "openai-compatible", "xai"]
 categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
