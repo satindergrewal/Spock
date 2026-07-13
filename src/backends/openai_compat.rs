@@ -90,14 +90,34 @@ pub fn get_json(base_url: &str, api_key: Option<&str>, path: &str) -> Result<Val
 
 /// List models for Settings discovery.
 /// Tries OpenAI-compatible GET {base}/models first (llama-server, Ollama OpenAI shim).
-/// Falls back to Ollama native GET /api/tags.
+/// Falls back to Ollama native GET /api/tags only when /models is reachable but empty,
+/// or returns 404 — never masks a LAN/connect failure with a confusing /api/tags error.
 pub fn list_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
-    if let Ok(v) = get_json(base_url, api_key, "/models") {
-        let ids = extract_openai_model_ids(&v);
-        if !ids.is_empty() {
-            return Ok(ids);
+    let base = base_url.trim_end_matches('/');
+    let models_err = match get_json(base_url, api_key, "/models") {
+        Ok(v) => {
+            let ids = extract_openai_model_ids(&v);
+            if !ids.is_empty() {
+                return Ok(ids);
+            }
+            // Reachable OpenAI-shaped body with no ids — try Ollama tags next.
+            None
         }
-    }
+        Err(Error::Http(code, ref body)) if code == 404 => {
+            // Some servers only expose Ollama tags.
+            Some(format!(
+                "GET {base}/models → 404: {}",
+                extract_simple_err(body)
+            ))
+        }
+        Err(e) => {
+            // Connection refused / no route / 5xx: report the real failure.
+            // Falling through to /api/tags only confuses llama-server / LAN users.
+            return Err(Error::Msg(format!(
+                "model list failed at {base}/models: {e}"
+            )));
+        }
+    };
 
     let root = ollama_root(base_url);
     let tags_url = format!("{root}/api/tags");
@@ -113,7 +133,10 @@ pub fn list_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>>
             ids.sort();
             ids.dedup();
             if ids.is_empty() {
-                Err(Error::Msg("no models found on Ollama /api/tags".into()))
+                Err(Error::Msg(match models_err {
+                    Some(m) => format!("{m}; also no models on {tags_url}"),
+                    None => format!("no models on {base}/models or {tags_url}"),
+                }))
             } else {
                 Ok(ids)
             }
@@ -121,12 +144,23 @@ pub fn list_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>>
         Err(ureq::Error::Status(code, resp)) => {
             let text = resp.into_string().unwrap_or_default();
             Err(Error::Msg(format!(
-                "model list failed ({code}): {}",
+                "model list failed ({code}) at {tags_url}: {}",
                 text.chars().take(200).collect::<String>()
             )))
         }
-        Err(e) => Err(Error::Msg(format!("model list failed for {base_url}: {e}"))),
+        Err(e) => Err(Error::Msg(match models_err {
+            Some(m) => format!("{m}; Ollama tags also failed ({tags_url}): {e}"),
+            None => format!("model list failed for {base_url}: {e}"),
+        })),
     }
+}
+
+fn extract_simple_err(body: &Value) -> String {
+    body.get("error")
+        .and_then(|e| e.get("message").or_else(|| e.as_str().map(|_| e)))
+        .and_then(|m| m.as_str())
+        .map(|s| s.chars().take(200).collect())
+        .unwrap_or_else(|| body.to_string().chars().take(200).collect())
 }
 
 fn extract_openai_model_ids(v: &Value) -> Vec<String> {

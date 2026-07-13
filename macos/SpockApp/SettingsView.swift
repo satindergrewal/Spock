@@ -95,13 +95,35 @@ struct SettingsView: View {
             Text(model.proxyUp ? "proxy up" : "proxy down")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Text(model.authPresent ? "· xAI auth" : "· no xAI auth")
+            Text("· xAI: \(model.authSourceLabel)")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(authSourceColor)
+                .help(authSourceHelp)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(Color.secondary.opacity(0.12), in: Capsule())
+    }
+
+    private var authSourceColor: Color {
+        switch model.authSource {
+        case "config_api_key", "env_XAI_TOKEN", "env": return .green
+        case "oauth": return .orange
+        default: return .secondary
+        }
+    }
+
+    private var authSourceHelp: String {
+        switch model.authSource {
+        case "config_api_key":
+            return "Using [backends.xai] api_key from config (beats OAuth)."
+        case "env_XAI_TOKEN", "env":
+            return "Using XAI_TOKEN environment variable."
+        case "oauth":
+            return "Using SuperGrok OAuth tokens. Paste a console API key in the xai row and Save & Apply to override."
+        default:
+            return "No xAI credentials. Set API key on the xai backend + Save & Apply, or menu Login xAI… for OAuth."
+        }
     }
 
     private var backendsSection: some View {
@@ -121,12 +143,19 @@ struct SettingsView: View {
                             .frame(width: 100)
                             TextField("base URL", text: $b.baseURL)
                                 .textFieldStyle(.roundedBorder)
-                            TextField(b.type == "xai" ? "xAI API key (optional)" : "api key", text: $b.apiKey)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 140)
-                                .help(b.type == "xai"
-                                      ? "Console API key from console.x.ai. Overrides OAuth when set. Env XAI_TOKEN also works."
-                                      : "Optional Bearer for OpenAI-compatible backends")
+                            Group {
+                                if b.type == "xai" {
+                                    SecureField("xAI console API key", text: $b.apiKey)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(minWidth: 200)
+                                        .help("From console.x.ai. Save & Apply required. Overrides OAuth. Menu “Login xAI” is OAuth only — not this key.")
+                                } else {
+                                    SecureField("api key (optional)", text: $b.apiKey)
+                                        .textFieldStyle(.roundedBorder)
+                                        .frame(minWidth: 160)
+                                        .help("Optional Bearer for OpenAI-compatible backends")
+                                }
+                            }
                             Button {
                                 // Use saved name if empty field mid-edit
                                 let name = b.name.trimmingCharacters(in: .whitespaces)
@@ -151,6 +180,12 @@ struct SettingsView: View {
                             .buttonStyle(.borderless)
                         }
 
+                        if b.type == "xai" {
+                            Text(xaiKeyHint(for: b))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+
                         if let models = model.discoveredModels[b.name], !models.isEmpty {
                             Text("\(models.count) model(s): \(models.prefix(8).joined(separator: ", "))\(models.count > 8 ? "…" : "")")
                                 .font(.caption)
@@ -160,15 +195,16 @@ struct SettingsView: View {
                     }
                     .padding(.vertical, 2)
                 }
-                HStack {
+                HStack(alignment: .top) {
                     Button {
                         model.addBackend()
                     } label: {
                         Label("Add backend", systemImage: "plus.circle")
                     }
-                    Text("xai = Grok (OAuth and/or API key) · openai = Ollama / llama-server / LAN  ·  Fetch uses OpenAI /v1/models, then Ollama /api/tags")
+                    Text("xai: paste console API key → Save & Apply (priority: config key → XAI_TOKEN → OAuth). Menu Login xAI = OAuth only. openai: Ollama / llama-server / LAN. Base URL is …/v1 not …/v1/models. Save before Fetch.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(8)
@@ -256,6 +292,23 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             content()
+        }
+    }
+
+    private func xaiKeyHint(for b: BackendRow) -> String {
+        let keySet = !b.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if keySet {
+            return "Key in form — click Save & Apply. Live proxy: \(model.authSourceLabel)."
+        }
+        switch model.authSource {
+        case "config_api_key":
+            return "Proxy is using a saved config API key. Field may be empty until Reload if you edited TOML by hand."
+        case "oauth":
+            return "Proxy is on OAuth. Paste console API key here + Save & Apply to override (do not use menu Login for keys)."
+        case "env_XAI_TOKEN", "env":
+            return "Proxy is using XAI_TOKEN from the environment."
+        default:
+            return "No key yet. Paste console.x.ai API key → Save & Apply. Menu Login xAI is OAuth subscription only."
         }
     }
 }

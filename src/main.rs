@@ -162,17 +162,27 @@ fn cmd_status() -> Result<()> {
     if let Ok(p) = cfg.active_profile() {
         println!("  routes:  {}", route::profile_summary(p));
     }
-    match load_tokens() {
-        Some(t) => {
-            let exp = t.expires_at.unwrap_or(0.0);
-            println!("  xAI auth: present (expires_at={exp:.0})");
-        }
-        None => {
-            if EnvOverrides::from_env().xai_token.is_some() {
-                println!("  xAI auth: XAI_TOKEN env");
-            } else {
-                println!("  xAI auth: none (run: spock login)");
+    // Same priority as proxy: config api_key → XAI_TOKEN → OAuth file.
+    let has_cfg_key = cfg.backends.values().any(|b| {
+        matches!(
+            b,
+            config::BackendConfig::Xai {
+                api_key: Some(k),
+                ..
+            } if !k.trim().is_empty()
+        )
+    });
+    if has_cfg_key {
+        println!("  xAI auth: config_api_key (beats OAuth)");
+    } else if EnvOverrides::from_env().xai_token.is_some() {
+        println!("  xAI auth: XAI_TOKEN env");
+    } else {
+        match load_tokens() {
+            Some(t) => {
+                let exp = t.expires_at.unwrap_or(0.0);
+                println!("  xAI auth: oauth (expires_at={exp:.0})");
             }
+            None => println!("  xAI auth: none (set api_key on xai backend, or: spock login)"),
         }
     }
     // live health if proxy up

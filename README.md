@@ -18,6 +18,37 @@ Claude Code always points at Spock (`http://127.0.0.1:8048`). Spock maps Haiku /
 
 ---
 
+## Compatible Claude Code versions
+
+Spock is protocol-compatible with Claude Code’s Anthropic Messages client. Versions below were **verified working** with this Spock release (normal chat, tools, streaming, profile routing). Future Claude Code releases can change betas, tool schemas, or streaming and break a proxy — pin or re-test when upgrading.
+
+| Spock | Claude Code CLI | Claude Code IDE extension | Host (example) | Status | Notes |
+|---|---|---|---|---|---|
+| **0.1.0** | **2.1.206** | **2.1.206** (`cc_version=2.1.206.87c`) | VSCodium **1.128.0** (also VS Code) | **OK** | Baseline after Rust multi-backend release (2026-07-11) |
+
+**How to check your versions**
+
+```bash
+# Spock
+curl -s http://127.0.0.1:8048/health | jq -r .version
+
+# Claude Code CLI
+claude --version
+
+# VSCodium / VS Code extension (folder name includes version)
+ls -d ~/.vscode-oss/extensions/anthropic.claude-code-* 2>/dev/null
+ls -d ~/.vscode/extensions/anthropic.claude-code-* 2>/dev/null
+```
+
+If something breaks after a Claude Code upgrade: note **both** Spock and Claude Code versions, re-run the smoke test below, and check [Troubleshooting](#troubleshooting). Prefer matching CLI and extension versions.
+
+**Known limits on the verified stack (not full breakage)**
+
+- Claude Code’s native **advisor** tool may appear client-side; Spock does not execute Anthropic’s server-side `advisor_20260301` yet (stripped like other non-`input_schema` tools). Planned as a Spock-only feature — no Claude Code / VSCode patches.
+- Some upstreams reject `tool_choice` when tools were filtered out; fix is on the Spock side.
+
+---
+
 ## Install
 
 ### macOS App (recommended)
@@ -186,6 +217,8 @@ fable   = "ollama:glm-5.2:cloud"
 
 **Tip:** Different backends have different “personalities.” Grok often follows Claude Code’s “you are Claude” system prompt; other models may answer as themselves (or in another language). For a single-brain session, point **default + fable + main roles** at the same `backend:model`.
 
+Many public OpenAI-compatible gateways (OpenRouter, DeepSeek, Groq, LM Studio, vLLM, …) already work as `type = "openai"` with the right `base_url` + `api_key`. First-class presets and extra vendors are planned (OpenRouter, OpenAI, DeepSeek, …). No Claude Code changes required.
+
 Switch profiles live: app menu **Profile**, Settings active profile, or edit TOML + **Reload** / `spock reload`.
 
 Config path: `~/.config/spock/config.toml` (created on first run). Full sample: [`config.example.toml`](config.example.toml).
@@ -222,6 +255,8 @@ Optional model env overrides (only if you want Claude Code to send fixed ids):
 Those ids are **role tags** for Spock routing — not necessarily the real upstream model names.
 
 Start a **new** Claude Code session after changing env.
+
+Use a Claude Code version from the [compatible table](#compatible-claude-code-versions) when possible.
 
 ### CLI helper
 
@@ -344,6 +379,7 @@ Workflows: [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/wor
 | Gatekeeper blocks app | Right-click → Open |
 | Auto Mode “temporarily unavailable” | Upgrade Spock; ensure stop is dropped for xAI reasoning; aliases on `/v1/models` |
 | Compacts too early | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000` + optional `[1m]` client id |
+| Broke after Claude Code update | Compare your CLI/extension versions to the [compatible table](#compatible-claude-code-versions); pin last good extension while Spock is updated |
 
 Proxy logs each request with the resolved route, e.g.:
 

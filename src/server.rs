@@ -833,31 +833,9 @@ fn handle_openai(sock: &mut TcpStream, state: &AppState, mut body: Value) -> Res
 fn write_upstream_err(stream: &mut TcpStream, e: Error) -> Result<()> {
     match e {
         Error::Http(code, body) => {
-            let mut msg = extract_err_msg(&body);
-            // Never look like bare Anthropic auth — clients open "login to Anthropic" on 401.
-            // Prefix backend context so Claude Code shows a real error instead of an auth modal.
-            if code == 401 {
-                msg = format!(
-                    "upstream 401 (not Anthropic login): {msg} — for xAI: spock logout && spock login; for Ollama cloud: check ollama sign-in"
-                );
-            } else if code == 402 || code == 403 {
-                msg = format!(
-                    "upstream {code} (quota/auth): {msg} — xAI may ask SuperGrok; Ollama cloud may need plan/login"
-                );
-            } else if code == 429 {
-                msg = format!(
-                    "upstream 429 rate limit: {msg} — wait or switch profile/model (not an Anthropic login issue)"
-                );
-            } else {
-                msg = format!("upstream {code}: {msg}");
-            }
-            // Prefer 502 for upstream failures so clients don't treat them as local Anthropic auth.
-            let out_status = if code == 401 || code == 403 {
-                502
-            } else {
-                code
-            };
-            let (st, err) = anthropic_error(out_status, "api_error", &msg);
+            let raw = extract_err_msg(&body);
+            let (out_status, err_type, msg) = classify_upstream_http(code, &raw);
+            let (st, err) = anthropic_error(out_status, err_type, &msg);
             write_json(stream, st, &err)
         }
         other => {
@@ -865,6 +843,101 @@ fn write_upstream_err(stream: &mut TcpStream, e: Error) -> Result<()> {
                 anthropic_error(502, "api_error", &format!("spock backend error: {other}"));
             write_json(stream, st, &err)
         }
+    }
+}
+
+/// Map vendor HTTP failures to Anthropic-shaped errors that Claude Code (CLI + VSCodium)
+/// will **show as text**, not misread as "log in to Anthropic".
+///
+/// xAI subscription/credit exhaustion often arrives as 403/402/429 with bodies mentioning
+/// quota, credits, usage, or SuperGrok. Bare 401 opens the Anthropic login modal in the IDE —
+/// always rewrite those. Prefer 502 + a loud message for quota so the IDE surfaces it the
+/// same way the CLI status path reports config keys.
+pub(crate) fn classify_upstream_http(code: u16, raw: &str) -> (u16, &'static str, String) {
+    let lower = raw.to_ascii_lowercase();
+    let looks_quota = code == 402
+        || lower.contains("quota")
+        || lower.contains("credit")
+        || lower.contains("billing")
+        || lower.contains("usage limit")
+        || lower.contains("usage_limit")
+        || lower.contains("exceeded")
+        || lower.contains("out of")
+        || lower.contains("insufficient")
+        || lower.contains("payment")
+        || lower.contains("supergrok")
+        || lower.contains("spend limit")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("resource_exhausted");
+
+    // Never look like bare Anthropic auth — clients open "login to Anthropic" on 401.
+    if code == 401 {
+        return (
+            502,
+            "authentication_error",
+            format!(
+                "Spock upstream 401 (NOT Anthropic login): {raw} — xAI: spock logout && spock login or set api_key/XAI_TOKEN; Ollama cloud: sign in / plan"
+            ),
+        );
+    }
+
+    if looks_quota || code == 402 || code == 403 || code == 429 {
+        let kind = if code == 429 && !looks_quota {
+            "rate_limit"
+        } else if code == 429 {
+            "rate_limit_or_quota"
+        } else {
+            "quota_or_billing"
+        };
+        return (
+            502,
+            // rate_limit_error is recognized by Claude Code; keeps IDE from auth-modal path.
+            "rate_limit_error",
+            format!(
+                "Spock upstream {code} ({kind}): {raw} — subscription/credits/rate limit on the **backend** (xAI / Ollama / etc.), not Anthropic. Add credits, wait, or switch Spock profile/model."
+            ),
+        );
+    }
+
+    (
+        if (500..600).contains(&code) { code } else { 502 },
+        "api_error",
+        format!("Spock upstream {code}: {raw}"),
+    )
+}
+
+#[cfg(test)]
+mod upstream_err_tests {
+    use super::classify_upstream_http;
+
+    #[test]
+    fn quota_body_becomes_loud_502() {
+        let (st, ty, msg) = classify_upstream_http(
+            403,
+            "You have exceeded your SuperGrok usage limit. Please add credits.",
+        );
+        assert_eq!(st, 502);
+        assert_eq!(ty, "rate_limit_error");
+        assert!(msg.contains("quota_or_billing"), "{msg}");
+        assert!(msg.contains("NOT Anthropic") || msg.contains("not Anthropic"), "{msg}");
+        assert!(msg.contains("SuperGrok") || msg.contains("credits"), "{msg}");
+    }
+
+    #[test]
+    fn plain_401_not_anthropic_login() {
+        let (st, ty, msg) = classify_upstream_http(401, "Invalid API key");
+        assert_eq!(st, 502);
+        assert_eq!(ty, "authentication_error");
+        assert!(msg.contains("NOT Anthropic login"), "{msg}");
+    }
+
+    #[test]
+    fn rate_limit_429() {
+        let (st, ty, msg) = classify_upstream_http(429, "Too Many Requests");
+        assert_eq!(st, 502);
+        assert_eq!(ty, "rate_limit_error");
+        assert!(msg.contains("429"), "{msg}");
     }
 }
 

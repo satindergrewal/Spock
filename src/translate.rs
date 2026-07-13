@@ -45,13 +45,18 @@ pub fn map_output_effort(effort: &str) -> Option<&'static str> {
     }
 }
 
-/// Priority: thinking disabled → none; output_config.effort; budget buckets; enabled → high.
+/// Priority: thinking disabled → omit (xAI rejects `reasoning_effort: "none"`);
+/// output_config.effort; budget buckets; enabled → high.
 pub fn thinking_effort(a: &Value) -> Option<String> {
     let t = a.get("thinking");
     if let Some(obj) = t.and_then(|v| v.as_object()) {
         let kind = obj.get("type").and_then(|v| v.as_str());
+        // Claude Code Auto Mode classifier sends thinking: {type: disabled}.
+        // Mapping that to reasoning_effort "none" makes xAI return 400:
+        // "This model does not support `reasoning_effort` value `none`."
+        // Omitting the field is the correct "no extra reasoning" signal.
         if kind.is_none() || kind == Some("disabled") {
-            return Some("none".into());
+            return None;
         }
     }
 
@@ -449,9 +454,32 @@ mod tests {
     }
 
     #[test]
-    fn thinking_disabled_none() {
+    fn thinking_disabled_omits_effort() {
+        // Auto Mode classifier: thinking disabled must NOT map to "none".
         let a = json!({"thinking": {"type": "disabled"}, "output_config": {"effort": "high"}});
-        assert_eq!(thinking_effort(&a).as_deref(), Some("none"));
+        assert_eq!(thinking_effort(&a), None);
+
+        let o = anthropic_to_openai(
+            &json!({
+                "max_tokens": 64,
+                "thinking": {"type": "disabled"},
+                "messages": [{"role":"user","content":"hi"}],
+                "tools": [{
+                    "name": "classify_result",
+                    "description": "c",
+                    "input_schema": {"type":"object"}
+                }],
+                "tool_choice": {"type":"tool","name":"classify_result"}
+            }),
+            "grok-4.5",
+            BackendFamily::Xai,
+            "grok-4.5",
+        );
+        assert!(
+            o.get("reasoning_effort").is_none(),
+            "got reasoning_effort={:?}",
+            o.get("reasoning_effort")
+        );
     }
 
     #[test]

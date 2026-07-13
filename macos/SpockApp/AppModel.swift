@@ -42,6 +42,8 @@ final class AppModel: ObservableObject {
     @Published var bind: String = "127.0.0.1"
     @Published var configPath: String = ""
     @Published var authPresent = false
+    /// Live proxy report: config_api_key | env_XAI_TOKEN | oauth | none
+    @Published var authSource: String = "none"
     @Published var statusMessage: String = ""
     @Published var statusIsError = false
     /// Discovered models per backend name: ["ollama": ["qwen2.5:14b", …]]
@@ -115,12 +117,14 @@ final class AppModel: ObservableObject {
         let up = healthOK()
         proxyUp = up
         if up {
+            // Proxy is healthy. If our tracked child died but something else is
+            // still serving (hot-swap, manual restart, second instance), clear
+            // the stale Process handle — do NOT show "Proxy process exited".
             if weStartedProxy, let child, !child.isRunning {
-                setProxyStatus(.error)
-                setStatus("Proxy process exited", error: true)
-            } else {
-                setProxyStatus(.running)
+                self.child = nil
+                weStartedProxy = false
             }
+            setProxyStatus(.running)
             if let status = getJSON(path: "/spock/v1/status") {
                 // Only sync profile from proxy if it differs — avoids fighting the picker mid-gesture.
                 // setProfile writes proxy first; this is the source of truth after that.
@@ -133,11 +137,20 @@ final class AppModel: ObservableObject {
                 if let path = status["config_path"] as? String { configPath = path }
                 if let auth = status["xai_auth"] as? [String: Any] {
                     authPresent = (auth["present"] as? Bool) ?? false
+                    authSource = (auth["source"] as? String) ?? (authPresent ? "unknown" : "none")
+                } else {
+                    authPresent = false
+                    authSource = "none"
                 }
             }
         } else {
             if weStartedProxy, let child, child.isRunning {
                 setProxyStatus(.starting)
+            } else if weStartedProxy, let child, !child.isRunning {
+                setProxyStatus(.error)
+                setStatus("Proxy process exited — reopen Spock or run: spock serve", error: true)
+                self.child = nil
+                weStartedProxy = false
             } else if statusIsError {
                 setProxyStatus(.error)
             } else {
@@ -195,6 +208,12 @@ final class AppModel: ObservableObject {
     }
 
     func saveConfig() {
+        // Trim keys/URLs so whitespace-only doesn't look "set" then fall through to OAuth.
+        for i in backends.indices {
+            backends[i].name = backends[i].name.trimmingCharacters(in: .whitespacesAndNewlines)
+            backends[i].baseURL = backends[i].baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            backends[i].apiKey = backends[i].apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         let body: [String: Any] = [
             "version": "0.1.0",
             "config_path": configPath,
@@ -224,13 +243,42 @@ final class AppModel: ObservableObject {
         ]
         if let resp = putJSON(path: "/spock/v1/config", body: body) {
             if let ok = resp["ok"] as? Bool, ok {
-                setStatus((resp["message"] as? String) ?? "Saved", error: false)
                 loadConfig()
+                // Re-read live auth source so UI proves key beat OAuth.
+                refreshQuiet()
+                let xaiKeySet = backends.contains {
+                    $0.type == "xai" && !$0.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                var msg = (resp["message"] as? String) ?? "Saved"
+                if xaiKeySet {
+                    msg += " · xAI auth: \(authSource)"
+                    if authSource != "config_api_key" {
+                        setStatus(
+                            "\(msg) — expected config_api_key (got \(authSource)). Check xai row key + Save.",
+                            error: true
+                        )
+                        return
+                    }
+                } else {
+                    msg += " · xAI auth: \(authSource)"
+                }
+                setStatus(msg, error: false)
             } else {
                 setStatus((resp["error"] as? String) ?? "Save failed", error: true)
             }
         } else {
             setStatus("Save failed — is the proxy running?", error: true)
+        }
+    }
+
+    /// Human label for status pill / settings.
+    var authSourceLabel: String {
+        switch authSource {
+        case "config_api_key": return "API key (config)"
+        case "env_XAI_TOKEN", "env": return "API key (env XAI_TOKEN)"
+        case "oauth": return "OAuth (subscription)"
+        case "none", "": return "none"
+        default: return authSource
         }
     }
 
@@ -265,6 +313,19 @@ final class AppModel: ObservableObject {
     }
 
     func loginXAI() {
+        // OAuth device flow only — does NOT install a console API key.
+        // If config already has api_key, warn so users don't think Login "fixes" keys.
+        let hasConfigKey = backends.contains {
+            $0.type == "xai" && !$0.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if hasConfigKey || authSource == "config_api_key" {
+            setStatus(
+                "xAI API key is already configured (source: \(authSourceLabel)). Login is OAuth-only and is not needed for API keys.",
+                error: false
+            )
+            // Still allow OAuth if they insist? Prefer not to surprise — skip device flow.
+            return
+        }
         guard let bin = findSpockBinary() else {
             setStatus("spock binary not found", error: true)
             return
@@ -273,7 +334,7 @@ final class AppModel: ObservableObject {
         let script = """
         tell application "Terminal"
           activate
-          do script "\\"\(escaped)\\" login; echo; echo Done — you can close this window."
+          do script "\\"\(escaped)\\" login; echo; echo Done — OAuth only. For console API key: Settings → xai → API key → Save & Apply."
         end tell
         """
         if let apple = NSAppleScript(source: script) {
@@ -282,24 +343,38 @@ final class AppModel: ObservableObject {
             if let err {
                 setStatus("Login launch failed: \(err)", error: true)
             } else {
-                setStatus("Login started in Terminal", error: false)
+                setStatus("OAuth login started in Terminal (not API key)", error: false)
             }
         }
     }
 
     func logoutXAI() {
         _ = postJSON(path: "/spock/v1/logout", body: [:])
-        authPresent = false
-        setStatus("Logged out of xAI", error: false)
+        refreshQuiet()
+        let note: String
+        if authSource == "config_api_key" {
+            note = "OAuth cleared · API key in config still active"
+        } else {
+            note = "Logged out of xAI OAuth"
+        }
+        setStatus(note, error: false)
     }
 
     func addBackend() {
+        // Unique default name so a second "Add backend" doesn't collide with existing "ollama".
+        var n = 2
+        var name = "lan"
+        let taken = Set(backends.map(\.name))
+        if taken.contains(name) {
+            while taken.contains("lan-\(n)") { n += 1 }
+            name = "lan-\(n)"
+        }
         backends.append(
             BackendRow(
                 id: UUID(),
-                name: "ollama",
+                name: name,
                 type: "openai",
-                baseURL: "http://127.0.0.1:11434/v1",
+                baseURL: "http://127.0.0.1:8080/v1",
                 apiKey: ""
             )
         )

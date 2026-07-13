@@ -13,8 +13,8 @@ MACOS_DIR="$APP/Contents/MacOS"
 RES_DIR="$APP/Contents/Resources"
 SWIFT_SRC="$ROOT/macos/SpockApp"
 
-echo "==> cargo build --release (proxy)"
-cargo build --release
+echo "==> cargo build --locked --release (proxy; pinned Cargo.lock)"
+cargo build --locked --release
 
 PROXY_BIN="$ROOT/target/release/spock"
 if [[ ! -x "$PROXY_BIN" ]]; then
@@ -42,7 +42,10 @@ swiftc \
   "$SWIFT_SRC/SettingsView.swift" \
   "$SWIFT_SRC/ChatView.swift"
 
-# Embed Rust proxy next to the Swift binary
+# Embed Rust proxy next to the Swift binary.
+# Never `cp` a new proxy into a signed .app later without re-running this script:
+# macOS kills (exit 137) nested binaries when the app signature is stale
+# ("nested code is modified or invalid").
 cp "$PROXY_BIN" "$MACOS_DIR/spock-proxy"
 chmod +x "$MACOS_DIR/Spock" "$MACOS_DIR/spock-proxy"
 
