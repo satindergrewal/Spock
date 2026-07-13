@@ -512,3 +512,115 @@ impl EnvOverrides {
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn parse_openai_extra_headers_and_env() {
+        let toml = r#"
+[server]
+profile = "xai-only"
+[backends.openrouter]
+type = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+[backends.openrouter.extra_headers]
+HTTP-Referer = "https://example.com"
+X-Title = "Spock"
+[profiles.xai-only]
+default = "xai:grok-4.5"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let be = cfg.backends.get("openrouter").expect("backend");
+        assert_eq!(be.kind_name(), "openai");
+        assert_eq!(be.base_url(), "https://openrouter.ai/api/v1");
+        assert_eq!(
+            be.extra_headers().get("HTTP-Referer").map(String::as_str),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            be.extra_headers().get("X-Title").map(String::as_str),
+            Some("Spock")
+        );
+    }
+
+    #[test]
+    fn parse_advisor_web_search_sections() {
+        let toml = r#"
+[server]
+profile = "xai-only"
+[backends.xai]
+type = "xai"
+[profiles.xai-only]
+default = "xai:grok-4.5"
+[advisor]
+enabled = true
+model = "xai:grok-4.5"
+max_tokens = 2048
+[web_search]
+enabled = true
+provider = "brave"
+api_key_env = "BRAVE_API_KEY"
+max_results = 7
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        assert!(cfg.advisor.enabled);
+        assert_eq!(cfg.advisor.model.as_deref(), Some("xai:grok-4.5"));
+        assert_eq!(cfg.advisor.max_tokens, 2048);
+        assert!(cfg.web_search.enabled);
+        assert_eq!(cfg.web_search.provider, "brave");
+        assert_eq!(cfg.web_search.max_results, 7);
+    }
+
+    #[test]
+    fn parse_anthropic_and_azure_fields() {
+        let toml = r#"
+[server]
+profile = "p"
+[backends.anthropic]
+type = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+[backends.azure]
+type = "openai"
+base_url = "https://res.openai.azure.com"
+azure_deployment = "gpt-4o"
+azure_api_version = "2024-06-01"
+api_key_env = "AZURE_OPENAI_API_KEY"
+[profiles.p]
+default = "anthropic:claude-sonnet-5"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.backends["anthropic"].kind_name(), "anthropic");
+        assert_eq!(cfg.backends["azure"].azure_deployment(), Some("gpt-4o"));
+        assert_eq!(cfg.backends["azure"].azure_api_version(), Some("2024-06-01"));
+        assert!(!cfg.backends["azure"].use_responses_api());
+    }
+
+    #[test]
+    fn openai_api_key_prefers_config_over_env_list() {
+        let be = BackendConfig::Openai {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: Some("sk-config".into()),
+            extra_headers: BTreeMap::new(),
+            api_key_env: Some("OPENAI_API_KEY".into()),
+            use_responses_api: false,
+            azure_deployment: None,
+            azure_api_version: None,
+        };
+        assert_eq!(be.api_key().as_deref(), Some("sk-config"));
+    }
+
+    #[test]
+    fn default_config_has_xai_and_ollama() {
+        let cfg = default_config();
+        assert!(cfg.backends.contains_key("xai"));
+        assert!(cfg.backends.contains_key("ollama"));
+        assert!(!cfg.advisor.enabled);
+        assert!(!cfg.web_search.enabled);
+    }
+}

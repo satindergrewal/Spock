@@ -688,6 +688,24 @@ mod tests {
     use crate::config::default_config;
 
     #[test]
+    fn headers_roundtrip() {
+        let mut m = BTreeMap::new();
+        m.insert("HTTP-Referer".into(), "https://x.test".into());
+        m.insert("X-Title".into(), "Spock".into());
+        let text = headers_to_text(&m);
+        let back = text_to_headers(&text);
+        assert_eq!(back.get("HTTP-Referer").map(String::as_str), Some("https://x.test"));
+        assert_eq!(back.get("X-Title").map(String::as_str), Some("Spock"));
+    }
+
+    #[test]
+    fn text_to_headers_skips_comments() {
+        let h = text_to_headers("# c\nFoo: bar\n\n");
+        assert_eq!(h.get("Foo").map(String::as_str), Some("bar"));
+        assert_eq!(h.len(), 1);
+    }
+
+    #[test]
     fn roundtrip_default_config() {
         let cfg = default_config();
         let doc = config_to_doc(&cfg);

@@ -219,6 +219,14 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_drops_reasoning_effort_none() {
+        let mut v = json!({"reasoning_effort": "none", "stop": ["x"]});
+        sanitize_upstream(&mut v, true);
+        assert!(v.get("reasoning_effort").is_none());
+        assert!(v.get("stop").is_none());
+    }
+
+    #[test]
     fn sanitize_drops_stop() {
         let mut v = json!({"stop": ["x"], "presence_penalty": 1.0, "model": "m"});
         sanitize_upstream(&mut v, true);

@@ -1095,6 +1095,22 @@ mod upstream_err_tests {
     }
 
     #[test]
+    fn payment_required_402() {
+        let (st, ty, msg) = classify_upstream_http(402, "Payment Required");
+        assert_eq!(st, 502);
+        assert_eq!(ty, "rate_limit_error");
+        assert!(msg.contains("402"), "{msg}");
+    }
+
+    #[test]
+    fn generic_500_passthrough_status() {
+        let (st, ty, msg) = classify_upstream_http(503, "backend down");
+        assert_eq!(st, 503);
+        assert_eq!(ty, "api_error");
+        assert!(msg.contains("503"), "{msg}");
+    }
+
+    #[test]
     fn rate_limit_429() {
         let (st, ty, msg) = classify_upstream_http(429, "Too Many Requests");
         assert_eq!(st, 502);

@@ -11,20 +11,42 @@ use crate::config::EnvOverrides;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AdvisorConfig {
     pub enabled: bool,
     pub model: Option<String>,
     pub max_tokens: u32,
 }
 
-#[derive(Debug, Clone, Default)]
+impl Default for AdvisorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            max_tokens: 4096,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WebSearchConfig {
     pub enabled: bool,
     pub provider: String,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub max_results: u32,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "duckduckgo".into(),
+            api_key: None,
+            api_key_env: None,
+            max_results: 5,
+        }
+    }
 }
 
 impl AdvisorConfig {
@@ -638,5 +660,45 @@ mod tests {
         inject_emulated_function_tools(&mut oai, true, true);
         let tools = oai["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn inject_idempotent() {
+        let mut oai = json!({"messages":[]});
+        inject_emulated_function_tools(&mut oai, true, false);
+        inject_emulated_function_tools(&mut oai, true, false);
+        assert_eq!(oai["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn no_server_tools_detected_on_bash_only() {
+        let a = json!({"tools":[{"name":"Bash","input_schema":{"type":"object"}}]});
+        assert!(!request_has_advisor(&a));
+        assert!(!request_has_web_search(&a));
+    }
+
+    #[test]
+    fn web_search_config_default_provider() {
+        let c = WebSearchConfig::default();
+        assert_eq!(c.provider, "duckduckgo");
+        assert!(!c.enabled);
+    }
+
+    #[test]
+    fn urlencoding_spaces() {
+        assert!(urlencoding_lite("a b").contains("%20"));
+        assert_eq!(urlencoding_lite("ok"), "ok");
+    }
+
+    #[test]
+    fn empty_query_errors() {
+        let cfg = WebSearchConfig {
+            enabled: true,
+            provider: "duckduckgo".into(),
+            api_key: None,
+            api_key_env: None,
+            max_results: 3,
+        };
+        assert!(run_web_search(&cfg, "  ").is_err());
     }
 }

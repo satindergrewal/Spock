@@ -561,6 +561,68 @@ mod tests {
     }
 
     #[test]
+    fn forced_tool_choice_requires_matching_function() {
+        // Forced tool that was stripped must not leave tool_choice pointing at missing name.
+        let a = json!({
+            "max_tokens": 50,
+            "messages": [{"role":"user","content":"x"}],
+            "tools": [
+                {"type":"advisor_20260301","name":"advisor","model":"fable"},
+                {"name":"Bash","description":"sh","input_schema":{"type":"object"}}
+            ],
+            "tool_choice": {"type":"tool","name":"advisor"}
+        });
+        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        assert!(o.get("tools").is_some());
+        // advisor stripped; Bash remains; forced advisor name missing → tool_choice dropped
+        assert!(o.get("tool_choice").is_none(), "{:?}", o.get("tool_choice"));
+    }
+
+    #[test]
+    fn anthropic_family_no_reasoning_effort() {
+        let a = json!({
+            "max_tokens": 10,
+            "thinking": {"type":"enabled","budget_tokens":8000},
+            "messages": [{"role":"user","content":"hi"}]
+        });
+        let o = anthropic_to_openai(&a, "claude-sonnet-5", BackendFamily::Anthropic, "grok-4.5");
+        assert!(o.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn tool_use_roundtrip_shape() {
+        let a = json!({
+            "max_tokens": 100,
+            "messages": [{
+                "role":"assistant",
+                "content": [{
+                    "type":"tool_use",
+                    "id":"toolu_1",
+                    "name":"Bash",
+                    "input":{"command":"echo hi"}
+                }]
+            },{
+                "role":"user",
+                "content": [{
+                    "type":"tool_result",
+                    "tool_use_id":"toolu_1",
+                    "content":"hi"
+                }]
+            }]
+        });
+        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        let msgs = o["messages"].as_array().unwrap();
+        assert!(msgs.iter().any(|m| m.get("tool_calls").is_some()));
+        assert!(msgs.iter().any(|m| m.get("role") == Some(&json!("tool"))));
+    }
+
+    #[test]
+    fn count_tokens_nonzero() {
+        let a = json!({"messages":[{"role":"user","content":"hello world from spock"}]});
+        assert!(count_tokens_estimate(&a) > 0);
+    }
+
+    #[test]
     fn stop_dropped_on_reasoning_xai() {
         let a = json!({
             "max_tokens": 100,
