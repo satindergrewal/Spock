@@ -513,20 +513,106 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, a: Value) -> Result<(
     };
 
     let env = EnvOverrides::from_env();
+    // Anthropic passthrough: forward Messages JSON with only model rewritten to upstream id.
+    if be.family == BackendFamily::Anthropic {
+        let mut body = a.clone();
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".into(), json!(resolved.upstream_model));
+        }
+        let do_stream = a.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+        eprintln!(
+            "  route {} → {}:{} (anthropic-passthrough)",
+            client_model, resolved.backend, resolved.upstream_model
+        );
+        return match be.chat(&body, do_stream, &state.tokens) {
+            Ok(UpstreamBody::Json(o)) => write_json(sock, 200, &o),
+            Ok(UpstreamBody::Stream(reader)) => {
+                // Raw Anthropic SSE passthrough
+                write_sse_headers(sock)?;
+                let mut buf = [0u8; 8192];
+                let mut r = reader;
+                loop {
+                    match r.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            sock.write_all(&buf[..n])?;
+                            sock.flush()?;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => write_upstream_err(sock, e),
+        };
+    }
+
     let oai = anthropic_to_openai(&a, &resolved.upstream_model, be.family, &env.grok_model);
     let include_thinking = wants_thinking(&a);
     let do_stream = a.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
+    let advisor_cfg = {
+        let c = state.snapshot_config()?;
+        crate::server_tools::AdvisorConfig {
+            enabled: c.advisor.enabled,
+            model: c.advisor.model.clone(),
+            max_tokens: c.advisor.max_tokens,
+        }
+    };
+    let web_cfg = {
+        let c = state.snapshot_config()?;
+        crate::server_tools::WebSearchConfig {
+            enabled: c.web_search.enabled,
+            provider: c.web_search.provider.clone(),
+            api_key: c.web_search.api_key.clone(),
+            api_key_env: c.web_search.api_key_env.clone(),
+            max_results: c.web_search.max_results,
+        }
+    };
+    let use_server_tools = (advisor_cfg.enabled
+        && crate::server_tools::request_has_advisor(&a))
+        || (web_cfg.enabled && crate::server_tools::request_has_web_search(&a));
+
     eprintln!(
-        "  route {} → {}:{} ({})",
+        "  route {} → {}:{} ({}){}",
         client_model,
         resolved.backend,
         resolved.upstream_model,
         match be.family {
             BackendFamily::Xai => "xai",
             BackendFamily::Openai => "openai",
+            BackendFamily::Anthropic => "anthropic",
+        },
+        if use_server_tools {
+            " [server-tools]"
+        } else {
+            ""
         }
     );
+
+    // Server-tool emulation runs a multi-round non-stream loop, then returns one Anthropic JSON
+    // (or a synthetic SSE of that JSON for stream clients).
+    if use_server_tools {
+        match crate::server_tools::run_with_server_tools(
+            state,
+            &a,
+            oai,
+            &client_model,
+            include_thinking,
+            &advisor_cfg,
+            &web_cfg,
+            be,
+            &env,
+        ) {
+            Ok(resp) => {
+                if do_stream {
+                    return stream_json_as_anthropic_sse(sock, &resp);
+                }
+                return write_json(sock, 200, &resp);
+            }
+            Err(e) => return write_upstream_err(sock, e),
+        }
+    }
 
     if !do_stream {
         match be.chat(&oai, false, &state.tokens) {
@@ -552,6 +638,82 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, a: Value) -> Result<(
             Err(e) => write_upstream_err(sock, e),
         }
     }
+}
+
+
+/// Emit a completed Anthropic message as SSE events (for server-tool multi-round results).
+fn stream_json_as_anthropic_sse(stream: &mut TcpStream, resp: &Value) -> Result<()> {
+    write_sse_headers(stream)?;
+    let msg_id = resp
+        .get("id")
+        .and_then(|i| i.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(new_msg_id);
+    let model = resp
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("spock");
+    emit_sse(
+        stream,
+        "message_start",
+        &json!({
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        }),
+    )?;
+    let blocks = resp
+        .get("content")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for (i, block) in blocks.iter().enumerate() {
+        emit_sse(
+            stream,
+            "content_block_start",
+            &json!({"type":"content_block_start","index": i, "content_block": block}),
+        )?;
+        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+            emit_sse(
+                stream,
+                "content_block_delta",
+                &json!({
+                    "type":"content_block_delta",
+                    "index": i,
+                    "delta": {"type":"text_delta","text": text}
+                }),
+            )?;
+        }
+        emit_sse(
+            stream,
+            "content_block_stop",
+            &json!({"type":"content_block_stop","index": i}),
+        )?;
+    }
+    let stop = resp
+        .get("stop_reason")
+        .cloned()
+        .unwrap_or(json!("end_turn"));
+    let usage = resp.get("usage").cloned().unwrap_or(json!({"input_tokens":0,"output_tokens":0}));
+    emit_sse(
+        stream,
+        "message_delta",
+        &json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": null},
+            "usage": usage
+        }),
+    )?;
+    emit_sse(stream, "message_stop", &json!({"type": "message_stop"}))?;
+    Ok(())
 }
 
 fn stream_anthropic(

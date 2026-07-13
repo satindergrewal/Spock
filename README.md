@@ -24,7 +24,8 @@ Spock is protocol-compatible with Claude Code’s Anthropic Messages client. Ver
 
 | Spock | Claude Code CLI | Claude Code IDE extension | Host (example) | Status | Notes |
 |---|---|---|---|---|---|
-| **0.1.0** | **2.1.206** | **2.1.206** (`cc_version=2.1.206.87c`) | VSCodium **1.128.0** (also VS Code) | **OK** | Baseline after Rust multi-backend release (2026-07-11) |
+| **0.2.0** | **2.1.206** | **2.1.206** (`cc_version=2.1.206.87c`) | VSCodium **1.128.0** (also VS Code) | **OK** | Server-tool emulation + presets + Auto Mode reasoning_effort fix (2026-07-13) |
+| **0.1.0** | **2.1.206** | **2.1.206** | VSCodium **1.128.0** | **OK** | Baseline Rust multi-backend release (2026-07-11) |
 
 **How to check your versions**
 
@@ -44,8 +45,8 @@ If something breaks after a Claude Code upgrade: note **both** Spock and Claude 
 
 **Known limits on the verified stack (not full breakage)**
 
-- Claude Code’s native **advisor** tool may appear client-side; Spock does not execute Anthropic’s server-side `advisor_20260301` yet (stripped like other non-`input_schema` tools). Planned as a Spock-only feature — no Claude Code / VSCode patches.
-- Some upstreams reject `tool_choice` when tools were filtered out; fix is on the Spock side.
+- Server-tool emulation is **opt-in** via `[advisor]` / `[web_search]` in config (defaults off). Without them, `advisor_20260301` / `web_search_*` schemas are stripped for OpenAI-compat upstreams.
+- OpenAI Responses API flag exists but is not fully implemented — use Chat Completions.
 
 ---
 
@@ -217,7 +218,26 @@ fable   = "ollama:glm-5.2:cloud"
 
 **Tip:** Different backends have different “personalities.” Grok often follows Claude Code’s “you are Claude” system prompt; other models may answer as themselves (or in another language). For a single-brain session, point **default + fable + main roles** at the same `backend:model`.
 
-Many public OpenAI-compatible gateways (OpenRouter, DeepSeek, Groq, LM Studio, vLLM, …) already work as `type = "openai"` with the right `base_url` + `api_key`. First-class presets and extra vendors are planned (OpenRouter, OpenAI, DeepSeek, …). No Claude Code changes required.
+Many public OpenAI-compatible gateways already work as `type = "openai"` with the right `base_url` + `api_key` (or `api_key_env`). Examples (see [`config.example.toml`](config.example.toml)):
+
+| Backend name | base_url | Key |
+|---|---|---|
+| OpenRouter | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` or `api_key` |
+| OpenAI | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| DeepSeek | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` |
+| Groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| LM Studio | `http://127.0.0.1:1234/v1` | optional |
+
+Optional on openai backends:
+
+```toml
+api_key_env = "OPENROUTER_API_KEY"
+[backends.openrouter.extra_headers]
+HTTP-Referer = "https://github.com/satindergrewal/Spock"
+X-Title = "Spock"
+```
+
+Then route e.g. `default = "openrouter:anthropic/claude-sonnet-4"`. No Claude Code changes required.
 
 Switch profiles live: app menu **Profile**, Settings active profile, or edit TOML + **Reload** / `spock reload`.
 
@@ -380,6 +400,9 @@ Workflows: [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/wor
 | Auto Mode “temporarily unavailable” | Upgrade Spock; ensure stop is dropped for xAI reasoning; aliases on `/v1/models` |
 | Compacts too early | `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000` + optional `[1m]` client id |
 | Broke after Claude Code update | Compare your CLI/extension versions to the [compatible table](#compatible-claude-code-versions); pin last good extension while Spock is updated |
+| xAI / backend quota or 401 in VSCodium | Prefer latest Spock — upstream 401/402/403/429 → **502** with a loud `Spock upstream …` message (not Anthropic login). Check `spock status` / `xai_auth`, credits on console.x.ai, or switch profile |
+| `tool_choice set but no tools` | Fixed when tools are stripped (server tools); upgrade Spock |
+| Auto Mode “claude-opus-… unavailable” | Often dead **opus** route or (older Spock) `reasoning_effort: none`. Point opus at a live backend; use Spock with the thinking-disabled fix |
 
 Proxy logs each request with the resolved route, e.g.:
 

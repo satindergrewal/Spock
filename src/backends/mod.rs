@@ -29,6 +29,7 @@ impl BackendHandle {
         let family = match cfg {
             BackendConfig::Xai { .. } => BackendFamily::Xai,
             BackendConfig::Openai { .. } => BackendFamily::Openai,
+            BackendConfig::Anthropic { .. } => BackendFamily::Anthropic,
         };
         Self {
             name: name.to_string(),
@@ -46,6 +47,7 @@ impl BackendHandle {
         match self.family {
             BackendFamily::Xai => "xai",
             BackendFamily::Openai => "openai",
+            BackendFamily::Anthropic => "anthropic",
         }
     }
 
@@ -57,10 +59,36 @@ impl BackendHandle {
     ) -> Result<UpstreamBody> {
         match &self.config {
             BackendConfig::Xai { base_url, api_key } => {
-                xai::chat(base_url, api_key.as_deref(), body, stream, tokens)
+                let key = self.config.api_key();
+                xai::chat(
+                    base_url,
+                    key.as_deref().or(api_key.as_deref()),
+                    body,
+                    stream,
+                    tokens,
+                )
             }
-            BackendConfig::Openai { base_url, api_key } => {
-                openai_compat::chat(base_url, api_key.as_deref(), body, stream)
+            BackendConfig::Openai { base_url, .. } => {
+                let key = self.config.api_key();
+                openai_compat::chat(
+                    base_url,
+                    key.as_deref(),
+                    body,
+                    stream,
+                    self.config.extra_headers(),
+                    self.config.azure_deployment(),
+                    self.config.azure_api_version(),
+                    self.config.use_responses_api(),
+                )
+            }
+            BackendConfig::Anthropic { base_url, .. } => {
+                let key = self.config.api_key();
+                openai_compat::anthropic_messages(
+                    base_url,
+                    key.as_deref(),
+                    body,
+                    stream,
+                )
             }
         }
     }
@@ -68,10 +96,35 @@ impl BackendHandle {
     pub fn get_json(&self, path: &str, tokens: &Arc<Mutex<TokenCache>>) -> Result<Value> {
         match &self.config {
             BackendConfig::Xai { base_url, api_key } => {
-                xai::get_json(base_url, path, api_key.as_deref(), tokens)
+                let key = self.config.api_key();
+                xai::get_json(
+                    base_url,
+                    path,
+                    key.as_deref().or(api_key.as_deref()),
+                    tokens,
+                )
             }
-            BackendConfig::Openai { base_url, api_key } => {
-                openai_compat::get_json(base_url, api_key.as_deref(), path)
+            BackendConfig::Openai { base_url, .. } => {
+                let key = self.config.api_key();
+                openai_compat::get_json(
+                    base_url,
+                    key.as_deref(),
+                    path,
+                    self.config.extra_headers(),
+                    self.config.azure_deployment(),
+                    self.config.azure_api_version(),
+                )
+            }
+            BackendConfig::Anthropic { base_url, .. } => {
+                let key = self.config.api_key();
+                openai_compat::get_json(
+                    base_url,
+                    key.as_deref(),
+                    path,
+                    self.config.extra_headers(),
+                    None,
+                    None,
+                )
             }
         }
     }
@@ -80,7 +133,13 @@ impl BackendHandle {
     pub fn list_models(&self, tokens: &Arc<Mutex<TokenCache>>) -> Result<Vec<String>> {
         match &self.config {
             BackendConfig::Xai { base_url, api_key } => {
-                let v = xai::get_json(base_url, "/models", api_key.as_deref(), tokens)?;
+                let key = self.config.api_key();
+                let v = xai::get_json(
+                    base_url,
+                    "/models",
+                    key.as_deref().or(api_key.as_deref()),
+                    tokens,
+                )?;
                 let mut ids = Vec::new();
                 if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
                     for m in data {
@@ -93,8 +152,13 @@ impl BackendHandle {
                 ids.dedup();
                 Ok(ids)
             }
-            BackendConfig::Openai { base_url, api_key } => {
-                openai_compat::list_models(base_url, api_key.as_deref())
+            BackendConfig::Openai { base_url, .. } | BackendConfig::Anthropic { base_url, .. } => {
+                let key = self.config.api_key();
+                openai_compat::list_models(
+                    base_url,
+                    key.as_deref(),
+                    self.config.extra_headers(),
+                )
             }
         }
     }

@@ -31,6 +31,12 @@ pub struct BackendDoc {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
+    /// Optional env var name for API key when field empty (openai).
+    #[serde(default)]
+    pub api_key_env: String,
+    /// Optional extra headers as "Key: Value" lines (openai / OpenRouter).
+    #[serde(default)]
+    pub extra_headers_text: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -58,12 +64,34 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
                 kind: "xai".into(),
                 base_url: base_url.clone(),
                 api_key: api_key.clone().unwrap_or_default(),
+                api_key_env: String::new(),
+                extra_headers_text: String::new(),
             },
-            BackendConfig::Openai { base_url, api_key } => BackendDoc {
+            BackendConfig::Openai {
+                base_url,
+                api_key,
+                extra_headers,
+                api_key_env,
+                ..
+            } => BackendDoc {
                 name: name.clone(),
                 kind: "openai".into(),
                 base_url: base_url.clone(),
                 api_key: api_key.clone().unwrap_or_default(),
+                api_key_env: api_key_env.clone().unwrap_or_default(),
+                extra_headers_text: headers_to_text(extra_headers),
+            },
+            BackendConfig::Anthropic {
+                base_url,
+                api_key,
+                api_key_env,
+            } => BackendDoc {
+                name: name.clone(),
+                kind: "anthropic".into(),
+                base_url: base_url.clone(),
+                api_key: api_key.clone().unwrap_or_default(),
+                api_key_env: api_key_env.clone().unwrap_or_default(),
+                extra_headers_text: String::new(),
             },
         })
         .collect();
@@ -125,6 +153,41 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
                         None
                     } else {
                         Some(k.to_string())
+                    }
+                },
+                extra_headers: text_to_headers(&b.extra_headers_text),
+                api_key_env: {
+                    let e = b.api_key_env.trim();
+                    if e.is_empty() {
+                        None
+                    } else {
+                        Some(e.to_string())
+                    }
+                },
+                use_responses_api: false,
+                azure_deployment: None,
+                azure_api_version: None,
+            },
+            "anthropic" => BackendConfig::Anthropic {
+                base_url: if b.base_url.trim().is_empty() {
+                    "https://api.anthropic.com".into()
+                } else {
+                    b.base_url.trim().to_string()
+                },
+                api_key: {
+                    let k = b.api_key.trim();
+                    if k.is_empty() {
+                        None
+                    } else {
+                        Some(k.to_string())
+                    }
+                },
+                api_key_env: {
+                    let e = b.api_key_env.trim();
+                    if e.is_empty() {
+                        None
+                    } else {
+                        Some(e.to_string())
                     }
                 },
             },
@@ -205,6 +268,13 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
         },
         backends,
         profiles,
+        // Settings UI does not edit these yet — preserve from disk when present.
+        advisor: crate::config::Config::load(&crate::config::config_path())
+            .map(|c| c.advisor)
+            .unwrap_or_default(),
+        web_search: crate::config::Config::load(&crate::config::config_path())
+            .map(|c| c.web_search)
+            .unwrap_or_default(),
     })
 }
 
@@ -512,6 +582,8 @@ function collectDoc() {{
     }},
     backends,
     profiles,
+      advisor: Default::default(),
+      web_search: Default::default(),
   }};
 }}
 
@@ -629,4 +701,30 @@ mod tests {
             Some("ollama:qwen2.5:14b")
         );
     }
+}
+
+
+fn headers_to_text(h: &BTreeMap<String, String>) -> String {
+    h.iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn text_to_headers(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() {
+                out.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    out
 }

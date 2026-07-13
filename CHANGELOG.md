@@ -2,6 +2,29 @@
 
 All notable changes to Spock are documented here.
 
+## [0.2.0] - 2026-07-13
+
+### Added
+- OpenAI-compat presets in `config.example.toml` (OpenRouter, OpenAI, DeepSeek, Groq, …)
+- `extra_headers` + `api_key_env` on openai backends
+- Server-tool emulation: `[advisor]` + `[web_search]` (DuckDuckGo / Brave / Serper)
+- Anthropic passthrough backend type (`type = "anthropic"`)
+- Azure OpenAI deployment fields (`azure_deployment`, `azure_api_version`)
+- Responses API flag stub (`use_responses_api` — chat completions remain default)
+- `scripts/smoke-compat.sh` for post-upgrade checks
+- Cargo `--locked` in CI, release, and macOS app build
+
+### Fixed
+- Auto Mode classifier: do not send `reasoning_effort: "none"` (Grok 400)
+- Drop `tool_choice` when all tools stripped (server tools / WebSearch nested call)
+- CLI `spock status` reports `config_api_key` (same priority as proxy)
+- Settings auth source (API key vs OAuth); clearer llama-server model-list errors
+- Loud 502 mapping for upstream 401/402/403/429 (IDE-friendly)
+
+### Notes
+- Claude Code baseline still **2.1.206** (see README compat table)
+- Enable advisor/web_search explicitly in config; defaults off
+
 ## [0.1.0] - 2026-07-11
 
 ### Added

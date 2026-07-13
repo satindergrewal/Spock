@@ -106,6 +106,7 @@ pub fn wants_thinking(a: &Value) -> bool {
 pub enum BackendFamily {
     Xai,
     Openai,
+    Anthropic,
 }
 
 fn convert_messages(a: &Value) -> Vec<Value> {
@@ -240,9 +241,11 @@ fn convert_messages(a: &Value) -> Vec<Value> {
 }
 
 fn apply_tools_and_choice(a: &Value, obj: &mut Map<String, Value>) {
+    let mut oai_tools = Vec::new();
     if let Some(tools) = a.get("tools").and_then(|v| v.as_array()) {
-        let mut oai_tools = Vec::new();
         for t in tools {
+            // Server tools (advisor_*, web_search_*, …) have no input_schema — strip for
+            // OpenAI-compat upstreams. Phase-2 Spock handlers intercept those separately.
             if t.get("input_schema").is_none() {
                 continue;
             }
@@ -256,18 +259,31 @@ fn apply_tools_and_choice(a: &Value, obj: &mut Map<String, Value>) {
             }));
         }
         if !oai_tools.is_empty() {
-            obj.insert("tools".into(), Value::Array(oai_tools));
+            obj.insert("tools".into(), Value::Array(oai_tools.clone()));
         }
+    }
+
+    // Never send tool_choice without tools — upstreams (Grok/Ollama) 400 with
+    // "tool_choice set but no tools specified" (WebSearch nested call after strip).
+    if oai_tools.is_empty() {
+        return;
     }
 
     if let Some(tc) = a.get("tool_choice").and_then(|v| v.as_object()) {
         match tc.get("type").and_then(|t| t.as_str()) {
             Some("tool") => {
+                let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                // If forced tool was stripped (server tool), drop tool_choice entirely.
+                if name.is_empty() || !oai_tools.iter().any(|t| {
+                    t.pointer("/function/name").and_then(|n| n.as_str()) == Some(name)
+                }) {
+                    return;
+                }
                 obj.insert(
                     "tool_choice".into(),
                     json!({
                         "type": "function",
-                        "function": {"name": tc.get("name").and_then(|n| n.as_str()).unwrap_or("")}
+                        "function": {"name": name}
                     }),
                 );
             }
@@ -316,6 +332,7 @@ pub fn anthropic_to_openai(
                 let keep = match family {
                     BackendFamily::Openai => true,
                     BackendFamily::Xai => !reasoning,
+                    BackendFamily::Anthropic => false,
                 };
                 if keep {
                     obj.insert("stop".into(), Value::Array(stops.clone()));
@@ -503,6 +520,44 @@ mod tests {
         let tools = o["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "b");
+    }
+
+    #[test]
+    fn tool_choice_dropped_when_all_tools_stripped() {
+        // WebSearch-style: only server tool left → no tools, must not send tool_choice.
+        let a = json!({
+            "max_tokens": 100,
+            "messages": [{"role":"user","content":"search"}],
+            "tools": [{
+                "type": "web_search_20250305",
+                "name": "web_search"
+            }],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        });
+        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        assert!(o.get("tools").is_none(), "tools={:?}", o.get("tools"));
+        assert!(
+            o.get("tool_choice").is_none(),
+            "tool_choice={:?}",
+            o.get("tool_choice")
+        );
+    }
+
+    #[test]
+    fn tool_choice_kept_when_function_tools_present() {
+        let a = json!({
+            "max_tokens": 100,
+            "messages": [{"role":"user","content":"hi"}],
+            "tools": [{
+                "name": "Bash",
+                "description": "run",
+                "input_schema": {"type":"object","properties":{}}
+            }],
+            "tool_choice": {"type": "auto"}
+        });
+        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        assert_eq!(o["tool_choice"], json!("auto"));
+        assert_eq!(o["tools"].as_array().unwrap().len(), 1);
     }
 
     #[test]

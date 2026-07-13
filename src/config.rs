@@ -45,6 +45,67 @@ pub struct Config {
     pub backends: BTreeMap<String, BackendConfig>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
+    #[serde(default)]
+    pub advisor: AdvisorSection,
+    #[serde(default)]
+    pub web_search: WebSearchSection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvisorSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_advisor_max")]
+    pub max_tokens: u32,
+}
+
+fn default_advisor_max() -> u32 {
+    4096
+}
+
+impl Default for AdvisorSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            max_tokens: default_advisor_max(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ws_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default = "default_ws_max")]
+    pub max_results: u32,
+}
+
+fn default_ws_provider() -> String {
+    "duckduckgo".into()
+}
+fn default_ws_max() -> u32 {
+    5
+}
+
+impl Default for WebSearchSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_ws_provider(),
+            api_key: None,
+            api_key_env: None,
+            max_results: default_ws_max(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +153,30 @@ pub enum BackendConfig {
         base_url: String,
         #[serde(default)]
         api_key: Option<String>,
+        /// Optional extra HTTP headers (e.g. OpenRouter HTTP-Referer / X-Title).
+        #[serde(default)]
+        extra_headers: BTreeMap<String, String>,
+        /// If `api_key` is empty, read bearer from this env var (e.g. OPENROUTER_API_KEY).
+        #[serde(default)]
+        api_key_env: Option<String>,
+        /// When true, call OpenAI Responses API (`/v1/responses`) instead of chat completions.
+        /// Not fully implemented for all shapes — prefer chat completions.
+        #[serde(default)]
+        use_responses_api: bool,
+        /// Azure OpenAI: if set, requests use `api-key` header and
+        /// `{base}/openai/deployments/{deployment}/chat/completions?api-version=...`.
+        #[serde(default)]
+        azure_deployment: Option<String>,
+        #[serde(default)]
+        azure_api_version: Option<String>,
+    },
+    /// Forward Anthropic Messages JSON as-is (no OpenAI translation).
+    Anthropic {
+        base_url: String,
+        #[serde(default)]
+        api_key: Option<String>,
+        #[serde(default)]
+        api_key_env: Option<String>,
     },
 }
 
@@ -104,6 +189,7 @@ impl BackendConfig {
         match self {
             BackendConfig::Xai { .. } => "xai",
             BackendConfig::Openai { .. } => "openai",
+            BackendConfig::Anthropic { .. } => "anthropic",
         }
     }
 
@@ -111,17 +197,142 @@ impl BackendConfig {
         match self {
             BackendConfig::Xai { base_url, .. } => base_url,
             BackendConfig::Openai { base_url, .. } => base_url,
+            BackendConfig::Anthropic { base_url, .. } => base_url,
+        }
+    }
+
+    /// Extra request headers (openai backends only; xAI returns empty).
+    pub fn extra_headers(&self) -> &BTreeMap<String, String> {
+        match self {
+            BackendConfig::Openai { extra_headers, .. } => extra_headers,
+            BackendConfig::Xai { .. } | BackendConfig::Anthropic { .. } => {
+                static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> =
+                    std::sync::OnceLock::new();
+                EMPTY.get_or_init(BTreeMap::new)
+            }
         }
     }
 
     /// Optional static bearer (API key) for this backend.
-    #[allow(dead_code)]
-    pub fn api_key(&self) -> Option<&str> {
+    /// Priority: config `api_key` → `api_key_env` → well-known env names by backend purpose.
+    pub fn api_key(&self) -> Option<String> {
         match self {
-            BackendConfig::Xai { api_key, .. } | BackendConfig::Openai { api_key, .. } => {
-                api_key.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            BackendConfig::Xai { api_key, .. } => api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    std::env::var("XAI_TOKEN")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                }),
+            BackendConfig::Openai {
+                api_key,
+                api_key_env,
+                ..
+            } => {
+                if let Some(k) = api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(k.to_string());
+                }
+                if let Some(env_name) = api_key_env
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Ok(v) = std::env::var(env_name) {
+                        let v = v.trim().to_string();
+                        if !v.is_empty() {
+                            return Some(v);
+                        }
+                    }
+                }
+                // Common fallbacks when api_key_env not set (order matters little).
+                for name in [
+                    "OPENROUTER_API_KEY",
+                    "OPENAI_API_KEY",
+                    "DEEPSEEK_API_KEY",
+                    "GROQ_API_KEY",
+                    "TOGETHER_API_KEY",
+                    "FIREWORKS_API_KEY",
+                    "MISTRAL_API_KEY",
+                    "MOONSHOT_API_KEY",
+                ] {
+                    if let Ok(v) = std::env::var(name) {
+                        let v = v.trim().to_string();
+                        if !v.is_empty() {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            }
+            BackendConfig::Anthropic {
+                api_key,
+                api_key_env,
+                ..
+            } => {
+                if let Some(k) = api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(k.to_string());
+                }
+                if let Some(env_name) = api_key_env
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Ok(v) = std::env::var(env_name) {
+                        let v = v.trim().to_string();
+                        if !v.is_empty() {
+                            return Some(v);
+                        }
+                    }
+                }
+                std::env::var("ANTHROPIC_API_KEY")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
             }
         }
+    }
+
+    pub fn azure_deployment(&self) -> Option<&str> {
+        match self {
+            BackendConfig::Openai {
+                azure_deployment, ..
+            } => azure_deployment.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            _ => None,
+        }
+    }
+
+    pub fn azure_api_version(&self) -> Option<&str> {
+        match self {
+            BackendConfig::Openai {
+                azure_api_version, ..
+            } => azure_api_version
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            _ => None,
+        }
+    }
+
+    pub fn use_responses_api(&self) -> bool {
+        matches!(
+            self,
+            BackendConfig::Openai {
+                use_responses_api: true,
+                ..
+            }
+        )
     }
 }
 
@@ -195,6 +406,11 @@ pub fn default_config() -> Config {
         BackendConfig::Openai {
             base_url: "http://127.0.0.1:11434/v1".to_string(),
             api_key: None,
+            extra_headers: BTreeMap::new(),
+            api_key_env: None,
+            use_responses_api: false,
+            azure_deployment: None,
+            azure_api_version: None,
         },
     );
 
@@ -202,6 +418,8 @@ pub fn default_config() -> Config {
         server: ServerConfig::default(),
         backends,
         profiles,
+        advisor: Default::default(),
+        web_search: Default::default(),
     }
 }
 

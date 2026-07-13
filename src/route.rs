@@ -135,6 +135,11 @@ mod tests {
             BackendConfig::Openai {
                 base_url: "http://127.0.0.1:11434/v1".into(),
                 api_key: None,
+                extra_headers: BTreeMap::new(),
+                api_key_env: None,
+                use_responses_api: false,
+                azure_deployment: None,
+                azure_api_version: None,
             },
         );
         let mut profiles = BTreeMap::new();
@@ -157,6 +162,8 @@ mod tests {
             },
             backends,
             profiles,
+            advisor: Default::default(),
+            web_search: Default::default(),
         }
     }
 
