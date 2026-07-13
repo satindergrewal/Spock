@@ -530,6 +530,10 @@ fn urlencoding_lite(s: &str) -> String {
 
 /// Multi-step non-stream loop: model may call advisor / web_search; Spock executes.
 /// Returns final Anthropic-shaped message value.
+///
+/// Critical: client tools (Read, Bash, …) are NOT executed by Spock. If the model
+/// calls any client tool, we return that turn to Claude Code so its tool runner
+/// can execute it. We only loop when the model calls advisor / web_search.
 pub fn run_with_server_tools(
     state: &AppState,
     anthropic_req: &Value,
@@ -599,10 +603,44 @@ pub fn run_with_server_tools(
             return Ok(anth);
         }
 
+        // Partition tool calls: server tools (advisor/web_search) we run now;
+        // client tools (Read, Bash, …) must be returned to Claude Code to execute.
+        let mut server_calls: Vec<&Value> = Vec::new();
+        let mut client_calls: Vec<&Value> = Vec::new();
+        for tc in &tool_calls {
+            let name = tc
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let is_server = (name == "advisor" && want_advisor)
+                || (name == "web_search" && want_web);
+            if is_server {
+                server_calls.push(tc);
+            } else {
+                client_calls.push(tc);
+            }
+        }
+
+        // If the model calls client tools, return this turn to Claude Code.
+        // Prepend any server_tool_use blocks we already collected earlier so the
+        // Advisor UI still lights up; Claude Code executes the client tool_use.
+        if !client_calls.is_empty() {
+            let mut anth = openai_to_anthropic(&resp, client_model, include_thinking);
+            if !collected_server_blocks.is_empty() {
+                if let Some(content) = anth.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    let mut merged = collected_server_blocks.clone();
+                    merged.append(content);
+                    *content = merged;
+                }
+            }
+            return Ok(anth);
+        }
+
+        // Only server tools this turn — run them and loop.
         // Append assistant tool_calls message
         messages.push(msg.clone());
 
-        for tc in &tool_calls {
+        for tc in server_calls {
             let id = tc
                 .get("id")
                 .and_then(|i| i.as_str())
@@ -666,6 +704,7 @@ pub fn run_with_server_tools(
                     ];
                     (text, blocks)
                 }
+                // Unreachable (filtered above) — defensive.
                 other => {
                     let err = format!("unknown or disabled server tool: {other}");
                     (err, vec![])
