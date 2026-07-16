@@ -420,6 +420,22 @@ final class AppModel: ObservableObject {
             // Still allow OAuth if they insist? Prefer not to surprise — skip device flow.
             return
         }
+        if authSource == "env_XAI_TOKEN" || authSource == "env" {
+            setStatus(
+                "xAI is using \(authSourceLabel). Login is OAuth-only — unset XAI_TOKEN if you want subscription OAuth instead.",
+                error: false
+            )
+            return
+        }
+        // Already have live OAuth tokens (same short-circuit as `spock login` CLI).
+        // Force re-auth: Logout xAI, then Login again.
+        if authPresent && authSource == "oauth" {
+            setStatus(
+                "Already logged in via xAI OAuth (subscription). Use Logout xAI first if you need a fresh token.",
+                error: false
+            )
+            return
+        }
         if loginInFlight {
             setStatus("xAI OAuth already in progress — check the browser", error: false)
             return

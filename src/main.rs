@@ -50,6 +50,27 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Login { no_open } => {
+            // Mirror GUI: say when OAuth tokens are already live (don't imply a fresh device flow).
+            if std::env::var("XAI_TOKEN").map(|t| !t.is_empty()).unwrap_or(false) {
+                println!("xAI auth: XAI_TOKEN env is set (OAuth login not used).");
+                return Ok(());
+            }
+            if let Some(tokens) = load_tokens() {
+                let exp = tokens.expires_at.unwrap_or(0.0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                if now < exp - 60.0 && !tokens.access_token.is_empty() {
+                    println!(
+                        "Already logged in (OAuth). Token cached at {} ({}…)",
+                        auth_path().display(),
+                        tokens.access_token.chars().take(12).collect::<String>()
+                    );
+                    println!("  Logout first (`spock logout`) if you need a fresh device login.");
+                    return Ok(());
+                }
+            }
             let token = get_access_token(!no_open)?;
             println!(
                 "Logged in. Token cached at {} ({}…)",

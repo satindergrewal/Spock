@@ -6,6 +6,7 @@ All notable changes to Spock are documented here.
 
 ### Fixed
 - **Login xAI…** from the menu bar no longer shells through Terminal/AppleScript (could stall 1–4 minutes on shell/TCC). Runs `spock login` as a direct child process, opens the browser immediately, surfaces progress in the status toast.
+- Menu **Login xAI…** short-circuits with a clear toast when OAuth / API key / `XAI_TOKEN` is already active; menu bar shows `xAI auth: …` and Login title reflects state. CLI `spock login` prints **Already logged in (OAuth)** when tokens are still valid.
 
 ### Changed
 - Product framing: multi-backend Anthropic Messages proxy (not Grok-only) — Cargo description, GitHub About/topics, macOS Get Info string, Chat empty-state copy

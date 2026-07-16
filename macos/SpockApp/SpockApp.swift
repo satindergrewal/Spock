@@ -95,18 +95,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Green / orange / gray / red hand based on proxy health.
     private func updateStatusItemAppearance() {
         guard let button = statusItem?.button else { return }
-        let status = AppModel.shared.proxyStatus
+        let model = AppModel.shared
+        let status = model.proxyStatus
         button.image = SpockHandIcon.menuBarImage(color: status.iconColor)
-        button.toolTip = "Spock · \(status.menuLabel) · \(AppModel.shared.profile) · :\(AppModel.shared.port)"
+        button.toolTip =
+            "Spock · \(status.menuLabel) · \(model.profile) · :\(model.port) · xAI: \(model.authSourceLabel)"
     }
 
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
         let model = AppModel.shared
-        let status = "Spock · \(model.proxyStatus.menuLabel) · \(model.profile) · :\(model.port)"
+        let status =
+            "Spock · \(model.proxyStatus.menuLabel) · \(model.profile) · :\(model.port)"
         let statusRow = NSMenuItem(title: status, action: nil, keyEquivalent: "")
         statusRow.isEnabled = false
         menu.addItem(statusRow)
+
+        let authRow = NSMenuItem(
+            title: "xAI auth: \(model.authSourceLabel)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        authRow.isEnabled = false
+        menu.addItem(authRow)
         menu.addItem(.separator())
 
         let chat = NSMenuItem(title: "Chat…", action: #selector(openChat), keyEquivalent: "n")
@@ -142,12 +153,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         menu.addItem(.separator())
 
-        let login = NSMenuItem(title: "Login xAI…", action: #selector(loginXAI), keyEquivalent: "")
+        // Reflect live auth so Login isn't a silent no-op when already OAuth'd.
+        let loginTitle: String
+        switch model.authSource {
+        case "oauth":
+            loginTitle = "Login xAI… (already OAuth)"
+        case "config_api_key":
+            loginTitle = "Login xAI… (API key active)"
+        case "env_XAI_TOKEN", "env":
+            loginTitle = "Login xAI… (XAI_TOKEN active)"
+        default:
+            loginTitle = "Login xAI…"
+        }
+        let login = NSMenuItem(title: loginTitle, action: #selector(loginXAI), keyEquivalent: "")
         login.target = self
         menu.addItem(login)
 
         let logout = NSMenuItem(title: "Logout xAI", action: #selector(logoutXAI), keyEquivalent: "")
         logout.target = self
+        // Logout only clears OAuth tokens — still useful to show when oauth present.
+        logout.isEnabled = model.authPresent || model.authSource == "oauth"
         menu.addItem(logout)
 
         menu.addItem(.separator())
