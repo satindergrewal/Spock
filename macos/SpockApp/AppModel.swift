@@ -72,6 +72,9 @@ final class AppModel: ObservableObject {
     private var child: Process?
     private var weStartedProxy = false
     private var lastIconStatus: ProxyStatus?
+    /// In-flight `spock login` Process (tray Login xAI).
+    private var loginProcess: Process?
+    private var loginInFlight = false
 
     private var baseURL: URL {
         URL(string: "http://127.0.0.1:\(port)")!
@@ -417,26 +420,111 @@ final class AppModel: ObservableObject {
             // Still allow OAuth if they insist? Prefer not to surprise — skip device flow.
             return
         }
+        if loginInFlight {
+            setStatus("xAI OAuth already in progress — check the browser", error: false)
+            return
+        }
         guard let bin = findSpockBinary() else {
             setStatus("spock binary not found", error: true)
             return
         }
-        let escaped = bin.path.replacingOccurrences(of: "\"", with: "\\\"")
-        let script = """
-        tell application "Terminal"
-          activate
-          do script "\\"\(escaped)\\" login; echo; echo Done — OAuth only. For console API key: Settings → xai → API key → Save & Apply."
-        end tell
-        """
-        if let apple = NSAppleScript(source: script) {
-            var err: NSDictionary?
-            apple.executeAndReturnError(&err)
-            if let err {
-                setStatus("Login launch failed: \(err)", error: true)
-            } else {
-                setStatus("OAuth login started in Terminal (not API key)", error: false)
+
+        // Run `spock login` as a child Process (opens the browser itself).
+        // Old path: AppleScript → Terminal → interactive shell. That waited on
+        // Automation TCC + Terminal cold start + zsh init — often 1–4 minutes
+        // before the device-code request even started.
+        loginInFlight = true
+        setStatus("Starting xAI OAuth… browser should open in a few seconds", error: false)
+
+        let proc = Process()
+        proc.executableURL = bin
+        proc.arguments = ["login"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        // Inherit PATH so nested `open` (browser) resolves; keep app env otherwise.
+        var env = ProcessInfo.processInfo.environment
+        if env["PATH"] == nil || env["PATH"]?.isEmpty == true {
+            env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        }
+        proc.environment = env
+        loginProcess = proc
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                try proc.run()
+                // Stream stderr/stdout so we can surface the verification URL if
+                // `open` fails, and so the UI isn't blind while polling for approval.
+                let handle = pipe.fileHandleForReading
+                var collected = Data()
+                var openedFallback = false
+                while proc.isRunning {
+                    let chunk = handle.availableData
+                    if !chunk.isEmpty {
+                        collected.append(chunk)
+                        if !openedFallback,
+                           let text = String(data: collected, encoding: .utf8),
+                           let url = Self.firstHTTPURL(in: text)
+                        {
+                            openedFallback = true
+                            DispatchQueue.main.async {
+                                NSWorkspace.shared.open(url)
+                                self.setStatus(
+                                    "Browser opened for xAI — approve the device code, then return here",
+                                    error: false
+                                )
+                            }
+                        }
+                    } else {
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                }
+                // Drain remainder after exit.
+                let rest = handle.readDataToEndOfFile()
+                if !rest.isEmpty { collected.append(rest) }
+                let text = String(data: collected, encoding: .utf8) ?? ""
+                let ok = proc.terminationStatus == 0
+                DispatchQueue.main.async {
+                    self.loginInFlight = false
+                    self.loginProcess = nil
+                    if ok {
+                        self.refreshQuiet()
+                        self.setStatus("xAI OAuth complete — tokens cached", error: false)
+                    } else {
+                        let tail = text
+                            .split(separator: "\n", omittingEmptySubsequences: false)
+                            .suffix(4)
+                            .joined(separator: " ")
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        let detail = tail.isEmpty ? "exit \(proc.terminationStatus)" : String(tail.prefix(240))
+                        self.setStatus("xAI OAuth failed: \(detail)", error: true)
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.loginInFlight = false
+                    self.loginProcess = nil
+                    self.setStatus("Login launch failed: \(error.localizedDescription)", error: true)
+                }
             }
         }
+    }
+
+    /// First http(s) URL in OAuth CLI output (verification_uri_complete).
+    private static func firstHTTPURL(in text: String) -> URL? {
+        // Device login prints the verification URL on its own line after a short banner.
+        for raw in text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }) {
+            let s = String(raw)
+            if s.hasPrefix("https://") || s.hasPrefix("http://"),
+               let u = URL(string: s),
+               let host = u.host,
+               !host.isEmpty
+            {
+                return u
+            }
+        }
+        return nil
     }
 
     func logoutXAI() {
