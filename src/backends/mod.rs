@@ -1,74 +1,85 @@
 pub mod openai_compat;
-pub mod xai;
 
 use crate::config::{BackendConfig, Config};
 use crate::error::{Error, Result};
-use crate::translate::BackendFamily;
+use crate::oauth::registry::{get_provider, request_headers, CompletionsQuirk, DeviceCtx};
+use crate::oauth::{access_token, AccessMode, OauthStore};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
-use std::sync::{Arc, Mutex};
-
-use crate::auth::TokenCache;
 
 pub enum UpstreamBody {
     Json(Value),
-    /// Streaming response: status already 200 assumed by caller after construction.
     Stream(Box<dyn Read + Send>),
 }
 
-#[allow(dead_code)]
+/// Cheap to clone — holds config only, no live sockets. Callers should clone out of
+/// `AppState.backends` and **drop the RwLock** before long upstream I/O so Save/reload
+/// cannot be blocked by hour-long LAN generations.
+#[derive(Clone)]
 pub struct BackendHandle {
     pub name: String,
-    pub family: BackendFamily,
+    pub quirk: CompletionsQuirk,
     pub config: BackendConfig,
 }
 
 impl BackendHandle {
     pub fn from_config(name: &str, cfg: &BackendConfig) -> Self {
-        let family = match cfg {
-            BackendConfig::Xai { .. } => BackendFamily::Xai,
-            BackendConfig::Openai { .. } => BackendFamily::Openai,
-            BackendConfig::Anthropic { .. } => BackendFamily::Anthropic,
-        };
         Self {
             name: name.to_string(),
-            family,
+            quirk: cfg.quirk(),
             config: cfg.clone(),
         }
     }
 
-    #[allow(dead_code)]
     pub fn base_url(&self) -> &str {
         self.config.base_url()
     }
 
     pub fn family_name(&self) -> &'static str {
-        match self.family {
-            BackendFamily::Xai => "xai",
-            BackendFamily::Openai => "openai",
-            BackendFamily::Anthropic => "anthropic",
+        match &self.config {
+            BackendConfig::Oauth { .. } => "oauth",
+            BackendConfig::ApiKey { .. } => "api_key",
+            BackendConfig::Anthropic { .. } => "anthropic",
         }
     }
 
-    pub fn chat(
-        &self,
-        body: &Value,
-        stream: bool,
-        tokens: &Arc<Mutex<TokenCache>>,
-    ) -> Result<UpstreamBody> {
+    pub fn is_anthropic(&self) -> bool {
+        matches!(self.config, BackendConfig::Anthropic { .. })
+    }
+
+    fn oauth_bearer(&self, store: &OauthStore) -> Result<(String, BTreeMap<String, String>, String)> {
+        let (provider_id, api_key) = match &self.config {
+            BackendConfig::Oauth {
+                provider, api_key, ..
+            } => (provider.as_str(), api_key.as_deref()),
+            _ => return Err(Error::Msg("not an oauth backend".into())),
+        };
+        let p = get_provider(provider_id)
+            .ok_or_else(|| Error::Auth(format!("unknown provider '{provider_id}'")))?;
+        let token = access_token(store, provider_id, api_key, AccessMode::Proxy)?;
+        let ctx = DeviceCtx::current();
+        let headers = request_headers(p, &ctx);
+        Ok((token, headers, p.user_agent.to_string()))
+    }
+
+    pub fn chat(&self, body: &Value, stream: bool, oauth: &OauthStore) -> Result<UpstreamBody> {
         match &self.config {
-            BackendConfig::Xai { base_url, api_key } => {
-                let key = self.config.api_key();
-                xai::chat(
+            BackendConfig::Oauth { base_url, .. } => {
+                let (token, headers, ua) = self.oauth_bearer(oauth)?;
+                openai_compat::chat(
                     base_url,
-                    key.as_deref().or(api_key.as_deref()),
+                    Some(&token),
                     body,
                     stream,
-                    tokens,
+                    &headers,
+                    None,
+                    None,
+                    false,
+                    Some(&ua),
                 )
             }
-            BackendConfig::Openai { base_url, .. } => {
+            BackendConfig::ApiKey { base_url, .. } => {
                 let key = self.config.api_key();
                 openai_compat::chat(
                     base_url,
@@ -79,32 +90,31 @@ impl BackendHandle {
                     self.config.azure_deployment(),
                     self.config.azure_api_version(),
                     self.config.use_responses_api(),
+                    None,
                 )
             }
             BackendConfig::Anthropic { base_url, .. } => {
                 let key = self.config.api_key();
-                openai_compat::anthropic_messages(
-                    base_url,
-                    key.as_deref(),
-                    body,
-                    stream,
-                )
+                openai_compat::anthropic_messages(base_url, key.as_deref(), body, stream)
             }
         }
     }
 
-    pub fn get_json(&self, path: &str, tokens: &Arc<Mutex<TokenCache>>) -> Result<Value> {
+    pub fn get_json(&self, path: &str, oauth: &OauthStore) -> Result<Value> {
         match &self.config {
-            BackendConfig::Xai { base_url, api_key } => {
-                let key = self.config.api_key();
-                xai::get_json(
+            BackendConfig::Oauth { base_url, .. } => {
+                let (token, headers, ua) = self.oauth_bearer(oauth)?;
+                openai_compat::get_json(
                     base_url,
+                    Some(&token),
                     path,
-                    key.as_deref().or(api_key.as_deref()),
-                    tokens,
+                    &headers,
+                    None,
+                    None,
+                    Some(&ua),
                 )
             }
-            BackendConfig::Openai { base_url, .. } => {
+            BackendConfig::ApiKey { base_url, .. } => {
                 let key = self.config.api_key();
                 openai_compat::get_json(
                     base_url,
@@ -113,6 +123,7 @@ impl BackendHandle {
                     self.config.extra_headers(),
                     self.config.azure_deployment(),
                     self.config.azure_api_version(),
+                    None,
                 )
             }
             BackendConfig::Anthropic { base_url, .. } => {
@@ -124,50 +135,27 @@ impl BackendHandle {
                     self.config.extra_headers(),
                     None,
                     None,
+                    None,
                 )
             }
         }
     }
 
-    /// Discover model ids for Settings (OpenAI /models or Ollama /api/tags).
-    pub fn list_models(&self, tokens: &Arc<Mutex<TokenCache>>) -> Result<Vec<String>> {
+    pub fn list_models(&self, oauth: &OauthStore) -> Result<Vec<String>> {
         match &self.config {
-            BackendConfig::Xai { base_url, api_key } => {
-                let key = self.config.api_key();
-                let v = xai::get_json(
-                    base_url,
-                    "/models",
-                    key.as_deref().or(api_key.as_deref()),
-                    tokens,
-                )?;
-                let mut ids = Vec::new();
-                if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
-                    for m in data {
-                        if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
-                            ids.push(id.to_string());
-                        }
-                    }
-                }
-                ids.sort();
-                ids.dedup();
-                Ok(ids)
+            BackendConfig::Oauth { base_url, .. } => {
+                let (token, headers, ua) = self.oauth_bearer(oauth)?;
+                openai_compat::list_models(base_url, Some(&token), &headers, Some(&ua))
             }
-            BackendConfig::Openai { base_url, .. } | BackendConfig::Anthropic { base_url, .. } => {
+            BackendConfig::ApiKey { base_url, .. } | BackendConfig::Anthropic { base_url, .. } => {
                 let key = self.config.api_key();
                 openai_compat::list_models(
                     base_url,
                     key.as_deref(),
                     self.config.extra_headers(),
+                    None,
                 )
             }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn health(&self, tokens: &Arc<Mutex<TokenCache>>) -> (bool, String) {
-        match self.get_json("/models", tokens) {
-            Ok(_) => (true, "ok".into()),
-            Err(e) => (false, e.to_string()),
         }
     }
 }

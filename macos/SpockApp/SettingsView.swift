@@ -143,7 +143,7 @@ struct SettingsView: View {
         case "oauth":
             return "Using SuperGrok OAuth tokens. Paste a console API key in the xai row and Save & Apply to override."
         default:
-            return "No xAI credentials. Set API key on the xai backend + Save & Apply, or menu Login xAI… for OAuth."
+            return "No xAI credentials. Set API key on the xai backend + Save & Apply, or menu Login… for OAuth."
         }
     }
 
@@ -157,24 +157,51 @@ struct SettingsView: View {
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 100)
                             Picker("", selection: $b.type) {
-                                Text("xai").tag("xai")
-                                Text("openai").tag("openai")
+                                Text("OAuth").tag("oauth")
+                                Text("API Key").tag("api_key")
+                                Text("Anthropic").tag("anthropic")
                             }
                             .labelsHidden()
                             .frame(width: 100)
+                            .onChange(of: b.type) { _, newVal in
+                                if newVal == "oauth" && b.provider.isEmpty {
+                                    b.provider = "xai"
+                                    if b.baseURL.isEmpty { b.baseURL = "https://api.x.ai/v1" }
+                                }
+                            }
+                            if b.type == "oauth" {
+                                Picker("", selection: $b.provider) {
+                                    Text("xai").tag("xai")
+                                    Text("kimi").tag("kimi")
+                                    if !b.provider.isEmpty && b.provider != "xai" && b.provider != "kimi" {
+                                        Text(b.provider).tag(b.provider)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(width: 90)
+                                .onChange(of: b.provider) { _, newVal in
+                                    if b.baseURL.trimmingCharacters(in: .whitespaces).isEmpty {
+                                        if newVal == "kimi" {
+                                            b.baseURL = "https://api.kimi.com/coding/v1"
+                                        } else if newVal == "xai" {
+                                            b.baseURL = "https://api.x.ai/v1"
+                                        }
+                                    }
+                                }
+                            }
                             TextField("base URL", text: $b.baseURL)
                                 .textFieldStyle(.roundedBorder)
                             Group {
-                                if b.type == "xai" {
-                                    SecureField("xAI console API key", text: $b.apiKey)
+                                if b.type == "oauth" {
+                                    SecureField("API key (optional escape hatch)", text: $b.apiKey)
                                         .textFieldStyle(.roundedBorder)
                                         .frame(minWidth: 200)
-                                        .help("From console.x.ai. Save & Apply required. Overrides OAuth. Menu “Login xAI” is OAuth only — not this key.")
+                                        .help("Optional. When set, beats OAuth for this backend. Prefer menu Login for subscription tokens.")
                                 } else {
                                     SecureField("api key (optional)", text: $b.apiKey)
                                         .textFieldStyle(.roundedBorder)
                                         .frame(minWidth: 160)
-                                        .help("Optional Bearer for OpenAI-compatible backends")
+                                        .help("Bearer for API Key backends / Anthropic key")
                                 }
                             }
                             Button {
@@ -201,8 +228,8 @@ struct SettingsView: View {
                             .buttonStyle(.borderless)
                         }
 
-                        if b.type == "xai" {
-                            Text(xaiKeyHint(for: b))
+                        if b.type == "oauth" {
+                            Text(oauthKeyHint(for: b))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -222,7 +249,7 @@ struct SettingsView: View {
                     } label: {
                         Label("Add backend", systemImage: "plus.circle")
                     }
-                    Text("xai: paste console API key → Save & Apply (priority: config key → XAI_TOKEN → OAuth). Menu Login xAI = OAuth only. openai: Ollama / llama-server / LAN. Base URL is …/v1 not …/v1/models. Save before Fetch.")
+                    Text("OAuth: pick provider (xai/kimi) + menu Login. Optional API key field beats OAuth. API Key: OpenAI-compatible base …/v1 + key. Anthropic: Messages passthrough. Save before Fetch.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -436,7 +463,7 @@ struct SettingsView: View {
         }
     }
 
-    private func xaiKeyHint(for b: BackendRow) -> String {
+    private func oauthKeyHint(for b: BackendRow) -> String {
         let keySet = !b.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if keySet {
             return "Key in form — click Save & Apply. Live proxy: \(model.authSourceLabel)."
@@ -449,7 +476,7 @@ struct SettingsView: View {
         case "env_XAI_TOKEN", "env":
             return "Proxy is using XAI_TOKEN from the environment."
         default:
-            return "No key yet. Paste console.x.ai API key → Save & Apply. Menu Login xAI is OAuth subscription only."
+            return "No key yet. Paste console.x.ai API key → Save & Apply. Menu Login is OAuth subscription only."
         }
     }
 }

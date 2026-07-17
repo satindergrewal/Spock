@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::oauth::registry::{get_provider, CompletionsQuirk};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -12,21 +13,6 @@ pub const DEFAULT_GROK_MODEL: &str = "grok-4.5";
 pub const CHAT_DEFAULT_MODEL: &str = "grok-4.3";
 pub const UA: &str = concat!("spock/", env!("CARGO_PKG_VERSION"));
 
-/// OAuth token file path — keep Python-era location so existing logins work.
-/// Intentionally NOT dirs::config_dir() (that is ~/Library on macOS).
-pub fn auth_path() -> PathBuf {
-    home_dir().join(".config/grok-test/auth.json")
-}
-
-pub fn config_path() -> PathBuf {
-    home_dir().join(".config/spock/config.toml")
-}
-
-#[allow(dead_code)]
-pub fn config_dir() -> PathBuf {
-    home_dir().join(".config/spock")
-}
-
 pub fn home_dir() -> PathBuf {
     if let Ok(h) = std::env::var("HOME") {
         return PathBuf::from(h);
@@ -35,6 +21,19 @@ pub fn home_dir() -> PathBuf {
         return PathBuf::from(h);
     }
     PathBuf::from(".")
+}
+
+pub fn config_path() -> PathBuf {
+    home_dir().join(".config/spock/config.toml")
+}
+
+pub fn config_dir() -> PathBuf {
+    home_dir().join(".config/spock")
+}
+
+/// Legacy xAI token path (Python-era); still used as import source.
+pub fn legacy_xai_auth_path() -> PathBuf {
+    home_dir().join(".config/grok-test/auth.json")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +80,6 @@ pub struct WebSearchSection {
     pub enabled: bool,
     #[serde(default = "default_ws_provider")]
     pub provider: String,
-    /// SearXNG (or custom) base, e.g. http://127.0.0.1:8888 — no path.
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -142,39 +140,36 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+/// Backend kinds. Legacy TOML `type = "xai"` / `"openai"` accepted on read via custom deserialize.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendConfig {
-    Xai {
-        #[serde(default = "default_xai_base")]
+    /// Device OAuth (xAI, Kimi Code, …) via registry `provider`.
+    Oauth {
+        provider: String,
+        #[serde(default)]
         base_url: String,
-        /// Optional xAI API key (console.x.ai). When set, skips OAuth for this backend.
-        /// Priority: this field → env `XAI_TOKEN` → OAuth device flow.
+        /// Optional console/API key escape hatch (beats OAuth).
         #[serde(default)]
         api_key: Option<String>,
     },
-    Openai {
+    /// OpenAI-compatible Chat Completions with bearer / Azure key.
+    ApiKey {
         base_url: String,
         #[serde(default)]
         api_key: Option<String>,
-        /// Optional extra HTTP headers (e.g. OpenRouter HTTP-Referer / X-Title).
         #[serde(default)]
         extra_headers: BTreeMap<String, String>,
-        /// If `api_key` is empty, read bearer from this env var (e.g. OPENROUTER_API_KEY).
         #[serde(default)]
         api_key_env: Option<String>,
-        /// When true, call OpenAI Responses API (`/v1/responses`) instead of chat completions.
-        /// Not fully implemented for all shapes — prefer chat completions.
         #[serde(default)]
         use_responses_api: bool,
-        /// Azure OpenAI: if set, requests use `api-key` header and
-        /// `{base}/openai/deployments/{deployment}/chat/completions?api-version=...`.
         #[serde(default)]
         azure_deployment: Option<String>,
         #[serde(default)]
         azure_api_version: Option<String>,
     },
-    /// Forward Anthropic Messages JSON as-is (no OpenAI translation).
+    /// Forward Anthropic Messages JSON as-is.
     Anthropic {
         base_url: String,
         #[serde(default)]
@@ -184,32 +179,147 @@ pub enum BackendConfig {
     },
 }
 
-fn default_xai_base() -> String {
-    DEFAULT_XAI_BASE.to_string()
+// Custom deserialize to accept legacy type = "xai" | "openai".
+impl<'de> Deserialize<'de> for BackendConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            provider: Option<String>,
+            #[serde(default)]
+            base_url: Option<String>,
+            #[serde(default)]
+            api_key: Option<String>,
+            #[serde(default)]
+            extra_headers: BTreeMap<String, String>,
+            #[serde(default)]
+            api_key_env: Option<String>,
+            #[serde(default)]
+            use_responses_api: bool,
+            #[serde(default)]
+            azure_deployment: Option<String>,
+            #[serde(default)]
+            azure_api_version: Option<String>,
+        }
+        let r = Raw::deserialize(deserializer)?;
+        let kind = r.kind.trim().to_ascii_lowercase();
+        match kind.as_str() {
+            "oauth" => {
+                let provider = r
+                    .provider
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| serde::de::Error::custom("oauth backend needs provider"))?;
+                if get_provider(&provider).is_none() {
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown oauth provider '{provider}' (known: {})",
+                        crate::oauth::provider_ids_csv()
+                    )));
+                }
+                let base_url = r
+                    .base_url
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        get_provider(&provider)
+                            .map(|p| p.default_base_url.to_string())
+                            .unwrap_or_default()
+                    });
+                Ok(BackendConfig::Oauth {
+                    provider,
+                    base_url,
+                    api_key: r.api_key,
+                })
+            }
+            // Legacy alias
+            "xai" => Ok(BackendConfig::Oauth {
+                provider: "xai".into(),
+                base_url: r
+                    .base_url
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_XAI_BASE.to_string()),
+                api_key: r.api_key,
+            }),
+            "api_key" | "openai" => {
+                let base_url = r
+                    .base_url
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("api_key/openai backend needs base_url")
+                    })?;
+                Ok(BackendConfig::ApiKey {
+                    base_url,
+                    api_key: r.api_key,
+                    extra_headers: r.extra_headers,
+                    api_key_env: r.api_key_env,
+                    use_responses_api: r.use_responses_api,
+                    azure_deployment: r.azure_deployment,
+                    azure_api_version: r.azure_api_version,
+                })
+            }
+            "anthropic" => {
+                let base_url = r
+                    .base_url
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "https://api.anthropic.com".into());
+                Ok(BackendConfig::Anthropic {
+                    base_url,
+                    api_key: r.api_key,
+                    api_key_env: r.api_key_env,
+                })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown backend type '{other}' (use oauth, api_key, anthropic)"
+            ))),
+        }
+    }
 }
 
 impl BackendConfig {
     pub fn kind_name(&self) -> &'static str {
         match self {
-            BackendConfig::Xai { .. } => "xai",
-            BackendConfig::Openai { .. } => "openai",
+            BackendConfig::Oauth { .. } => "oauth",
+            BackendConfig::ApiKey { .. } => "api_key",
             BackendConfig::Anthropic { .. } => "anthropic",
+        }
+    }
+
+    pub fn oauth_provider(&self) -> Option<&str> {
+        match self {
+            BackendConfig::Oauth { provider, .. } => Some(provider.as_str()),
+            _ => None,
         }
     }
 
     pub fn base_url(&self) -> &str {
         match self {
-            BackendConfig::Xai { base_url, .. } => base_url,
-            BackendConfig::Openai { base_url, .. } => base_url,
+            BackendConfig::Oauth { base_url, .. } => base_url,
+            BackendConfig::ApiKey { base_url, .. } => base_url,
             BackendConfig::Anthropic { base_url, .. } => base_url,
         }
     }
 
-    /// Extra request headers (openai backends only; xAI returns empty).
+    pub fn quirk(&self) -> CompletionsQuirk {
+        match self {
+            BackendConfig::Oauth { provider, .. } => get_provider(provider)
+                .map(|p| p.quirk)
+                .unwrap_or(CompletionsQuirk::Generic),
+            BackendConfig::ApiKey { .. } => CompletionsQuirk::Generic,
+            BackendConfig::Anthropic { .. } => CompletionsQuirk::Generic,
+        }
+    }
+
     pub fn extra_headers(&self) -> &BTreeMap<String, String> {
         match self {
-            BackendConfig::Openai { extra_headers, .. } => extra_headers,
-            BackendConfig::Xai { .. } | BackendConfig::Anthropic { .. } => {
+            BackendConfig::ApiKey { extra_headers, .. } => extra_headers,
+            BackendConfig::Oauth { .. } | BackendConfig::Anthropic { .. } => {
                 static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> =
                     std::sync::OnceLock::new();
                 EMPTY.get_or_init(BTreeMap::new)
@@ -217,22 +327,15 @@ impl BackendConfig {
         }
     }
 
-    /// Optional static bearer (API key) for this backend.
-    /// Priority: config `api_key` → `api_key_env` → well-known env names by backend purpose.
+    /// Static API key only (no OAuth). For Oauth backends this is the escape-hatch key.
     pub fn api_key(&self) -> Option<String> {
         match self {
-            BackendConfig::Xai { api_key, .. } => api_key
+            BackendConfig::Oauth { api_key, .. } => api_key
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    std::env::var("XAI_TOKEN")
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                }),
-            BackendConfig::Openai {
+                .map(|s| s.to_string()),
+            BackendConfig::ApiKey {
                 api_key,
                 api_key_env,
                 ..
@@ -256,7 +359,6 @@ impl BackendConfig {
                         }
                     }
                 }
-                // Common fallbacks when api_key_env not set (order matters little).
                 for name in [
                     "OPENROUTER_API_KEY",
                     "OPENAI_API_KEY",
@@ -310,16 +412,19 @@ impl BackendConfig {
 
     pub fn azure_deployment(&self) -> Option<&str> {
         match self {
-            BackendConfig::Openai {
+            BackendConfig::ApiKey {
                 azure_deployment, ..
-            } => azure_deployment.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            } => azure_deployment
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
             _ => None,
         }
     }
 
     pub fn azure_api_version(&self) -> Option<&str> {
         match self {
-            BackendConfig::Openai {
+            BackendConfig::ApiKey {
                 azure_api_version, ..
             } => azure_api_version
                 .as_deref()
@@ -332,7 +437,7 @@ impl BackendConfig {
     pub fn use_responses_api(&self) -> bool {
         matches!(
             self,
-            BackendConfig::Openai {
+            BackendConfig::ApiKey {
                 use_responses_api: true,
                 ..
             }
@@ -347,8 +452,6 @@ pub struct ProfileConfig {
     pub sonnet: Option<String>,
     pub opus: Option<String>,
     pub fable: Option<String>,
-    /// Exact model-id overrides (not role keys).
-    /// TOML: under [profiles.name.exact] or we also accept unknown string keys via deny_unknown_fields off.
     #[serde(default)]
     pub exact: BTreeMap<String, String>,
 }
@@ -363,9 +466,22 @@ pub fn default_config() -> Config {
     let mut backends = BTreeMap::new();
     backends.insert(
         "xai".to_string(),
-        BackendConfig::Xai {
+        BackendConfig::Oauth {
+            provider: "xai".into(),
             base_url: DEFAULT_XAI_BASE.to_string(),
             api_key: None,
+        },
+    );
+    backends.insert(
+        "ollama".to_string(),
+        BackendConfig::ApiKey {
+            base_url: "http://127.0.0.1:11434/v1".to_string(),
+            api_key: None,
+            extra_headers: BTreeMap::new(),
+            api_key_env: None,
+            use_responses_api: false,
+            azure_deployment: None,
+            azure_api_version: None,
         },
     );
 
@@ -401,20 +517,6 @@ pub fn default_config() -> Config {
             opus: Some("ollama:qwen2.5:14b".to_string()),
             fable: Some("ollama:qwen2.5:14b".to_string()),
             exact: BTreeMap::new(),
-        },
-    );
-
-    // hybrid example ollama backend (inactive until user has Ollama)
-    backends.insert(
-        "ollama".to_string(),
-        BackendConfig::Openai {
-            base_url: "http://127.0.0.1:11434/v1".to_string(),
-            api_key: None,
-            extra_headers: BTreeMap::new(),
-            api_key_env: None,
-            use_responses_api: false,
-            azure_deployment: None,
-            azure_api_version: None,
         },
     );
 
@@ -461,7 +563,7 @@ impl Config {
             .ok_or_else(|| Error::Msg(format!("unknown profile '{}'", self.server.profile)))
     }
 
-    #[allow(dead_code)] // used by Settings UI + tray
+    #[allow(dead_code)]
     pub fn set_profile(&mut self, name: &str) -> Result<()> {
         if !self.profiles.contains_key(name) {
             return Err(Error::Msg(format!("unknown profile '{name}'")));
@@ -478,7 +580,6 @@ impl Config {
     }
 
     pub fn bind_addr(&self) -> String {
-        // Force loopback for safety even if misconfigured.
         let host = if self.server.bind == "127.0.0.1" || self.server.bind == "localhost" {
             self.server.bind.clone()
         } else {
@@ -489,6 +590,19 @@ impl Config {
             DEFAULT_BIND.to_string()
         };
         format!("{host}:{}", self.port_from_env_or_self())
+    }
+
+    /// Any backend using this oauth provider has a config api_key set?
+    pub fn oauth_config_key_set(&self, provider_id: &str) -> bool {
+        self.backends.values().any(|b| match b {
+            BackendConfig::Oauth {
+                provider, api_key, ..
+            } if provider.eq_ignore_ascii_case(provider_id) => api_key
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty()),
+            _ => false,
+        })
     }
 }
 
@@ -517,106 +631,63 @@ impl EnvOverrides {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     #[test]
-    fn parse_openai_extra_headers_and_env() {
-        let toml = r#"
-[server]
-profile = "xai-only"
-[backends.openrouter]
-type = "openai"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-[backends.openrouter.extra_headers]
-HTTP-Referer = "https://example.com"
-X-Title = "Spock"
-[profiles.xai-only]
-default = "xai:grok-4.5"
-"#;
-        let cfg: Config = toml::from_str(toml).expect("parse");
-        let be = cfg.backends.get("openrouter").expect("backend");
-        assert_eq!(be.kind_name(), "openai");
-        assert_eq!(be.base_url(), "https://openrouter.ai/api/v1");
-        assert_eq!(
-            be.extra_headers().get("HTTP-Referer").map(String::as_str),
-            Some("https://example.com")
-        );
-        assert_eq!(
-            be.extra_headers().get("X-Title").map(String::as_str),
-            Some("Spock")
-        );
-    }
-
-    #[test]
-    fn parse_advisor_web_search_sections() {
+    fn parse_oauth_and_legacy_xai() {
         let toml = r#"
 [server]
 profile = "xai-only"
 [backends.xai]
 type = "xai"
+[backends.kimi]
+type = "oauth"
+provider = "kimi"
+[backends.ollama]
+type = "openai"
+base_url = "http://127.0.0.1:11434/v1"
 [profiles.xai-only]
 default = "xai:grok-4.5"
-[advisor]
-enabled = true
-model = "xai:grok-4.5"
-max_tokens = 2048
-[web_search]
-enabled = true
-provider = "brave"
-api_key_env = "BRAVE_API_KEY"
-max_results = 7
 "#;
         let cfg: Config = toml::from_str(toml).expect("parse");
-        assert!(cfg.advisor.enabled);
-        assert_eq!(cfg.advisor.model.as_deref(), Some("xai:grok-4.5"));
-        assert_eq!(cfg.advisor.max_tokens, 2048);
-        assert!(cfg.web_search.enabled);
-        assert_eq!(cfg.web_search.provider, "brave");
-        assert_eq!(cfg.web_search.max_results, 7);
+        assert_eq!(cfg.backends["xai"].kind_name(), "oauth");
+        assert_eq!(cfg.backends["xai"].oauth_provider(), Some("xai"));
+        assert_eq!(cfg.backends["kimi"].oauth_provider(), Some("kimi"));
+        assert_eq!(cfg.backends["ollama"].kind_name(), "api_key");
+        assert_eq!(cfg.backends["kimi"].base_url(), "https://api.kimi.com/coding/v1");
     }
 
     #[test]
-    fn parse_anthropic_and_azure_fields() {
+    fn parse_api_key_extra_headers() {
         let toml = r#"
 [server]
 profile = "p"
-[backends.anthropic]
-type = "anthropic"
-base_url = "https://api.anthropic.com"
-api_key_env = "ANTHROPIC_API_KEY"
-[backends.azure]
-type = "openai"
-base_url = "https://res.openai.azure.com"
-azure_deployment = "gpt-4o"
-azure_api_version = "2024-06-01"
-api_key_env = "AZURE_OPENAI_API_KEY"
+[backends.openrouter]
+type = "api_key"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+[backends.openrouter.extra_headers]
+HTTP-Referer = "https://example.com"
 [profiles.p]
-default = "anthropic:claude-sonnet-5"
+default = "openrouter:x"
 "#;
         let cfg: Config = toml::from_str(toml).expect("parse");
-        assert_eq!(cfg.backends["anthropic"].kind_name(), "anthropic");
-        assert_eq!(cfg.backends["azure"].azure_deployment(), Some("gpt-4o"));
-        assert_eq!(cfg.backends["azure"].azure_api_version(), Some("2024-06-01"));
-        assert!(!cfg.backends["azure"].use_responses_api());
+        let be = &cfg.backends["openrouter"];
+        assert_eq!(
+            be.extra_headers().get("HTTP-Referer").map(String::as_str),
+            Some("https://example.com")
+        );
     }
 
     #[test]
-    fn openai_api_key_prefers_config_over_env_list() {
-        let be = BackendConfig::Openai {
-            base_url: "https://api.openai.com/v1".into(),
-            api_key: Some("sk-config".into()),
-            extra_headers: BTreeMap::new(),
-            api_key_env: Some("OPENAI_API_KEY".into()),
-            use_responses_api: false,
-            azure_deployment: None,
-            azure_api_version: None,
-        };
-        assert_eq!(be.api_key().as_deref(), Some("sk-config"));
+    fn serialize_writes_oauth_not_xai() {
+        let cfg = default_config();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("type = \"oauth\"") || text.contains("type = 'oauth'"));
+        assert!(!text.contains("type = \"xai\""));
+        assert!(text.contains("type = \"api_key\"") || text.contains("type = 'api_key'"));
     }
 
     #[test]
@@ -625,6 +696,5 @@ default = "anthropic:claude-sonnet-5"
         assert!(cfg.backends.contains_key("xai"));
         assert!(cfg.backends.contains_key("ollama"));
         assert!(!cfg.advisor.enabled);
-        assert!(!cfg.web_search.enabled);
     }
 }

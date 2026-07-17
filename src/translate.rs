@@ -101,13 +101,12 @@ pub fn wants_thinking(a: &Value) -> bool {
     true
 }
 
-/// Backend family controls stop forwarding and reasoning_effort.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendFamily {
-    Xai,
-    Openai,
-    Anthropic,
-}
+/// Completions quirk controls stop forwarding and reasoning_effort.
+/// Re-export so call sites can use `translate::CompletionsQuirk`.
+pub use crate::oauth::registry::CompletionsQuirk;
+
+/// Legacy name used in older call sites / tests.
+pub type BackendFamily = CompletionsQuirk;
 
 fn convert_messages(a: &Value) -> Vec<Value> {
     let mut msgs: Vec<Value> = Vec::new();
@@ -575,13 +574,12 @@ pub fn anthropic_to_openai(
             obj.insert("top_p".into(), t.clone());
         }
 
-        // stop_sequences: drop for xAI reasoning; keep for OpenAI-compat
+        // stop_sequences: drop for xAI reasoning; keep for generic/Kimi
         if let Some(stops) = a.get("stop_sequences").and_then(|v| v.as_array()) {
             if !stops.is_empty() {
                 let keep = match family {
-                    BackendFamily::Openai => true,
-                    BackendFamily::Xai => !reasoning,
-                    BackendFamily::Anthropic => false,
+                    CompletionsQuirk::Generic | CompletionsQuirk::Kimi => true,
+                    CompletionsQuirk::Xai => !reasoning,
                 };
                 if keep {
                     obj.insert("stop".into(), Value::Array(stops.clone()));
@@ -591,18 +589,42 @@ pub fn anthropic_to_openai(
 
         apply_tools_and_choice(a, obj);
 
-        if family == BackendFamily::Xai {
+        // reasoning_effort: xAI + Kimi (Kimi clamps xhigh/max → high)
+        if matches!(family, CompletionsQuirk::Xai | CompletionsQuirk::Kimi) {
             if let Some(effort) = thinking_effort(a) {
+                let effort = if family == CompletionsQuirk::Kimi {
+                    clamp_kimi_effort(&effort)
+                } else {
+                    effort
+                };
                 obj.insert("reasoning_effort".into(), json!(effort));
             }
         }
     }
 
-    if family == BackendFamily::Xai {
+    if family == CompletionsQuirk::Xai {
         sanitize_upstream(&mut req, reasoning);
+    } else if family == CompletionsQuirk::Kimi {
+        // Drop effort "none" if present; keep stop for generic-like behavior.
+        if let Some(obj) = req.as_object_mut() {
+            if obj
+                .get("reasoning_effort")
+                .and_then(|v| v.as_str())
+                == Some("none")
+            {
+                obj.remove("reasoning_effort");
+            }
+        }
     }
 
     req
+}
+
+fn clamp_kimi_effort(effort: &str) -> String {
+    match effort {
+        "xhigh" | "max" => "high".into(),
+        other => other.to_string(),
+    }
 }
 
 pub fn openai_to_anthropic(o: &Value, req_model: &str, include_thinking: bool) -> Value {
@@ -738,7 +760,7 @@ mod tests {
                 "tool_choice": {"type":"tool","name":"classify_result"}
             }),
             "grok-4.5",
-            BackendFamily::Xai,
+            CompletionsQuirk::Xai,
             "grok-4.5",
         );
         assert!(
@@ -765,7 +787,7 @@ mod tests {
                 {"name": "b", "description": "y", "input_schema": {"type":"object"}}
             ]
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
         let tools = o["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "b");
@@ -783,7 +805,7 @@ mod tests {
             }],
             "tool_choice": {"type": "tool", "name": "web_search"}
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
         assert!(o.get("tools").is_none(), "tools={:?}", o.get("tools"));
         assert!(
             o.get("tool_choice").is_none(),
@@ -804,7 +826,7 @@ mod tests {
             }],
             "tool_choice": {"type": "auto"}
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
         assert_eq!(o["tool_choice"], json!("auto"));
         assert_eq!(o["tools"].as_array().unwrap().len(), 1);
     }
@@ -821,7 +843,7 @@ mod tests {
             ],
             "tool_choice": {"type":"tool","name":"advisor"}
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
         assert!(o.get("tools").is_some());
         // advisor stripped; Bash remains; forced advisor name missing → tool_choice dropped
         assert!(o.get("tool_choice").is_none(), "{:?}", o.get("tool_choice"));
@@ -834,7 +856,7 @@ mod tests {
             "thinking": {"type":"enabled","budget_tokens":8000},
             "messages": [{"role":"user","content":"hi"}]
         });
-        let o = anthropic_to_openai(&a, "claude-sonnet-5", BackendFamily::Anthropic, "grok-4.5");
+        let o = anthropic_to_openai(&a, "claude-sonnet-5", CompletionsQuirk::Generic, "grok-4.5");
         assert!(o.get("reasoning_effort").is_none());
     }
 
@@ -859,7 +881,7 @@ mod tests {
                 }]
             }]
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
         let msgs = o["messages"].as_array().unwrap();
         assert!(msgs.iter().any(|m| m.get("tool_calls").is_some()));
         assert!(msgs.iter().any(|m| m.get("role") == Some(&json!("tool"))));
@@ -878,7 +900,7 @@ mod tests {
             "messages": [{"role":"user","content":"hi"}],
             "stop_sequences": ["</block>"]
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", BackendFamily::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
         assert!(o.get("stop").is_none());
     }
 
@@ -889,7 +911,7 @@ mod tests {
             "messages": [{"role":"user","content":"hi"}],
             "stop_sequences": ["</block>"]
         });
-        let o = anthropic_to_openai(&a, "qwen2.5:14b", BackendFamily::Openai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "qwen2.5:14b", CompletionsQuirk::Generic, "grok-4.5");
         assert!(o.get("stop").is_some());
     }
 

@@ -4,12 +4,23 @@ All notable changes to Spock are documented here.
 
 ## [Unreleased]
 
-### Fixed
-- **Login xAI…** from the menu bar no longer shells through Terminal/AppleScript (could stall 1–4 minutes on shell/TCC). Runs `spock login` as a direct child process, opens the browser immediately, surfaces progress in the status toast.
-- Menu **Login xAI…** short-circuits with a clear toast when OAuth / API key / `XAI_TOKEN` is already active; menu bar shows `xAI auth: …` and Login title reflects state. CLI `spock login` prints **Already logged in (OAuth)** when tokens are still valid.
+### Added
+- **Generalized OAuth providers** — registry-driven `spock login|logout <provider>` / `spock providers` (xai, kimi); status + menus follow the table
+- Backend types: `oauth` / `api_key` / `anthropic` (Settings labels: **OAuth** / **API Key** / **Anthropic**)
+- **Kimi Code** OAuth (`provider = "kimi"`, `https://api.kimi.com/coding/v1`, KimiCLI UA + X-Msh headers)
+- Token files: `~/.config/spock/oauth-<provider>.json` (imports legacy grok-test / kimi-cli paths once; logout clears them)
 
 ### Changed
-- Product framing: multi-backend Anthropic Messages proxy (not Grok-only) — Cargo description, GitHub About/topics, macOS Get Info string, Chat empty-state copy
+- Breaking: bare `spock login` removed — use `spock login xai` (or `kimi`)
+- Proxy never opens a browser mid-request; refresh is single-flight per provider
+- Long streaming generations: idle read/write timeouts (1h) instead of total 600s request caps; stream clients skip server-tools buffer path; backend map lock dropped before upstream I/O
+- macOS app: Local Network + Bonjour keys so LAN backends work from Spock.app
+- Product framing: multi-backend Anthropic Messages proxy (not Grok-only)
+
+### Fixed
+- **Login…** from the menu bar runs as a direct child process (no Terminal/AppleScript stall)
+- Menu + CLI surface already-logged-in OAuth state clearly
+- Slow LAN (llama-server) streams no longer die at ~10 minutes while the backend still generates
 
 ## [0.2.0] - 2026-07-13
 

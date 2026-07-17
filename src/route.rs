@@ -125,14 +125,14 @@ mod tests {
         let mut backends = BTreeMap::new();
         backends.insert(
             "xai".into(),
-            BackendConfig::Xai {
+            BackendConfig::Oauth { provider: "xai".into(),
                 base_url: "https://api.x.ai/v1".into(),
                 api_key: None,
             },
         );
         backends.insert(
             "ollama".into(),
-            BackendConfig::Openai {
+            BackendConfig::ApiKey {
                 base_url: "http://127.0.0.1:11434/v1".into(),
                 api_key: None,
                 extra_headers: BTreeMap::new(),

@@ -80,16 +80,19 @@ pub struct ServerDoc {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackendDoc {
     pub name: String,
-    /// "xai" | "openai"
+    /// "oauth" | "api_key" | "anthropic"
     #[serde(rename = "type")]
     pub kind: String,
+    /// OAuth provider id when kind = oauth (xai, kimi, …)
+    #[serde(default)]
+    pub provider: String,
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
-    /// Optional env var name for API key when field empty (openai).
+    /// Optional env var name for API key when field empty (api_key).
     #[serde(default)]
     pub api_key_env: String,
-    /// Optional extra headers as "Key: Value" lines (openai / OpenRouter).
+    /// Optional extra headers as "Key: Value" lines (OpenRouter etc.).
     #[serde(default)]
     pub extra_headers_text: String,
 }
@@ -114,15 +117,20 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
         .backends
         .iter()
         .map(|(name, b)| match b {
-            BackendConfig::Xai { base_url, api_key } => BackendDoc {
+            BackendConfig::Oauth {
+                provider,
+                base_url,
+                api_key,
+            } => BackendDoc {
                 name: name.clone(),
-                kind: "xai".into(),
+                kind: "oauth".into(),
+                provider: provider.clone(),
                 base_url: base_url.clone(),
                 api_key: api_key.clone().unwrap_or_default(),
                 api_key_env: String::new(),
                 extra_headers_text: String::new(),
             },
-            BackendConfig::Openai {
+            BackendConfig::ApiKey {
                 base_url,
                 api_key,
                 extra_headers,
@@ -130,7 +138,8 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
                 ..
             } => BackendDoc {
                 name: name.clone(),
-                kind: "openai".into(),
+                kind: "api_key".into(),
+                provider: String::new(),
                 base_url: base_url.clone(),
                 api_key: api_key.clone().unwrap_or_default(),
                 api_key_env: api_key_env.clone().unwrap_or_default(),
@@ -143,6 +152,7 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
             } => BackendDoc {
                 name: name.clone(),
                 kind: "anthropic".into(),
+                provider: String::new(),
                 base_url: base_url.clone(),
                 api_key: api_key.clone().unwrap_or_default(),
                 api_key_env: api_key_env.clone().unwrap_or_default(),
@@ -209,67 +219,66 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
         if name.is_empty() {
             continue;
         }
-        let be = match b.kind.as_str() {
-            "xai" => BackendConfig::Xai {
-                base_url: if b.base_url.trim().is_empty() {
-                    crate::config::DEFAULT_XAI_BASE.to_string()
+        let kind = b.kind.trim().to_ascii_lowercase();
+        let opt_key = |s: &str| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+        let be = match kind.as_str() {
+            "oauth" | "xai" => {
+                let provider = if kind == "xai" {
+                    "xai".to_string()
+                } else {
+                    let p = b.provider.trim();
+                    if p.is_empty() {
+                        return Err(crate::error::Error::Msg(format!(
+                            "backend '{name}' (oauth) needs provider"
+                        )));
+                    }
+                    p.to_string()
+                };
+                let def = crate::oauth::get_provider(&provider)
+                    .map(|p| p.default_base_url.to_string())
+                    .unwrap_or_default();
+                let base_url = if b.base_url.trim().is_empty() {
+                    def
                 } else {
                     b.base_url.trim().to_string()
-                },
-                api_key: {
-                    let k = b.api_key.trim();
-                    if k.is_empty() {
-                        None
-                    } else {
-                        Some(k.to_string())
-                    }
-                },
-            },
-            "openai" => BackendConfig::Openai {
-                base_url: b.base_url.trim().to_string(),
-                api_key: {
-                    let k = b.api_key.trim();
-                    if k.is_empty() {
-                        None
-                    } else {
-                        Some(k.to_string())
-                    }
-                },
-                extra_headers: text_to_headers(&b.extra_headers_text),
-                api_key_env: {
-                    let e = b.api_key_env.trim();
-                    if e.is_empty() {
-                        None
-                    } else {
-                        Some(e.to_string())
-                    }
-                },
-                use_responses_api: false,
-                azure_deployment: None,
-                azure_api_version: None,
-            },
+                };
+                BackendConfig::Oauth {
+                    provider,
+                    base_url,
+                    api_key: opt_key(&b.api_key),
+                }
+            }
+            "api_key" | "openai" => {
+                if b.base_url.trim().is_empty() {
+                    return Err(crate::error::Error::Msg(format!(
+                        "backend '{name}' (api_key) needs base_url"
+                    )));
+                }
+                BackendConfig::ApiKey {
+                    base_url: b.base_url.trim().to_string(),
+                    api_key: opt_key(&b.api_key),
+                    extra_headers: text_to_headers(&b.extra_headers_text),
+                    api_key_env: opt_key(&b.api_key_env),
+                    use_responses_api: false,
+                    azure_deployment: None,
+                    azure_api_version: None,
+                }
+            }
             "anthropic" => BackendConfig::Anthropic {
                 base_url: if b.base_url.trim().is_empty() {
                     "https://api.anthropic.com".into()
                 } else {
                     b.base_url.trim().to_string()
                 },
-                api_key: {
-                    let k = b.api_key.trim();
-                    if k.is_empty() {
-                        None
-                    } else {
-                        Some(k.to_string())
-                    }
-                },
-                api_key_env: {
-                    let e = b.api_key_env.trim();
-                    if e.is_empty() {
-                        None
-                    } else {
-                        Some(e.to_string())
-                    }
-                },
+                api_key: opt_key(&b.api_key),
+                api_key_env: opt_key(&b.api_key_env),
             },
             other => {
                 return Err(crate::error::Error::Msg(format!(
@@ -277,11 +286,6 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
                 )));
             }
         };
-        if matches!(&be, BackendConfig::Openai { base_url, .. } if base_url.is_empty()) {
-            return Err(crate::error::Error::Msg(format!(
-                "backend '{name}' (openai) needs base_url"
-            )));
-        }
         backends.insert(name.to_string(), be);
     }
     if backends.is_empty() {
@@ -553,7 +557,7 @@ pub fn settings_html(initial: &SettingsDoc) -> String {
     </table>
     <div class="row" style="margin-top:10px">
       <button id="btnAddBackend">+ Backend</button>
-      <span class="chip">xai = Grok (OAuth or API key in API key field) · openai = Ollama / llama.cpp / LAN</span>
+      <span class="chip">OAuth = subscription login (provider xai/kimi) · API Key = OpenAI-compatible · Anthropic = passthrough</span>
     </div>
   </section>
 
@@ -611,8 +615,9 @@ function backendRow(b) {{
     <td><input class="b-name" value="${{esc(b.name || '')}}"/></td>
     <td>
       <select class="b-type">
-        <option value="xai" ${{b.type === 'xai' ? 'selected' : ''}}>xai</option>
-        <option value="openai" ${{b.type === 'openai' ? 'selected' : ''}}>openai</option>
+        <option value="oauth" ${{b.type === 'oauth' || b.type === 'xai' ? 'selected' : ''}}>OAuth</option>
+        <option value="api_key" ${{b.type === 'api_key' || b.type === 'openai' ? 'selected' : ''}}>API Key</option>
+        <option value="anthropic" ${{b.type === 'anthropic' ? 'selected' : ''}}>Anthropic</option>
       </select>
     </td>
     <td><input class="b-url" value="${{esc(b.base_url || '')}}" placeholder="http://127.0.0.1:11434/v1"/></td>
@@ -699,7 +704,7 @@ function collectDoc() {{
 
 document.getElementById('btnAddBackend').onclick = () => {{
   document.getElementById('backendsBody').appendChild(backendRow({{
-    name: 'ollama', type: 'openai', base_url: 'http://127.0.0.1:11434/v1', api_key: ''
+    name: 'ollama', type: 'api_key', provider: '', base_url: 'http://127.0.0.1:11434/v1', api_key: '', api_key_env: '', extra_headers_text: ''
   }}));
 }};
 document.getElementById('btnAddProfile').onclick = () => {{

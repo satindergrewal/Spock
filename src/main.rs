@@ -1,4 +1,4 @@
-mod auth;
+mod oauth;
 mod backends;
 mod cli;
 mod config;
@@ -12,11 +12,11 @@ mod state;
 mod translate;
 mod tray;
 
-use auth::{get_access_token, load_tokens, logout};
 use cli::{parse, print_help, Command};
 use config::{
-    auth_path, config_path, Config, EnvOverrides, CHAT_DEFAULT_MODEL, DEFAULT_XAI_BASE, UA, VERSION,
+    config_path, Config, CHAT_DEFAULT_MODEL, DEFAULT_XAI_BASE, UA, VERSION,
 };
+use oauth::{AccessMode, OauthStore};
 use error::Result;
 use serde_json::json;
 use state::AppState;
@@ -49,13 +49,15 @@ fn run() -> Result<()> {
             println!("spock {VERSION}");
             Ok(())
         }
-        Command::Login { no_open } => {
-            // Mirror GUI: say when OAuth tokens are already live (don't imply a fresh device flow).
-            if std::env::var("XAI_TOKEN").map(|t| !t.is_empty()).unwrap_or(false) {
-                println!("xAI auth: XAI_TOKEN env is set (OAuth login not used).");
-                return Ok(());
-            }
-            if let Some(tokens) = load_tokens() {
+        Command::Login { provider, no_open } => {
+            let p = oauth::get_provider(&provider).ok_or_else(|| {
+                error::Error::Auth(format!(
+                    "unknown provider '{provider}' (known: {})",
+                    oauth::provider_ids_csv()
+                ))
+            })?;
+            // Already logged in?
+            if let Some(tokens) = oauth::load_tokens(p.id) {
                 let exp = tokens.expires_at.unwrap_or(0.0);
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -63,27 +65,65 @@ fn run() -> Result<()> {
                     .unwrap_or(0.0);
                 if now < exp - 60.0 && !tokens.access_token.is_empty() {
                     println!(
-                        "Already logged in (OAuth). Token cached at {} ({}…)",
-                        auth_path().display(),
+                        "Already logged in to {} (OAuth). Token cached ({}…)",
+                        p.label,
                         tokens.access_token.chars().take(12).collect::<String>()
                     );
-                    println!("  Logout first (`spock logout`) if you need a fresh device login.");
+                    println!("  Logout first (`spock logout {}`) for a fresh device login.", p.id);
                     return Ok(());
                 }
             }
-            let token = get_access_token(!no_open)?;
+            if oauth::store::OauthStore::env_token(p).is_some() {
+                println!(
+                    "{}: env token is set ({}) — OAuth login not used.",
+                    p.label,
+                    p.env_token_keys.join("/")
+                );
+                return Ok(());
+            }
+            let tokens = oauth::login(p.id, !no_open)?;
             println!(
-                "Logged in. Token cached at {} ({}…)",
-                auth_path().display(),
-                token.chars().take(12).collect::<String>()
+                "Logged in to {}. Token cached ({}…)",
+                p.label,
+                tokens.access_token.chars().take(12).collect::<String>()
             );
             Ok(())
         }
-        Command::Logout => {
-            if logout()? {
-                println!("Logged out (cached tokens removed).");
+        Command::Logout { provider, all } => {
+            if all {
+                let cleared = oauth::logout_all()?;
+                if cleared.is_empty() {
+                    println!("Nothing to remove.");
+                } else {
+                    println!("Logged out: {}", cleared.join(", "));
+                }
+                return Ok(());
+            }
+            let provider = provider.expect("provider");
+            if oauth::logout(&provider)? {
+                println!("Logged out of {provider} (cached tokens removed).");
             } else {
-                println!("Nothing to remove.");
+                println!("Nothing to remove for {provider}.");
+            }
+            Ok(())
+        }
+        Command::Providers { json } => {
+            if json {
+                let arr: Vec<_> = oauth::list_providers()
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "id": p.id,
+                            "label": p.label,
+                            "default_base_url": p.default_base_url,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                for p in oauth::list_providers() {
+                    println!("{:<8}  {}  ({})", p.id, p.label, p.default_base_url);
+                }
             }
             Ok(())
         }
@@ -207,7 +247,8 @@ extern "C" {
 
 fn cmd_chat(model: Option<String>, prompt: String) -> Result<()> {
     let model = model.unwrap_or_else(|| CHAT_DEFAULT_MODEL.to_string());
-    let token = get_access_token(true)?;
+    let store = OauthStore::default();
+    let token = oauth::access_token(&store, "xai", None, AccessMode::Login { open_browser: true })?;
     let base = std::env::var("XAI_API_BASE").unwrap_or_else(|_| DEFAULT_XAI_BASE.to_string());
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
     println!("  Model: {model}\n  Prompt: {prompt}\n");
@@ -263,7 +304,6 @@ fn cmd_status() -> Result<()> {
     let cfg = Config::load_or_init()?;
     println!("Spock {VERSION}");
     println!("  config:  {}", config_path().display());
-    println!("  tokens:  {}", auth_path().display());
     println!("  profile: {}", cfg.server.profile);
     println!("  listen:  {}", cfg.bind_addr());
     println!("  backends:");
@@ -289,28 +329,21 @@ fn cmd_status() -> Result<()> {
             "disabled"
         }
     );
-    // Same priority as proxy: config api_key → XAI_TOKEN → OAuth file.
-    let has_cfg_key = cfg.backends.values().any(|b| {
-        matches!(
-            b,
-            config::BackendConfig::Xai {
-                api_key: Some(k),
-                ..
-            } if !k.trim().is_empty()
-        )
-    });
-    if has_cfg_key {
-        println!("  xAI auth: config_api_key (beats OAuth)");
-    } else if EnvOverrides::from_env().xai_token.is_some() {
-        println!("  xAI auth: XAI_TOKEN env");
-    } else {
-        match load_tokens() {
-            Some(t) => {
-                let exp = t.expires_at.unwrap_or(0.0);
-                println!("  xAI auth: oauth (expires_at={exp:.0})");
-            }
-            None => println!("  xAI auth: none (set api_key on xai backend, or: spock login)"),
-        }
+    println!("  oauth:");
+    for p in oauth::list_providers() {
+        let key_set = cfg.oauth_config_key_set(p.id);
+        let (present, source) = oauth::status_for_provider(p.id, key_set);
+        let extra = match &source {
+            oauth::AuthSource::Oauth { expires_at: Some(e) } => format!(" expires_at={e:.0}"),
+            _ => String::new(),
+        };
+        println!(
+            "    {}: {} ({}){}",
+            p.id,
+            if present { "yes" } else { "no" },
+            source.as_str(),
+            extra
+        );
     }
     // live health if proxy up
     let port = cfg.port_from_env_or_self();

@@ -8,9 +8,16 @@ pub enum Command {
     },
     App,
     Login {
+        provider: String,
         no_open: bool,
     },
-    Logout,
+    Logout {
+        provider: Option<String>,
+        all: bool,
+    },
+    Providers {
+        json: bool,
+    },
     Chat {
         model: Option<String>,
         prompt: String,
@@ -25,7 +32,6 @@ pub fn parse(args: &[String]) -> Command {
     if args.is_empty() {
         return Command::Help;
     }
-    // GUI launch on macOS often passes -psn_...
     if args.iter().any(|a| a.starts_with("-psn_")) {
         return Command::App;
     }
@@ -56,9 +62,45 @@ pub fn parse(args: &[String]) -> Command {
         "app" => Command::App,
         "login" => {
             let no_open = args.iter().any(|a| a == "--no-open");
-            Command::Login { no_open }
+            let provider = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with('-'))
+                .cloned();
+            match provider {
+                Some(p) => Command::Login {
+                    provider: p,
+                    no_open,
+                },
+                None => {
+                    eprintln!(
+                        "usage: spock login <provider> [--no-open]\n  providers: {}",
+                        crate::oauth::provider_ids_csv()
+                    );
+                    Command::Help
+                }
+            }
         }
-        "logout" => Command::Logout,
+        "logout" => {
+            let all = args.iter().any(|a| a == "--all");
+            let provider = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with('-'))
+                .cloned();
+            if !all && provider.is_none() {
+                eprintln!(
+                    "usage: spock logout <provider> | spock logout --all\n  providers: {}",
+                    crate::oauth::provider_ids_csv()
+                );
+                return Command::Help;
+            }
+            Command::Logout { provider, all }
+        }
+        "providers" => {
+            let json = args.iter().any(|a| a == "--json");
+            Command::Providers { json }
+        }
         "chat" => {
             let mut model = None;
             let mut prompt_parts = Vec::new();
@@ -99,21 +141,19 @@ Spock {ver} — multi-backend Anthropic-compatible proxy
 
 Usage:
   spock serve [--port N] [--log-file PATH]
-  spock app                  Open Spock.app (macOS menu bar + chat)
-  spock login [--no-open]    xAI OAuth device login
-  spock logout               Forget cached xAI tokens
-  spock chat [prompt] [-m model]
-  spock status               Active profile + backends
-  spock reload               Re-read ~/.config/spock/config.toml
-  spock -V                   Version
-
-  --log-file PATH            Append proxy logs to PATH (Unix)
-                             App default: ~/Library/Logs/Spock/spock.log
+  spock app
+  spock login <provider> [--no-open]   OAuth device login ({providers})
+  spock logout <provider> | --all
+  spock providers [--json]             List OAuth providers (offline)
+  spock chat [prompt] [-m model]       xAI helper (uses xai oauth)
+  spock status
+  spock reload
+  spock -V
 
 Config:  ~/.config/spock/config.toml
-Tokens:  ~/.config/grok-test/auth.json
-macOS:   ./packaging/macos/build-app.sh → dist/Spock.app
+OAuth:   ~/.config/spock/oauth-<provider>.json
 ",
-        ver = crate::config::VERSION
+        ver = crate::config::VERSION,
+        providers = crate::oauth::provider_ids_csv()
     );
 }

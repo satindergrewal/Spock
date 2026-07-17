@@ -42,8 +42,12 @@ final class AppModel: ObservableObject {
     @Published var bind: String = "127.0.0.1"
     @Published var configPath: String = ""
     @Published var authPresent = false
-    /// Live proxy report: config_api_key | env_XAI_TOKEN | oauth | none
+    /// Live proxy report: config_api_key | env | oauth | none (legacy single-source; prefer oauthStatus)
     @Published var authSource: String = "none"
+    /// Per-provider OAuth status from GET /spock/v1/status → oauth map
+    @Published var oauthStatus: [String: OauthProviderStatus] = [:]
+    /// Provider list from status.providers (fallback hardcoded in menu if empty)
+    @Published var oauthProviders: [OauthProviderInfo] = []
     @Published var statusMessage: String = ""
     @Published var statusIsError = false
     /// Discovered models per backend name: ["ollama": ["qwen2.5:14b", …]]
@@ -159,12 +163,38 @@ final class AppModel: ObservableObject {
                 if let bind = status["bind"] as? String { self.bind = bind }
                 if let ps = status["profiles"] as? [String] { profiles = ps.sorted() }
                 if let path = status["config_path"] as? String { configPath = path }
-                if let auth = status["xai_auth"] as? [String: Any] {
-                    authPresent = (auth["present"] as? Bool) ?? false
-                    authSource = (auth["source"] as? String) ?? (authPresent ? "unknown" : "none")
+                if let oauth = status["oauth"] as? [String: Any] {
+                    var map: [String: OauthProviderStatus] = [:]
+                    for (id, raw) in oauth {
+                        guard let entry = raw as? [String: Any] else { continue }
+                        map[id] = OauthProviderStatus(
+                            present: (entry["present"] as? Bool) ?? false,
+                            source: (entry["source"] as? String) ?? "none",
+                            expiresAt: entry["expires_at"] as? Double
+                        )
+                    }
+                    oauthStatus = map
+                    // Legacy single-source fields for any remaining UI: prefer xai then first present.
+                    if let x = map["xai"] {
+                        authPresent = x.present
+                        authSource = x.source
+                    } else if let first = map.values.first(where: { $0.present }) {
+                        authPresent = true
+                        authSource = first.source
+                    } else {
+                        authPresent = false
+                        authSource = "none"
+                    }
                 } else {
+                    oauthStatus = [:]
                     authPresent = false
                     authSource = "none"
+                }
+                if let arr = status["providers"] as? [[String: Any]] {
+                    oauthProviders = arr.compactMap { row in
+                        guard let id = row["id"] as? String else { return nil }
+                        return OauthProviderInfo(id: id, label: (row["label"] as? String) ?? id)
+                    }
                 }
                 // Surface last upstream error as a Settings toast once per new event.
                 if let err = status["last_upstream_error"] as? [String: Any],
@@ -220,7 +250,8 @@ final class AppModel: ObservableObject {
                 BackendRow(
                     id: UUID(),
                     name: b["name"] as? String ?? "",
-                    type: b["type"] as? String ?? "openai",
+                    type: b["type"] as? String ?? "api_key",
+                    provider: b["provider"] as? String ?? "",
                     baseURL: b["base_url"] as? String ?? "",
                     apiKey: b["api_key"] as? String ?? ""
                 )
@@ -305,6 +336,7 @@ final class AppModel: ObservableObject {
                 [
                     "name": b.name,
                     "type": b.type,
+                    "provider": b.provider,
                     "base_url": b.baseURL,
                     "api_key": b.apiKey,
                     "api_key_env": "",
@@ -406,115 +438,78 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func loginXAI() {
-        // OAuth device flow only — does NOT install a console API key.
-        // If config already has api_key, warn so users don't think Login "fixes" keys.
-        let hasConfigKey = backends.contains {
-            $0.type == "xai" && !$0.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
-        if hasConfigKey || authSource == "config_api_key" {
-            setStatus(
-                "xAI API key is already configured (source: \(authSourceLabel)). Login is OAuth-only and is not needed for API keys.",
-                error: false
-            )
-            // Still allow OAuth if they insist? Prefer not to surprise — skip device flow.
+    func loginProvider(_ provider: String) {
+        let id = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return }
+        if let st = oauthStatus[id], st.source == "config_api_key" {
+            setStatus("\(id): API key already configured — OAuth login not needed.", error: false)
             return
         }
-        if authSource == "env_XAI_TOKEN" || authSource == "env" {
-            setStatus(
-                "xAI is using \(authSourceLabel). Login is OAuth-only — unset XAI_TOKEN if you want subscription OAuth instead.",
-                error: false
-            )
+        if let st = oauthStatus[id], st.source == "env" {
+            setStatus("\(id): env token active — unset env if you want OAuth instead.", error: false)
             return
         }
-        // Already have live OAuth tokens (same short-circuit as `spock login` CLI).
-        // Force re-auth: Logout xAI, then Login again.
-        if authPresent && authSource == "oauth" {
-            setStatus(
-                "Already logged in via xAI OAuth (subscription). Use Logout xAI first if you need a fresh token.",
-                error: false
-            )
+        if let st = oauthStatus[id], st.present && st.source == "oauth" {
+            setStatus("Already logged in to \(id). Use Logout first for a fresh token.", error: false)
             return
         }
         if loginInFlight {
-            setStatus("xAI OAuth already in progress — check the browser", error: false)
+            setStatus("OAuth already in progress — check the browser", error: false)
             return
         }
         guard let bin = findSpockBinary() else {
             setStatus("spock binary not found", error: true)
             return
         }
-
-        // Run `spock login` as a child Process (opens the browser itself).
-        // Old path: AppleScript → Terminal → interactive shell. That waited on
-        // Automation TCC + Terminal cold start + zsh init — often 1–4 minutes
-        // before the device-code request even started.
         loginInFlight = true
-        setStatus("Starting xAI OAuth… browser should open in a few seconds", error: false)
-
+        setStatus("Starting \(id) OAuth… browser should open shortly", error: false)
         let proc = Process()
         proc.executableURL = bin
-        proc.arguments = ["login"]
+        proc.arguments = ["login", id]
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
-        // Inherit PATH so nested `open` (browser) resolves; keep app env otherwise.
         var env = ProcessInfo.processInfo.environment
         if env["PATH"] == nil || env["PATH"]?.isEmpty == true {
             env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         }
         proc.environment = env
         loginProcess = proc
-
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             do {
                 try proc.run()
-                // Stream stderr/stdout so we can surface the verification URL if
-                // `open` fails, and so the UI isn't blind while polling for approval.
                 let handle = pipe.fileHandleForReading
                 var collected = Data()
-                var openedFallback = false
                 while proc.isRunning {
                     let chunk = handle.availableData
-                    if !chunk.isEmpty {
-                        collected.append(chunk)
-                        if !openedFallback,
-                           let text = String(data: collected, encoding: .utf8),
-                           let url = Self.firstHTTPURL(in: text)
-                        {
-                            openedFallback = true
-                            DispatchQueue.main.async {
-                                NSWorkspace.shared.open(url)
-                                self.setStatus(
-                                    "Browser opened for xAI — approve the device code, then return here",
-                                    error: false
-                                )
+                    if chunk.isEmpty {
+                        Thread.sleep(forTimeInterval: 0.05)
+                        continue
+                    }
+                    collected.append(chunk)
+                    if let s = String(data: collected, encoding: .utf8) {
+                        // Surface verification URL lines if present
+                        for line in s.split(separator: "\n") {
+                            let l = line.trimmingCharacters(in: .whitespaces)
+                            if l.hasPrefix("http") {
+                                DispatchQueue.main.async {
+                                    self.setStatus(String(l.prefix(120)), error: false)
+                                }
                             }
                         }
-                    } else {
-                        Thread.sleep(forTimeInterval: 0.05)
                     }
                 }
-                // Drain remainder after exit.
-                let rest = handle.readDataToEndOfFile()
-                if !rest.isEmpty { collected.append(rest) }
-                let text = String(data: collected, encoding: .utf8) ?? ""
-                let ok = proc.terminationStatus == 0
+                proc.waitUntilExit()
+                let out = String(data: collected, encoding: .utf8) ?? ""
                 DispatchQueue.main.async {
                     self.loginInFlight = false
                     self.loginProcess = nil
-                    if ok {
-                        self.refreshQuiet()
-                        self.setStatus("xAI OAuth complete — tokens cached", error: false)
+                    if proc.terminationStatus == 0 {
+                        self.setStatus("\(id) OAuth complete — tokens cached", error: false)
+                        self.refresh()
                     } else {
-                        let tail = text
-                            .split(separator: "\n", omittingEmptySubsequences: false)
-                            .suffix(4)
-                            .joined(separator: " ")
-                            .trimmingCharacters(in: .whitespacesAndNewlines)
-                        let detail = tail.isEmpty ? "exit \(proc.terminationStatus)" : String(tail.prefix(240))
-                        self.setStatus("xAI OAuth failed: \(detail)", error: true)
+                        self.setStatus("\(id) OAuth failed: \(out.suffix(200))", error: true)
                     }
                 }
             } catch {
@@ -526,6 +521,15 @@ final class AppModel: ObservableObject {
             }
         }
     }
+
+    func logoutProvider(_ provider: String) {
+        let id = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return }
+        _ = postJSON(path: "/spock/v1/logout", body: ["provider": id])
+        setStatus("Logged out of \(id)", error: false)
+        refresh()
+    }
+
 
     /// First http(s) URL in OAuth CLI output (verification_uri_complete).
     private static func firstHTTPURL(in text: String) -> URL? {
@@ -543,18 +547,7 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    func logoutXAI() {
-        _ = postJSON(path: "/spock/v1/logout", body: [:])
-        refreshQuiet()
-        let note: String
-        if authSource == "config_api_key" {
-            note = "OAuth cleared · API key in config still active"
-        } else {
-            note = "Logged out of xAI OAuth"
-        }
-        setStatus(note, error: false)
-    }
-
+    
     func addBackend() {
         // Unique default name so a second "Add backend" doesn't collide with existing "ollama".
         var n = 2
@@ -568,7 +561,8 @@ final class AppModel: ObservableObject {
             BackendRow(
                 id: UUID(),
                 name: name,
-                type: "openai",
+                type: "api_key",
+                provider: "",
                 baseURL: "http://127.0.0.1:8080/v1",
                 apiKey: ""
             )
@@ -623,12 +617,14 @@ final class AppModel: ObservableObject {
                 return
             }
             let path = "/spock/v1/backends/\(encoded)/models"
-            let resp = self.getJSON(path: path)
+            // Model list can queue behind a long LAN generation — use a long timeout
+            // (not the default short admin GET). Does not restart/affect other sessions.
+            let resp = self.getJSON(path: path, timeout: 120)
             DispatchQueue.main.async {
                 self.discoveringBackend = nil
                 guard let resp else {
                     self.setStatus(
-                        "Fetch failed for \(name). Is proxy up? Save & Apply if this backend is new.",
+                        "Fetch failed for \(name) (timeout or proxy busy). Proxy may still be up — retry; LAN servers often queue /models behind long chats.",
                         error: true
                     )
                     return
@@ -684,7 +680,7 @@ final class AppModel: ObservableObject {
         return ok
     }
 
-    private func getJSON(path: String) -> [String: Any]? {
+    private func getJSON(path: String, timeout: TimeInterval = 15) -> [String: Any]? {
         // path may include query; build carefully
         let url: URL?
         if path.hasPrefix("http") {
@@ -694,8 +690,8 @@ final class AppModel: ObservableObject {
         }
         guard let url else { return nil }
         var req = URLRequest(url: url)
-        req.timeoutInterval = 15
-        return syncJSON(req)
+        req.timeoutInterval = timeout
+        return syncJSON(req, wait: timeout + 2)
     }
 
     private func putJSON(path: String, body: [String: Any]) -> [String: Any]? {
@@ -718,7 +714,7 @@ final class AppModel: ObservableObject {
         return syncJSON(req)
     }
 
-    private func syncJSON(_ req: URLRequest) -> [String: Any]? {
+    private func syncJSON(_ req: URLRequest, wait: TimeInterval = 6) -> [String: Any]? {
         let sem = DispatchSemaphore(value: 0)
         var result: [String: Any]?
         URLSession.shared.dataTask(with: req) { data, _, _ in
@@ -728,7 +724,7 @@ final class AppModel: ObservableObject {
             else { return }
             result = obj
         }.resume()
-        _ = sem.wait(timeout: .now() + 6)
+        _ = sem.wait(timeout: .now() + wait)
         return result
     }
 
@@ -767,10 +763,24 @@ final class AppModel: ObservableObject {
     }
 }
 
+struct OauthProviderInfo: Identifiable, Equatable {
+    var id: String
+    var label: String
+}
+
+struct OauthProviderStatus: Equatable {
+    var present: Bool
+    var source: String
+    var expiresAt: Double?
+}
+
 struct BackendRow: Identifiable, Equatable {
     let id: UUID
     var name: String
+    /// oauth | api_key | anthropic
     var type: String
+    /// OAuth provider id when type == oauth
+    var provider: String
     var baseURL: String
     var apiKey: String
 }

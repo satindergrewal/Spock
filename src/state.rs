@@ -1,7 +1,7 @@
-use crate::auth::TokenCache;
 use crate::backends::{build_backends, BackendHandle};
 use crate::config::{config_path, Config};
 use crate::error::{Error, Result};
+use crate::oauth::OauthStore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +18,8 @@ pub struct LastUpstreamError {
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub backends: Arc<RwLock<HashMap<String, BackendHandle>>>,
-    pub tokens: Arc<Mutex<TokenCache>>,
+    /// Internal mutexes only — do not wrap in another Mutex (refresh must not block all backends).
+    pub oauth: Arc<OauthStore>,
     pub last_upstream_error: Arc<Mutex<Option<LastUpstreamError>>>,
 }
 
@@ -28,7 +29,7 @@ impl AppState {
         Self {
             config: Arc::new(RwLock::new(config)),
             backends: Arc::new(RwLock::new(backends)),
-            tokens: Arc::new(Mutex::new(TokenCache::default())),
+            oauth: Arc::new(OauthStore::default()),
             last_upstream_error: Arc::new(Mutex::new(None)),
         }
     }
@@ -57,7 +58,7 @@ impl AppState {
         self.apply_config(cfg)
     }
 
-    /// Replace live config + rebuild backend handles.
+    /// Replace live config + rebuild backend handles (oauth store preserved).
     pub fn apply_config(&self, cfg: Config) -> Result<()> {
         let backends = build_backends(&cfg);
         *self

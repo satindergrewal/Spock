@@ -252,11 +252,13 @@ pub fn run_advisor_review(
         advisor_model_hint.to_string()
     };
     let resolved = state.with_config(|c| route::resolve(c, &client_model))??;
-    let backends = state
-        .backends
-        .read()
-        .map_err(|_| Error::Msg("backends lock".into()))?;
-    let be = get_backend(&backends, &resolved.backend)?;
+    let be = {
+        let backends = state
+            .backends
+            .read()
+            .map_err(|_| Error::Msg("backends lock".into()))?;
+        get_backend(&backends, &resolved.backend)?.clone()
+    };
 
     let mut messages = Vec::new();
     messages.push(json!({
@@ -302,7 +304,7 @@ pub fn run_advisor_review(
         be.family_name()
     );
 
-    match be.chat(&body, false, &state.tokens)? {
+    match be.chat(&body, false, &state.oauth)? {
         UpstreamBody::Json(o) => {
             let choice = o
                 .pointer("/choices/0/message/content")
@@ -562,7 +564,7 @@ pub fn run_with_server_tools(
             obj.insert("stream".into(), json!(false));
         }
 
-        let resp = match be.chat(&body, false, &state.tokens)? {
+        let resp = match be.chat(&body, false, &state.oauth)? {
             UpstreamBody::Json(j) => j,
             UpstreamBody::Stream(_) => {
                 return Err(Error::Msg("server_tools: unexpected stream".into()))

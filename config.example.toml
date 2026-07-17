@@ -4,8 +4,12 @@
 # Direct deps are pinned via Cargo.lock. Build with: cargo build --locked --release
 #
 # Backend types:
-#   xai    — Grok (OAuth device login and/or console API key)
-#   openai — any OpenAI Chat Completions compatible API
+#   oauth    — subscription OAuth (provider = xai | kimi | …); optional api_key escape hatch
+#   api_key  — OpenAI Chat Completions compatible API + bearer key
+#   anthropic — Messages passthrough
+#
+# Login:  spock login <provider>     (xai, kimi)
+# Logout: spock logout <provider>
 
 [server]
 bind = "127.0.0.1"
@@ -15,28 +19,35 @@ profile = "xai-only"
 # --- Backends ---
 
 [backends.xai]
-type = "xai"
+type = "oauth"
+provider = "xai"
 # base_url = "https://api.x.ai/v1"
-# Priority: api_key → env XAI_TOKEN → OAuth (spock login)
+# Priority: api_key → env XAI_TOKEN → OAuth (spock login xai)
 # api_key = "xai-..."
 
+[backends.kimi]
+type = "oauth"
+provider = "kimi"
+# base_url = "https://api.kimi.com/coding/v1"
+# Priority: api_key → env KIMI_TOKEN → OAuth (spock login kimi)
+
 [backends.ollama]
-type = "openai"
+type = "api_key"
 base_url = "http://127.0.0.1:11434/v1"
 # api_key = ""
 
 # Example LAN llama-server / vLLM (use your host; do not commit real IPs)
 # [backends.lan]
-# type = "openai"
+# type = "api_key"
 # base_url = "http://10.0.0.5:8080/v1"
 
 # --- OpenAI-compatible presets (uncomment + set key) ---
-# All stay type = "openai". Optional:
+# All stay type = "api_key". Optional:
 #   api_key_env     — read bearer from this env if api_key empty
 #   extra_headers   — map of HTTP headers (OpenRouter likes Referer / X-Title)
 
 # [backends.openrouter]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://openrouter.ai/api/v1"
 # api_key_env = "OPENROUTER_API_KEY"
 # # api_key = "sk-or-..."
@@ -45,52 +56,53 @@ base_url = "http://127.0.0.1:11434/v1"
 # X-Title = "Spock"
 
 # [backends.openai]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://api.openai.com/v1"
 # api_key_env = "OPENAI_API_KEY"
 
 # [backends.deepseek]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://api.deepseek.com"
 # api_key_env = "DEEPSEEK_API_KEY"
 
 # [backends.groq]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://api.groq.com/openai/v1"
 # api_key_env = "GROQ_API_KEY"
 
 # [backends.together]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://api.together.xyz/v1"
 # api_key_env = "TOGETHER_API_KEY"
 
 # [backends.fireworks]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://api.fireworks.ai/inference/v1"
 # api_key_env = "FIREWORKS_API_KEY"
 
 # [backends.mistral]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://api.mistral.ai/v1"
 # api_key_env = "MISTRAL_API_KEY"
 
 # [backends.gemini]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
 # api_key_env = "GOOGLE_API_KEY"
 
-# [backends.kimi]
-# type = "openai"
+# Platform Moonshot API key (metered) — NOT Kimi Code OAuth:
+# [backends.moonshot]
+# type = "api_key"
 # base_url = "https://api.moonshot.ai/v1"
 # api_key_env = "MOONSHOT_API_KEY"
 
 # [backends.nim]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://integrate.api.nvidia.com/v1"
 # api_key_env = "NVIDIA_API_KEY"
 
 # [backends.lmstudio]
-# type = "openai"
+# type = "api_key"
 # base_url = "http://127.0.0.1:1234/v1"
 
 # --- Profiles: map Claude roles → backend:model ---
@@ -105,6 +117,13 @@ haiku = "ollama:kimi-k2.7-code:cloud"
 sonnet = "ollama:kimi-k2.7-code:cloud"
 opus = "xai:grok-4.5"
 fable = "ollama:glm-5.2:cloud"
+
+# [profiles.kimi-code]
+# default = "kimi:kimi-for-coding"
+# haiku = "kimi:kimi-for-coding"
+# sonnet = "kimi:kimi-for-coding"
+# opus = "kimi:kimi-for-coding"
+# fable = "kimi:kimi-for-coding"
 
 [profiles.local-only]
 default = "ollama:qwen2.5:14b"
@@ -129,7 +148,7 @@ fable = "ollama:qwen2.5:14b"
 # # api_key_env = "BRAVE_API_KEY"
 
 # [backends.azure]
-# type = "openai"
+# type = "api_key"
 # base_url = "https://YOUR_RESOURCE.openai.azure.com"
 # api_key_env = "AZURE_OPENAI_API_KEY"
 # azure_deployment = "gpt-4o"

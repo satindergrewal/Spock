@@ -8,7 +8,7 @@ use crate::route;
 use crate::state::AppState;
 use crate::translate::{
     anthropic_to_openai, count_tokens_estimate, new_msg_id, new_tool_id, openai_to_anthropic,
-    prepare_for_openai_compat, wants_thinking, BackendFamily,
+    prepare_for_openai_compat, wants_thinking, CompletionsQuirk,
 };
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -62,8 +62,13 @@ struct Request {
 }
 
 fn handle_client(mut stream: TcpStream, state: AppState) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(600)))?;
+    // Idle timeouts only (reset on each successful read/write). Do not use short
+    // total-request caps — LAN streaming generations can run 30–60+ minutes while
+    // still producing SSE deltas.
+    let idle = Duration::from_secs(3600);
+    stream.set_read_timeout(Some(idle))?;
+    stream.set_write_timeout(Some(idle))?;
+    let _ = stream.set_nodelay(true);
     let req = read_request(&mut stream)?;
     let path = req.path.split('?').next().unwrap_or(&req.path).to_string();
     eprintln!("  {} {path}", req.method);
@@ -98,11 +103,8 @@ fn handle_client(mut stream: TcpStream, state: AppState) -> Result<()> {
             handle_admin_set_profile(&mut stream, &state, body)?;
         }
         ("POST", "/spock/v1/logout") => {
-            let _ = crate::auth::logout();
-            if let Ok(mut t) = state.tokens.lock() {
-                t.clear();
-            }
-            write_json(&mut stream, 200, &json!({"ok": true}))?;
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+            handle_admin_logout(&mut stream, &state, body)?;
         }
         ("GET", "/spock/v1/status") => {
             handle_admin_status(&mut stream, &state)?;
@@ -223,6 +225,17 @@ fn health_json(state: &AppState) -> Result<Value> {
     }))
 }
 
+
+/// Clone a backend handle and drop the map lock immediately so long upstream
+/// chats (LAN llama-server) cannot block config Save / reload / other writers.
+fn take_backend(state: &AppState, name: &str) -> Result<crate::backends::BackendHandle> {
+    let backends = state
+        .backends
+        .read()
+        .map_err(|_| Error::Msg("backends lock".into()))?;
+    get_backend(&backends, name).cloned()
+}
+
 fn handle_admin_get_config(stream: &mut TcpStream, state: &AppState) -> Result<()> {
     let cfg = state.snapshot_config()?;
     let doc = crate::settings::config_to_doc(&cfg);
@@ -296,37 +309,26 @@ fn handle_admin_set_profile(stream: &mut TcpStream, state: &AppState, body: Valu
 
 fn handle_admin_status(stream: &mut TcpStream, state: &AppState) -> Result<()> {
     let cfg = state.snapshot_config()?;
-    // Prefer reporting static API key if any xai backend has api_key configured.
-    let has_cfg_key = state
-        .with_config(|c| {
-            c.backends.values().any(|b| {
-                matches!(
-                    b,
-                    crate::config::BackendConfig::Xai {
-                        api_key: Some(k),
-                        ..
-                    } if !k.trim().is_empty()
-                )
-            })
-        })
-        .unwrap_or(false);
-    let auth = if has_cfg_key {
-        json!({"present": true, "source": "config_api_key"})
-    } else if std::env::var("XAI_TOKEN")
-        .map(|t| !t.is_empty())
-        .unwrap_or(false)
-    {
-        json!({"present": true, "source": "env"})
-    } else {
-        match crate::auth::load_tokens() {
-            Some(t) => json!({
-                "present": true,
-                "source": "oauth",
-                "expires_at": t.expires_at,
-            }),
-            None => json!({"present": false}),
+    let mut oauth = serde_json::Map::new();
+    for p in crate::oauth::list_providers() {
+        let key_set = cfg.oauth_config_key_set(p.id);
+        let (present, source) = crate::oauth::status_for_provider(p.id, key_set);
+        let mut entry = json!({
+            "present": present,
+            "source": source.as_str(),
+            "label": p.label,
+        });
+        if let crate::oauth::AuthSource::Oauth { expires_at } = source {
+            if let Some(exp) = expires_at {
+                entry.as_object_mut().unwrap().insert("expires_at".into(), json!(exp));
+            }
         }
-    };
+        oauth.insert(p.id.to_string(), entry);
+    }
+    let providers: Vec<_> = crate::oauth::list_providers()
+        .iter()
+        .map(|p| json!({"id": p.id, "label": p.label}))
+        .collect();
     write_json(
         stream,
         200,
@@ -339,8 +341,8 @@ fn handle_admin_status(stream: &mut TcpStream, state: &AppState) -> Result<()> {
             "backends": cfg.backends.keys().cloned().collect::<Vec<_>>(),
             "profiles": cfg.profiles.keys().cloned().collect::<Vec<_>>(),
             "config_path": crate::config::config_path().display().to_string(),
-            "auth_path": crate::config::auth_path().display().to_string(),
-            "xai_auth": auth,
+            "oauth": oauth,
+            "providers": providers,
             "last_upstream_error": state.last_error_snapshot().map(|e| json!({
                 "message": e.message,
                 "status": e.status,
@@ -349,6 +351,39 @@ fn handle_admin_status(stream: &mut TcpStream, state: &AppState) -> Result<()> {
         }),
     )
 }
+
+fn handle_admin_logout(stream: &mut TcpStream, state: &AppState, body: Value) -> Result<()> {
+    if body.get("all").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let cleared = crate::oauth::logout_all()?;
+        state.oauth.clear_all_memory();
+        return write_json(stream, 200, &json!({"ok": true, "cleared": cleared}));
+    }
+    let provider = body
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(provider) = provider else {
+        return write_json(
+            stream,
+            400,
+            &json!({"ok": false, "error": "provider required (or {\"all\": true})"}),
+        );
+    };
+    match crate::oauth::logout(provider) {
+        Ok(removed) => {
+            state.oauth.clear_memory(provider);
+            write_json(
+                stream,
+                200,
+                &json!({"ok": true, "provider": provider, "removed": removed}),
+            )
+        }
+        Err(e) => write_json(stream, 400, &json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+
 
 /// GET /spock/v1/backends/{name}/models — discover models for Settings pickers.
 fn handle_admin_backend_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result<()> {
@@ -367,18 +402,14 @@ fn handle_admin_backend_models(stream: &mut TcpStream, state: &AppState, path: &
         );
     }
 
-    let backends = state
-        .backends
-        .read()
-        .map_err(|_| Error::Msg("backends lock".into()))?;
-    let be = match get_backend(&backends, &name) {
+    let be = match take_backend(state, &name) {
         Ok(b) => b,
         Err(e) => {
             return write_json(stream, 404, &json!({"ok": false, "error": e.to_string()}));
         }
     };
 
-    match be.list_models(&state.tokens) {
+    match be.list_models(&state.oauth) {
         Ok(models) => write_json(
             stream,
             200,
@@ -405,16 +436,19 @@ fn handle_admin_backend_models(stream: &mut TcpStream, state: &AppState, path: &
 
 fn handle_language_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result<()> {
     // Prefer xai backend for language-models passthrough
-    let backends = state
-        .backends
-        .read()
-        .map_err(|_| Error::Msg("backends lock".into()))?;
-    let be = backends
-        .get("xai")
-        .or_else(|| backends.values().next())
-        .ok_or_else(|| Error::Msg("no backends".into()))?;
+    let be = {
+        let backends = state
+            .backends
+            .read()
+            .map_err(|_| Error::Msg("backends lock".into()))?;
+        backends
+            .get("xai")
+            .or_else(|| backends.values().next())
+            .cloned()
+            .ok_or_else(|| Error::Msg("no backends".into()))?
+    };
     let rest = path.strip_prefix("/v1").unwrap_or(path);
-    match be.get_json(rest, &state.tokens) {
+    match be.get_json(rest, &state.oauth) {
         Ok(v) => write_json(stream, 200, &v),
         Err(Error::Http(code, body)) => {
             let msg = extract_err_msg(&body);
@@ -438,13 +472,9 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
     if !model_id.is_empty() {
         // Prefer synthetic for anything we can route; try upstream for real ids
         if let Ok(resolved) = state.with_config(|c| route::resolve(c, &model_id))? {
-            let backends = state
-                .backends
-                .read()
-                .map_err(|_| Error::Msg("backends lock".into()))?;
-            if let Ok(be) = get_backend(&backends, &resolved.backend) {
+            if let Ok(be) = take_backend(state, &resolved.backend) {
                 let path = format!("/models/{}", resolved.upstream_model);
-                if let Ok(mut card) = be.get_json(&path, &state.tokens) {
+                if let Ok(mut card) = be.get_json(&path, &state.oauth) {
                     if let Some(obj) = card.as_object_mut() {
                         obj.insert("id".into(), json!(model_id));
                         obj.entry("display_name".to_string())
@@ -460,12 +490,15 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
     // List: merge backends + aliases
     let mut by_id: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     {
-        let backends = state
-            .backends
-            .read()
-            .map_err(|_| Error::Msg("backends lock".into()))?;
-        for be in backends.values() {
-            if let Ok(raw) = be.get_json("/models", &state.tokens) {
+        let handles: Vec<_> = {
+            let backends = state
+                .backends
+                .read()
+                .map_err(|_| Error::Msg("backends lock".into()))?;
+            backends.values().cloned().collect()
+        };
+        for be in &handles {
+            if let Ok(raw) = be.get_json("/models", &state.oauth) {
                 if let Some(data) = raw.get("data").and_then(|d| d.as_array()) {
                     for m in data {
                         if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
@@ -505,11 +538,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
         }
     };
 
-    let backends = state
-        .backends
-        .read()
-        .map_err(|_| Error::Msg("backends lock".into()))?;
-    let be = match get_backend(&backends, &resolved.backend) {
+    let be = match take_backend(state, &resolved.backend) {
         Ok(b) => b,
         Err(e) => {
             let (st, err) = anthropic_error(400, "invalid_request_error", &e.to_string());
@@ -520,7 +549,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
     let env = EnvOverrides::from_env();
     // Anthropic passthrough: forward Messages JSON with only model rewritten to upstream id.
     // Keep betas / context_management — real Anthropic understands them.
-    if be.family == BackendFamily::Anthropic {
+    if be.is_anthropic() {
         let mut body = a.clone();
         if let Some(obj) = body.as_object_mut() {
             obj.insert("model".into(), json!(resolved.upstream_model));
@@ -530,7 +559,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
             "  route {} → {}:{} (anthropic-passthrough)",
             client_model, resolved.backend, resolved.upstream_model
         );
-        return match be.chat(&body, do_stream, &state.tokens) {
+        return match be.chat(&body, do_stream, &state.oauth) {
             Ok(UpstreamBody::Json(o)) => write_json(sock, 200, &o),
             Ok(UpstreamBody::Stream(reader)) => {
                 // Raw Anthropic SSE passthrough
@@ -556,7 +585,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
     // Microcompact + drop Anthropic-only keys before OpenAI-compat / xAI translation.
     prepare_for_openai_compat(&mut a);
 
-    let oai = anthropic_to_openai(&a, &resolved.upstream_model, be.family, &env.grok_model);
+    let oai = anthropic_to_openai(&a, &resolved.upstream_model, be.quirk, &env.grok_model);
     let include_thinking = wants_thinking(&a);
     let do_stream = a.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -583,18 +612,28 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
         && crate::server_tools::request_has_advisor(&a))
         || (web_cfg.enabled && crate::server_tools::request_has_web_search(&a));
 
+    // CRITICAL: the server-tools multi-round path forces stream:false upstream and
+    // only emits SSE after the *entire* completion is done. On a slow LAN model
+    // (~11 tok/s, 10–25 min turns) Claude Code sees zero bytes for ~600s and
+    // reports "Request timed out" while llama-server is still generating.
+    // When the client asked for streaming, always use real incremental SSE.
+    // Advisor/web_search emulation still runs for non-stream clients.
+    let use_server_tools = use_server_tools && !do_stream;
+
     eprintln!(
         "  route {} → {}:{} ({}){}",
         client_model,
         resolved.backend,
         resolved.upstream_model,
-        match be.family {
-            BackendFamily::Xai => "xai",
-            BackendFamily::Openai => "openai",
-            BackendFamily::Anthropic => "anthropic",
+        match be.quirk {
+            CompletionsQuirk::Xai => "xai",
+            CompletionsQuirk::Kimi => "kimi",
+            CompletionsQuirk::Generic => "generic",
         },
         if use_server_tools {
             " [server-tools]"
+        } else if do_stream {
+            " [stream]"
         } else {
             ""
         }
@@ -611,7 +650,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
             include_thinking,
             &advisor_cfg,
             &web_cfg,
-            be,
+            &be,
             &env,
         ) {
             Ok(resp) => {
@@ -625,7 +664,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
     }
 
     if !do_stream {
-        match be.chat(&oai, false, &state.tokens) {
+        match be.chat(&oai, false, &state.oauth) {
             Ok(UpstreamBody::Json(o)) => {
                 let resp = openai_to_anthropic(&o, &client_model, include_thinking);
                 write_json(sock, 200, &resp)
@@ -637,7 +676,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
             Err(e) => write_upstream_err(sock, state, e),
         }
     } else {
-        match be.chat(&oai, true, &state.tokens) {
+        match be.chat(&oai, true, &state.oauth) {
             Ok(UpstreamBody::Stream(reader)) => {
                 stream_anthropic(sock, reader, &client_model, include_thinking, state)
             }
@@ -1048,11 +1087,7 @@ fn handle_openai(sock: &mut TcpStream, state: &AppState, mut body: Value) -> Res
         obj.insert("model".into(), json!(resolved.upstream_model));
     }
 
-    let backends = state
-        .backends
-        .read()
-        .map_err(|_| Error::Msg("backends lock".into()))?;
-    let be = match get_backend(&backends, &resolved.backend) {
+    let be = match take_backend(state, &resolved.backend) {
         Ok(b) => b,
         Err(e) => {
             let (st, err) = anthropic_error(400, "invalid_request_error", &e.to_string());
@@ -1060,7 +1095,7 @@ fn handle_openai(sock: &mut TcpStream, state: &AppState, mut body: Value) -> Res
         }
     };
 
-    if be.family == BackendFamily::Xai {
+    if be.quirk == CompletionsQuirk::Xai {
         let env = EnvOverrides::from_env();
         let reasoning =
             crate::models::is_reasoning_model(&resolved.upstream_model, &env.grok_model);
@@ -1071,7 +1106,7 @@ fn handle_openai(sock: &mut TcpStream, state: &AppState, mut body: Value) -> Res
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    match be.chat(&body, stream_flag, &state.tokens) {
+    match be.chat(&body, stream_flag, &state.oauth) {
         Ok(UpstreamBody::Json(v)) => write_json(sock, 200, &v),
         Ok(UpstreamBody::Stream(mut reader)) => {
             write_sse_headers(sock)?;
@@ -1141,7 +1176,7 @@ pub(crate) fn classify_upstream_http(code: u16, raw: &str) -> (u16, &'static str
             502,
             "authentication_error",
             format!(
-                "Spock upstream 401 (NOT Anthropic login): {raw} — xAI: spock logout && spock login or set api_key/XAI_TOKEN; Ollama cloud: sign in / plan"
+                "Spock upstream 401 (NOT Anthropic login): {raw} — run: spock login <provider> (or set api_key on that oauth backend); Ollama cloud: sign in / plan"
             ),
         );
     }

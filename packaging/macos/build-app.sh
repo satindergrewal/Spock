@@ -81,6 +81,15 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<!-- macOS 15+: required for LAN backends (llama-server / Ollama on LAN).
+	     Without this, ureq gets "No route to host" (os error 65) while Terminal curl works. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Spock talks to local OpenAI-compatible servers (Ollama, llama-server) on your LAN for multi-backend routing.</string>
+	<!-- Optional Bonjour service browse; helps Local Network permission UI appear. -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp</string>
+	</array>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Satinder Grewal</string>
 	<key>CFBundleGetInfoString</key>

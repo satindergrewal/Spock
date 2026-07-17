@@ -153,27 +153,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         menu.addItem(.separator())
 
-        // Reflect live auth so Login isn't a silent no-op when already OAuth'd.
-        let loginTitle: String
-        switch model.authSource {
-        case "oauth":
-            loginTitle = "Login xAI… (already OAuth)"
-        case "config_api_key":
-            loginTitle = "Login xAI… (API key active)"
-        case "env_XAI_TOKEN", "env":
-            loginTitle = "Login xAI… (XAI_TOKEN active)"
-        default:
-            loginTitle = "Login xAI…"
-        }
-        let login = NSMenuItem(title: loginTitle, action: #selector(loginXAI), keyEquivalent: "")
-        login.target = self
-        menu.addItem(login)
+        // Login / Logout submenus — one item per OAuth provider from status.
+        let loginRoot = NSMenuItem(title: "Login", action: nil, keyEquivalent: "")
+        let loginMenu = NSMenu(title: "Login")
+        let logoutRoot = NSMenuItem(title: "Logout", action: nil, keyEquivalent: "")
+        let logoutMenu = NSMenu(title: "Logout")
+        let providers = model.oauthProviders.isEmpty
+            ? [("xai", "xAI (Grok)"), ("kimi", "Kimi Code")]
+            : model.oauthProviders.map { ($0.id, $0.label) }
+        for (id, label) in providers {
+            let src = model.oauthStatus[id]?.source ?? "none"
+            let present = model.oauthStatus[id]?.present ?? false
+            let suffix: String
+            switch src {
+            case "oauth": suffix = present ? " (logged in)" : ""
+            case "config_api_key": suffix = " (API key)"
+            case "env": suffix = " (env token)"
+            default: suffix = ""
+            }
+            let li = NSMenuItem(title: "\(label)\(suffix)", action: #selector(loginProvider(_:)), keyEquivalent: "")
+            li.target = self
+            li.representedObject = id
+            loginMenu.addItem(li)
 
-        let logout = NSMenuItem(title: "Logout xAI", action: #selector(logoutXAI), keyEquivalent: "")
-        logout.target = self
-        // Logout only clears OAuth tokens — still useful to show when oauth present.
-        logout.isEnabled = model.authPresent || model.authSource == "oauth"
-        menu.addItem(logout)
+            let lo = NSMenuItem(title: label, action: #selector(logoutProvider(_:)), keyEquivalent: "")
+            lo.target = self
+            lo.representedObject = id
+            lo.isEnabled = present && (src == "oauth")
+            logoutMenu.addItem(lo)
+        }
+        loginRoot.submenu = loginMenu
+        logoutRoot.submenu = logoutMenu
+        menu.addItem(loginRoot)
+        menu.addItem(logoutRoot)
 
         menu.addItem(.separator())
 
@@ -241,8 +253,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem?.menu = buildMenu()
     }
 
-    @objc private func loginXAI() { AppModel.shared.loginXAI() }
-    @objc private func logoutXAI() { AppModel.shared.logoutXAI() }
+    @objc private func loginProvider(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        AppModel.shared.loginProvider(id)
+    }
+    @objc private func logoutProvider(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        AppModel.shared.logoutProvider(id)
+    }
 
     @objc private func quitApp() {
         NSApp.terminate(nil)

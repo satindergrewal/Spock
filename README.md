@@ -2,8 +2,8 @@
 
 **Local multi-backend proxy** that speaks the **Anthropic Messages API** so [Claude Code](https://claude.com/claude-code) (CLI + VSCodium/VS Code) can run on:
 
-- **xAI Grok** — subscription OAuth *or* console API key  
-- **Ollama / llama-server / any OpenAI-compatible API** — localhost or LAN  
+- **OAuth providers** — xAI Grok, Kimi Code (device login: `spock login <provider>`)  
+- **API Key backends** — Ollama / llama-server / OpenRouter / any OpenAI-compatible API  
 
 Claude Code always points at Spock (`http://127.0.0.1:8048`). Spock maps Haiku / Sonnet / Opus / Fable (and any model id) to different backends via profiles — without changing Claude settings when you switch vendors.
 
@@ -14,7 +14,7 @@ Claude Code always points at Spock (`http://127.0.0.1:8048`). Spock maps Haiku /
 | **Spock.app** | macOS menu bar app — proxy, Settings, Chat, profile switch, status icon |
 | `spock` CLI | `serve`, `login`, `logout`, `chat`, `status`, `reload` (all platforms) |
 | Config | `~/.config/spock/config.toml` |
-| xAI OAuth tokens | `~/.config/grok-test/auth.json` (same path as the original Python tool) |
+| OAuth tokens | `~/.config/spock/oauth-<provider>.json` (imports legacy grok-test / kimi paths once) |
 
 ---
 
@@ -92,7 +92,7 @@ cargo build --release
 open dist/Spock.app   # or Spock from Applications
 
 # Option B — CLI
-spock login           # once, if using OAuth (skip if using API key)
+spock login xai       # Grok subscription (or: spock login kimi)
 spock serve           # http://127.0.0.1:8048
 ```
 
@@ -142,31 +142,47 @@ Closing Settings/Chat **does not** quit the app (no Dock icon stuck around). Onl
 
 ---
 
-## xAI authentication
+## OAuth authentication (xAI, Kimi Code, …)
 
-Three options (**first wins**):
+Providers are registered in Spock (`spock providers`). Each OAuth backend is:
 
-1. **API key in config / Settings**  
-   ```toml
-   [backends.xai]
-   type = "xai"
-   api_key = "xai-..."    # from console.x.ai
-   ```  
-   Or Settings → Backends → `xai` → API key field → Save & Apply.
+```toml
+[backends.xai]
+type = "oauth"
+provider = "xai"
 
-2. **Environment**  
+[backends.kimi]
+type = "oauth"
+provider = "kimi"
+```
+
+Auth priority per provider (**first wins**):
+
+1. **API key** on that backend (Settings / config) — escape hatch  
+2. **Env token** (`XAI_TOKEN`, `KIMI_TOKEN`, …)  
+3. **OAuth device login**  
    ```bash
-   export XAI_TOKEN=xai-...
-   ```
-
-3. **OAuth (subscription)**  
-   ```bash
-   spock login            # browser device flow
-   # or menu: Login xAI…
+   spock login xai
+   spock login kimi
+   # menu: Login ▸ xAI / Kimi Code
    ```  
-   Tokens: `~/.config/grok-test/auth.json` (mode `0600`).
+   Tokens: `~/.config/spock/oauth-<provider>.json` (`0600`).
 
-With an API key set, device login is skipped. OAuth remains available when the key is empty.
+```bash
+spock logout xai
+spock logout kimi
+spock logout --all
+```
+
+### API Key backends (not OAuth)
+
+```toml
+[backends.ollama]
+type = "api_key"
+base_url = "http://127.0.0.1:11434/v1"
+```
+
+Platform Moonshot metered keys use `api.moonshot.ai` as `type = "api_key"` — that is separate from **Kimi Code** OAuth (`api.kimi.com/coding/v1`).
 
 ---
 
@@ -307,8 +323,9 @@ xAI reasoning models reject OpenAI `stop`. Spock drops `stop` / presence / frequ
 ```text
 spock serve [--port N]     Headless proxy on 127.0.0.1 (default 8048)
 spock app                  Open Spock.app (macOS)
-spock login [--no-open]    xAI OAuth device login
-spock logout               Forget OAuth tokens
+spock login <provider> [--no-open]   OAuth device login (xai, kimi, …)
+spock logout <provider> | --all
+spock providers [--json]
 spock chat [prompt] [-m model]
 spock status               Profile, backends, auth source, proxy health
 spock reload               Re-read config.toml
@@ -400,6 +417,8 @@ Workflows: [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/wor
 | Active profile snaps back in Settings | Use latest app (profile switch persists immediately); Save & Apply |
 | Hybrid hits wrong model | Check **active** profile rows; fable/default often drive main chat; empty role fields fall through to default |
 | Ollama `*:cloud` fails | Sign in / enable that model in Ollama cloud |
+| LAN Fetch models: **No route to host** (os error 65) while Terminal `curl` works | macOS **Local Network** privacy. Rebuild app (`./packaging/macos/build-app.sh` includes `NSLocalNetworkUsageDescription`), **Quit Spock**, reopen. System Settings → Privacy & Security → **Local Network** → enable **Spock**. Or run `spock serve` from Terminal (inherits Terminal’s LAN access). |
+| `type = "oauth"` parse error from `dist/Spock.app` | App binary is **old** — rebuild with `./packaging/macos/build-app.sh`; do not hot-copy `spock-proxy` into a signed `.app` |
 | Address already in use | `lsof -nP -iTCP:8048` — quit old Spock or Python proxy |
 | Gatekeeper blocks app | Right-click → Open |
 | Auto Mode “temporarily unavailable” | Upgrade Spock; ensure stop is dropped for xAI reasoning; aliases on `/v1/models` |
