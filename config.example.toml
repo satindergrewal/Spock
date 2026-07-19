@@ -31,13 +31,19 @@ provider = "kimi"
 # base_url = "https://api.kimi.com/coding/v1"
 # Priority: api_key → env KIMI_TOKEN → OAuth (spock login kimi)
 
+# Qwen Cloud (https://www.qwencloud.com) — Token Plan / API key, NOT chat.qwen.ai OAuth.
+# Create key: https://home.qwencloud.com/api-keys  (sk-… or Token Plan sk-sp-…)
 [backends.qwen]
-type = "oauth"
-provider = "qwen"
-# base_url fallback; live token resource_url usually overrides after login
-# base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-# Priority: api_key → env QWEN_TOKEN/DASHSCOPE_API_KEY → OAuth (spock login qwen)
-# Models e.g. qwen3-max-preview / qwen3.5-plus — Fetch models after login
+type = "api_key"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+# api_key = "sk-..."
+# Models: qwen3.8-max-preview, qwen3.7-plus, qwen3.7-max, …
+
+# Optional: chat.qwen.ai device OAuth (qwen-code path; different product from Qwen Cloud Token Plan)
+# [backends.qwen-oauth]
+# type = "oauth"
+# provider = "qwen"
 
 [backends.ollama]
 type = "api_key"

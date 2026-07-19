@@ -2,8 +2,8 @@
 
 **Local multi-backend proxy** that speaks the **Anthropic Messages API** so [Claude Code](https://claude.com/claude-code) (CLI + VSCodium/VS Code) can run on:
 
-- **OAuth providers** — xAI Grok, Kimi Code, Qwen Cloud (device login: `spock login <provider>`)  
-- **API Key backends** — Ollama / llama-server / OpenRouter / any OpenAI-compatible API  
+- **OAuth providers** — xAI Grok, Kimi Code, optional chat.qwen.ai (`spock login <provider>`)  
+- **API Key backends** — Qwen Cloud (qwencloud.com), Ollama / llama-server / OpenRouter / any OpenAI-compatible API  
 
 Claude Code always points at Spock (`http://127.0.0.1:8048`). Spock maps Haiku / Sonnet / Opus / Fable (and any model id) to different backends via profiles — without changing Claude settings when you switch vendors.
 
@@ -155,31 +155,43 @@ provider = "xai"
 type = "oauth"
 provider = "kimi"
 
-[backends.qwen]
-type = "oauth"
-provider = "qwen"
-# After login, Spock prefers the token's resource_url over the default base.
 ```
 
-Auth priority per provider (**first wins**):
+Auth priority per OAuth provider (**first wins**):
 
 1. **API key** on that backend (Settings / config) — escape hatch  
-2. **Env token** (`XAI_TOKEN`, `KIMI_TOKEN`, `QWEN_TOKEN` / `DASHSCOPE_API_KEY`, …)  
+2. **Env token** (`XAI_TOKEN`, `KIMI_TOKEN`, …)  
 3. **OAuth device login**  
    ```bash
    spock login xai
    spock login kimi
-   spock login qwen
-   # menu: Login ▸ xAI / Kimi Code / Qwen Cloud
+   # menu: Login ▸ xAI / Kimi Code
    ```  
    Tokens: `~/.config/spock/oauth-<provider>.json` (`0600`).
 
 ```bash
 spock logout xai
 spock logout kimi
-spock logout qwen
 spock logout --all
 ```
+
+### Qwen Cloud (qwencloud.com) — API key, not OAuth
+
+[qwencloud.com](https://www.qwencloud.com) **Token Plan / model marketplace** is **DashScope international API keys**, not the chat.qwen.ai device login used by qwen-code.
+
+```toml
+[backends.qwen]
+type = "api_key"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+```
+
+1. Create a key at [home.qwencloud.com/api-keys](https://home.qwencloud.com/api-keys) (`sk-…`, or Token Plan `sk-sp-…`)  
+2. `export DASHSCOPE_API_KEY='sk-…'` (or paste into Settings)  
+3. Route e.g. `fable = "qwen:qwen3.8-max-preview"` (or `qwen3.7-plus`, …)  
+4. Reload Spock / Save & Apply  
+
+Optional: `spock login qwen` is the **chat.qwen.ai** OAuth path (qwen-code). That is a different product from the Qwen Cloud website subscription.
 
 ### API Key backends (not OAuth)
 
@@ -190,7 +202,6 @@ base_url = "http://127.0.0.1:11434/v1"
 ```
 
 Platform Moonshot metered keys use `api.moonshot.ai` as `type = "api_key"` — that is separate from **Kimi Code** OAuth (`api.kimi.com/coding/v1`).
-Alibaba **Coding Plan** API keys (`sk-sp-…` on `coding.dashscope.aliyuncs.com`) are also `type = "api_key"` — separate from **Qwen Cloud** OAuth (`spock login qwen`).
 
 ---
 

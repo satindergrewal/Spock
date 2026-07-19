@@ -86,12 +86,12 @@ pub const PROVIDERS: &[ProviderDef] = &[
         legacy_token_paths: &[".kimi/credentials/kimi-code.json"],
         header_style: HeaderStyle::KimiCode,
     },
-    // Qwen Cloud subscription via chat.qwen.ai device flow (same client as qwen-code).
-    // Docs say free Qwen OAuth tier ended 2026-04-15; paid Qwen Cloud still uses this path.
-    // Token may include resource_url — Spock prefers that over default_base_url at request time.
+    // chat.qwen.ai device OAuth (same client as qwen-code). Distinct from
+    // www.qwencloud.com Token Plan, which is DashScope API keys (type=api_key).
+    // Token may include resource_url — Spock prefers that over default_base_url.
     ProviderDef {
         id: "qwen",
-        label: "Qwen Cloud",
+        label: "Qwen (chat.qwen.ai OAuth)",
         client_id: "f0304373b74a44d2b584a3fb70ca9e56",
         auth: AuthEndpoints::Fixed {
             device_auth: "https://chat.qwen.ai/api/v1/oauth2/device/code",
@@ -99,12 +99,12 @@ pub const PROVIDERS: &[ProviderDef] = &[
         },
         scope: Some("openid profile email model.completion"),
         pkce: true,
-        // Fallback OpenAI-compat base; live token.resource_url usually overrides.
-        default_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        default_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         user_agent: UA,
         quirk: CompletionsQuirk::Generic,
         token_file: "oauth-qwen.json",
-        env_token_keys: &["QWEN_TOKEN", "QWEN_API_KEY", "DASHSCOPE_API_KEY"],
+        // Do NOT list DASHSCOPE_API_KEY here — that is Qwen Cloud api_key backends.
+        env_token_keys: &["QWEN_OAUTH_TOKEN", "QWEN_TOKEN"],
         legacy_token_paths: &[".qwen/oauth_creds.json"],
         header_style: HeaderStyle::Default,
     },

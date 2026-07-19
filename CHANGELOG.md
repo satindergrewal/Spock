@@ -8,7 +8,8 @@ All notable changes to Spock are documented here.
 - **Generalized OAuth providers** — registry-driven `spock login|logout <provider>` / `spock providers` (xai, kimi, qwen); status + menus follow the table
 - Backend types: `oauth` / `api_key` / `anthropic` (Settings labels: **OAuth** / **API Key** / **Anthropic**)
 - **Kimi Code** OAuth (`provider = "kimi"`, `https://api.kimi.com/coding/v1`, KimiCLI UA + X-Msh headers)
-- **Qwen Cloud** OAuth (`provider = "qwen"`, chat.qwen.ai device flow + PKCE S256; uses token `resource_url` when present)
+- **Qwen OAuth (optional)** — `provider = "qwen"` chat.qwen.ai device flow + PKCE S256; uses token `resource_url` when present (qwen-code path)
+- **Qwen Cloud (qwencloud.com)** documented as `type = "api_key"` on `dashscope-intl…/compatible-mode/v1` + `DASHSCOPE_API_KEY` (Token Plan / Max Preview)
 - Token files: `~/.config/spock/oauth-<provider>.json` (imports legacy grok-test / kimi-cli / qwen-code paths once; logout clears them)
 
 ### Changed

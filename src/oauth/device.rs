@@ -291,6 +291,11 @@ pub fn device_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
             eprintln!(" approved.\n");
             return token_set_from_json(tok);
         }
+        // Transient gateway errors while waiting for user approval (Qwen has 504'd here).
+        if (500..600).contains(&st) {
+            interval = (interval + 2.0).min(15.0);
+            continue;
+        }
         let err = tok.get("error").and_then(|e| e.as_str()).unwrap_or("");
         if err == "authorization_pending" {
             continue;
