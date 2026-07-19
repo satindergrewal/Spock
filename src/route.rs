@@ -62,7 +62,20 @@ pub fn resolve(cfg: &Config, client_model: &str) -> Result<ResolvedRoute> {
         return make_route(spec, &client);
     }
 
-    // 2. role buckets — empty strings fall through (UI often saves "" for unused roles)
+    // 2. Explicit "backend:model" client ids — if the left side is a configured
+    // backend name, honor it. Without this, `qwen:qwen3.7-plus` falls through
+    // to profile default (often xai) and looks like a successful Qwen call.
+    if let Ok((backend, upstream)) = parse_route_spec(&stripped) {
+        if cfg.backends.contains_key(&backend) {
+            return Ok(ResolvedRoute {
+                backend,
+                upstream_model: upstream,
+                client_model: client,
+            });
+        }
+    }
+
+    // 3. role buckets — empty strings fall through (UI often saves "" for unused roles)
     let role_spec = match detect_role(&stripped) {
         Role::Haiku => nonempty(profile.haiku.as_deref()),
         Role::Sonnet => nonempty(profile.sonnet.as_deref()),
@@ -74,7 +87,7 @@ pub fn resolve(cfg: &Config, client_model: &str) -> Result<ResolvedRoute> {
         return make_route(spec, &client);
     }
 
-    // 3. profile default (including bare grok-* client ids — no xAI auto-passthrough)
+    // 4. profile default (including bare grok-* client ids — no xAI auto-passthrough)
     if let Some(spec) = nonempty(profile.default.as_deref()) {
         return make_route(spec, &client);
     }
@@ -214,5 +227,22 @@ mod tests {
         let (b, m) = parse_route_spec("ollama:qwen2.5:14b").unwrap();
         assert_eq!(b, "ollama");
         assert_eq!(m, "qwen2.5:14b");
+    }
+
+    #[test]
+    fn explicit_backend_model_passthrough() {
+        let cfg = sample();
+        // Must NOT fall through to profile default (ollama) — honor configured backend name.
+        let r = resolve(&cfg, "xai:grok-4.5").unwrap();
+        assert_eq!(r.backend, "xai");
+        assert_eq!(r.upstream_model, "grok-4.5");
+    }
+
+    #[test]
+    fn unknown_backend_prefix_falls_through() {
+        let cfg = sample();
+        // "notabackend:foo" is not a configured backend → profile default
+        let r = resolve(&cfg, "notabackend:foo").unwrap();
+        assert_eq!(r.backend, "ollama");
     }
 }

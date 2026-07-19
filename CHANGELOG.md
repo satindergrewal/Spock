@@ -24,6 +24,8 @@ All notable changes to Spock are documented here.
 - Menu + CLI surface already-logged-in OAuth state clearly
 - Slow LAN (llama-server) streams no longer die at ~10 minutes while the backend still generates
 - Mid-SSE llama.cpp tool-call diff aborts (`Invalid diff: now finding less tool calls`) labeled as **upstream llama-server**, not Spock
+- Route `backend:model` client ids to that backend when it exists (stop falling through to profile default / xAI)
+- Docs: Qwen Cloud **Coding Plan** (`coding-intl…`, `sk-sp-…`) vs **Token Plan** (`token-plan.ap-southeast-1…`, separate key) — `qwen3.8-max-preview` is Token Plan only
 
 ## [0.2.0] - 2026-07-13
 

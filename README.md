@@ -177,21 +177,35 @@ spock logout --all
 
 ### Qwen Cloud (qwencloud.com) — API key, not OAuth
 
-[qwencloud.com](https://www.qwencloud.com) **Token Plan / model marketplace** is **DashScope international API keys**, not the chat.qwen.ai device login used by qwen-code.
+[qwencloud.com](https://www.qwencloud.com) has **two paid plans with different hosts and keys**. Neither is chat.qwen.ai OAuth.
+
+| Plan | Key | OpenAI-compatible base | Models (examples) |
+|---|---|---|---|
+| **Coding Plan** | `sk-sp-…` | `https://coding-intl.dashscope.aliyuncs.com/v1` | Fixed allowlist: `qwen3.7-plus`, `qwen3.6-plus`, `qwen3-coder-plus`, `glm-5`, `kimi-k2.5`, … — **no** `qwen3.8-max-preview` |
+| **Token Plan** | separate key (create on Token Plan page) | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | Credits catalog incl. **`qwen3.8-max-preview`**, `qwen3.7-max`, … |
 
 ```toml
+# Coding Plan (sk-sp-…)
 [backends.qwen]
 type = "api_key"
-base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+base_url = "https://coding-intl.dashscope.aliyuncs.com/v1"
 api_key_env = "DASHSCOPE_API_KEY"
+
+# Token Plan (for qwen3.8-max-preview) — different key + host:
+# [backends.qwen-token]
+# type = "api_key"
+# base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+# api_key = "…"   # from Token Plan page — NOT your Coding Plan sk-sp key
 ```
 
-1. Create a key at [home.qwencloud.com/api-keys](https://home.qwencloud.com/api-keys) (`sk-…`, or Token Plan `sk-sp-…`)  
-2. `export DASHSCOPE_API_KEY='sk-…'` (or paste into Settings)  
-3. Route e.g. `fable = "qwen:qwen3.8-max-preview"` (or `qwen3.7-plus`, …)  
+1. Create the matching key: [API Keys](https://home.qwencloud.com/api-keys) / [Token Plan](https://home.qwencloud.com/billing/subscription/token-plan)  
+2. Paste into Settings or env; **do not mix** Coding Plan keys with the Token Plan host (or vice versa)  
+3. Route e.g. Coding: `fable = "qwen:qwen3.7-plus"` · Token: `fable = "qwen-token:qwen3.8-max-preview"`  
 4. Reload Spock / Save & Apply  
 
-Optional: `spock login qwen` is the **chat.qwen.ai** OAuth path (qwen-code). That is a different product from the Qwen Cloud website subscription.
+`/models` only lists what **that plan’s host** exposes. Docs can advertise `qwen3.8-max-preview` while a Coding Plan key’s catalog stays at 10 fixed models — that is upstream plan gating, not Spock.
+
+Optional: `spock login qwen` is the **chat.qwen.ai** OAuth path (qwen-code). Different product again.
 
 ### API Key backends (not OAuth)
 

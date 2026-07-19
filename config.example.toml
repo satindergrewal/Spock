@@ -31,16 +31,31 @@ provider = "kimi"
 # base_url = "https://api.kimi.com/coding/v1"
 # Priority: api_key → env KIMI_TOKEN → OAuth (spock login kimi)
 
-# Qwen Cloud (https://www.qwencloud.com) — Token Plan / API key, NOT chat.qwen.ai OAuth.
-# Create key: https://home.qwencloud.com/api-keys  (sk-… or Token Plan sk-sp-…)
+# Qwen Cloud Coding Plan (https://www.qwencloud.com) — sk-sp-… key
+# Create key: https://home.qwencloud.com/api-keys
+# Fixed model allowlist (qwen3.7-plus, qwen3-coder-plus, …). NO qwen3.8-max-preview.
 [backends.qwen]
 type = "api_key"
-base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+base_url = "https://coding-intl.dashscope.aliyuncs.com/v1"
 api_key_env = "DASHSCOPE_API_KEY"
-# api_key = "sk-..."
-# Models: qwen3.8-max-preview, qwen3.7-plus, qwen3.7-max, …
+# api_key = "sk-sp-..."
 
-# Optional: chat.qwen.ai device OAuth (qwen-code path; different product from Qwen Cloud Token Plan)
+# Qwen Cloud Token Plan — required for qwen3.8-max-preview (and other Credits models).
+# Different key + host from Coding Plan (keys are NOT interchangeable).
+# Subscribe + key: https://home.qwencloud.com/billing/subscription/token-plan
+# [backends.qwen-token]
+# type = "api_key"
+# base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+# api_key = "..."
+# Then route: fable = "qwen-token:qwen3.8-max-preview"
+
+# China region coding host (if your Coding Plan key is CN):
+# base_url = "https://coding.dashscope.aliyuncs.com/v1"
+
+# Pay-as-you-go sk- (not sk-sp) standard Model Studio:
+# base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+# Optional: chat.qwen.ai device OAuth (qwen-code path; different product)
 # [backends.qwen-oauth]
 # type = "oauth"
 # provider = "qwen"
