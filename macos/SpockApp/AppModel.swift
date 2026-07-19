@@ -247,11 +247,14 @@ final class AppModel: ObservableObject {
 
         if let arr = raw["backends"] as? [[String: Any]] {
             backends = arr.map { b in
-                BackendRow(
+                let t = b["type"] as? String ?? "api_key"
+                let prov = b["provider"] as? String ?? ""
+                return BackendRow(
                     id: UUID(),
                     name: b["name"] as? String ?? "",
-                    type: b["type"] as? String ?? "api_key",
-                    provider: b["provider"] as? String ?? "",
+                    type: t,
+                    // Never surface a provider chip on API Key / Anthropic rows.
+                    provider: t == "oauth" ? prov : "",
                     baseURL: b["base_url"] as? String ?? "",
                     apiKey: b["api_key"] as? String ?? ""
                 )
@@ -311,8 +314,14 @@ final class AppModel: ObservableObject {
         // Trim keys/URLs so whitespace-only doesn't look "set" then fall through to OAuth.
         for i in backends.indices {
             backends[i].name = backends[i].name.trimmingCharacters(in: .whitespacesAndNewlines)
+            backends[i].type = backends[i].type.trimmingCharacters(in: .whitespacesAndNewlines)
             backends[i].baseURL = backends[i].baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             backends[i].apiKey = backends[i].apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            backends[i].provider = backends[i].provider.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Only OAuth backends carry a provider id. Stale "xai" on api_key rows confuses the UI.
+            if backends[i].type != "oauth" {
+                backends[i].provider = ""
+            }
         }
         advisorModel = advisorModel.trimmingCharacters(in: .whitespacesAndNewlines)
         webSearchApiKey = webSearchApiKey.trimmingCharacters(in: .whitespacesAndNewlines)

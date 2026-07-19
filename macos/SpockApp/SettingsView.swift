@@ -164,11 +164,19 @@ struct SettingsView: View {
                             .labelsHidden()
                             .frame(width: 100)
                             .onChange(of: b.type) { _, newVal in
-                                if newVal == "oauth" && b.provider.isEmpty {
-                                    b.provider = "xai"
-                                    if b.baseURL.isEmpty { b.baseURL = "https://api.x.ai/v1" }
+                                if newVal == "oauth" {
+                                    if b.provider.isEmpty {
+                                        b.provider = "xai"
+                                    }
+                                    if b.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        b.baseURL = "https://api.x.ai/v1"
+                                    }
+                                } else {
+                                    // API Key / Anthropic are not OAuth — never keep a stale provider chip.
+                                    b.provider = ""
                                 }
                             }
+                            // Provider only for OAuth. API Key backends (Qwen Token Plan, Ollama, …) have no provider.
                             if b.type == "oauth" {
                                 Picker("", selection: $b.provider) {
                                     Text("xai").tag("xai")
@@ -180,7 +188,11 @@ struct SettingsView: View {
                                 .labelsHidden()
                                 .frame(width: 90)
                                 .onChange(of: b.provider) { _, newVal in
-                                    if b.baseURL.trimmingCharacters(in: .whitespaces).isEmpty {
+                                    let url = b.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    if url.isEmpty
+                                        || url.contains("api.x.ai")
+                                        || url.contains("api.kimi.com")
+                                    {
                                         if newVal == "kimi" {
                                             b.baseURL = "https://api.kimi.com/coding/v1"
                                         } else if newVal == "xai" {
@@ -465,18 +477,21 @@ struct SettingsView: View {
 
     private func oauthKeyHint(for b: BackendRow) -> String {
         let keySet = !b.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let prov = b.provider.isEmpty ? "provider" : b.provider
+        let st = model.oauthStatus[prov]
+        let src = st?.source ?? "none"
         if keySet {
-            return "Key in form — click Save & Apply. Live proxy: \(model.authSourceLabel)."
+            return "Key in form beats OAuth after Save & Apply. Live \(prov): \(src)."
         }
-        switch model.authSource {
+        switch src {
         case "config_api_key":
-            return "Proxy is using a saved config API key. Field may be empty until Reload if you edited TOML by hand."
+            return "Proxy uses a saved config API key for \(prov)."
         case "oauth":
-            return "Proxy is on OAuth. Paste console API key here + Save & Apply to override (do not use menu Login for keys)."
-        case "env_XAI_TOKEN", "env":
-            return "Proxy is using XAI_TOKEN from the environment."
+            return "Proxy on \(prov) OAuth. Optional key field overrides after Save & Apply. Menu Login for device flow."
+        case "env":
+            return "Proxy using env token for \(prov)."
         default:
-            return "No key yet. Paste console.x.ai API key → Save & Apply. Menu Login is OAuth subscription only."
+            return "No \(prov) credentials yet — menu Login… or paste API key + Save & Apply."
         }
     }
 }
