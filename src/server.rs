@@ -883,7 +883,7 @@ fn stream_anthropic(
                 .and_then(|m| m.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| err.to_string());
-            mid_stream_err = Some(format!("upstream stream error: {msg}"));
+            mid_stream_err = Some(label_mid_stream_upstream_error(&msg));
             break;
         }
 
@@ -1145,6 +1145,26 @@ fn write_upstream_err(stream: &mut TcpStream, state: &AppState, e: Error) -> Res
     }
 }
 
+/// Label mid-SSE `error` objects from OpenAI-compat backends so Claude Code / status
+/// toasts don't look like Spock itself aborted the stream.
+///
+/// llama.cpp `common_chat_msg_diff::compute_diffs` throws
+/// `"Invalid diff: now finding less tool calls!"` when a model retracts a partial
+/// tool_call mid-stream (common on damaged quants). That is upstream — Spock only
+/// forwards it.
+fn label_mid_stream_upstream_error(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("invalid diff")
+        || lower.contains("finding less tool calls")
+        || lower.contains("tool call mismatch")
+    {
+        return format!(
+            "upstream stream error [llama-server tool-call parser, not Spock]: {raw}"
+        );
+    }
+    format!("upstream stream error: {raw}")
+}
+
 /// Map vendor HTTP failures to Anthropic-shaped errors that Claude Code (CLI + VSCodium)
 /// will **show as text**, not misread as "log in to Anthropic".
 ///
@@ -1208,7 +1228,23 @@ pub(crate) fn classify_upstream_http(code: u16, raw: &str) -> (u16, &'static str
 
 #[cfg(test)]
 mod upstream_err_tests {
-    use super::classify_upstream_http;
+    use super::{classify_upstream_http, label_mid_stream_upstream_error};
+
+    #[test]
+    fn llama_tool_call_diff_is_labeled_upstream() {
+        let msg = label_mid_stream_upstream_error(
+            "Invalid diff: now finding less tool calls!\n  Previous (1):\n",
+        );
+        assert!(msg.contains("llama-server tool-call parser"), "{msg}");
+        assert!(msg.contains("not Spock"), "{msg}");
+        assert!(msg.contains("Invalid diff"), "{msg}");
+    }
+
+    #[test]
+    fn generic_mid_stream_error_unchanged_prefix() {
+        let msg = label_mid_stream_upstream_error("connection reset by peer");
+        assert_eq!(msg, "upstream stream error: connection reset by peer");
+    }
 
     #[test]
     fn quota_body_becomes_loud_502() {

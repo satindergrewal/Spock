@@ -21,6 +21,7 @@ All notable changes to Spock are documented here.
 - **Login…** from the menu bar runs as a direct child process (no Terminal/AppleScript stall)
 - Menu + CLI surface already-logged-in OAuth state clearly
 - Slow LAN (llama-server) streams no longer die at ~10 minutes while the backend still generates
+- Mid-SSE llama.cpp tool-call diff aborts (`Invalid diff: now finding less tool calls`) labeled as **upstream llama-server**, not Spock
 
 ## [0.2.0] - 2026-07-13
 
