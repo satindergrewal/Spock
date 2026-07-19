@@ -1,15 +1,27 @@
-//! Generic OAuth 2.0 device-code + refresh (RFC 8628).
+//! Generic OAuth 2.0 device-code + refresh (RFC 8628), optional PKCE S256.
 
 use crate::error::{Error, Result};
 use crate::oauth::registry::{request_headers, AuthEndpoints, DeviceCtx, ProviderDef};
 use crate::oauth::store::{now_secs, save_tokens, TokenSet};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::thread;
 use std::time::Duration;
 
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// RFC 7636 PKCE pair (S256).
+fn generate_pkce() -> Result<(String, String)> {
+    let mut raw = [0u8; 32];
+    getrandom::getrandom(&mut raw).map_err(|e| Error::Msg(format!("getrandom: {e}")))?;
+    let verifier = URL_SAFE_NO_PAD.encode(raw);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    Ok((verifier, challenge))
+}
 
 #[derive(Debug, Deserialize)]
 struct Discovery {
@@ -162,6 +174,12 @@ fn token_set_from_json(tok: Value) -> Result<TokenSet> {
         .get("expires_at")
         .and_then(|v| v.as_f64())
         .or_else(|| tok.get("expires_at").and_then(|v| v.as_i64()).map(|i| i as f64))
+        // Qwen oauth_creds.json uses expiry_date as ms epoch.
+        .or_else(|| {
+            tok.get("expiry_date")
+                .and_then(|v| v.as_f64())
+                .or_else(|| tok.get("expiry_date").and_then(|v| v.as_i64()).map(|i| i as f64))
+        })
         .map(crate::oauth::store::normalize_expires_at);
     let expires_at = expires_in
         .map(|e| now_secs() + e)
@@ -197,9 +215,24 @@ pub fn device_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
     let agent = agent(provider.user_agent);
     let endpoints = resolve_endpoints(provider, &agent)?;
 
+    // Owned PKCE strings so form slices can borrow them for the whole login.
+    let pkce = if provider.pkce {
+        Some(generate_pkce()?)
+    } else {
+        None
+    };
+    let (code_verifier, code_challenge) = match &pkce {
+        Some((v, c)) => (Some(v.as_str()), Some(c.as_str())),
+        None => (None, None),
+    };
+
     let mut form: Vec<(&str, &str)> = vec![("client_id", provider.client_id)];
     if let Some(scope) = provider.scope {
         form.push(("scope", scope));
+    }
+    if let Some(ch) = code_challenge {
+        form.push(("code_challenge", ch));
+        form.push(("code_challenge_method", "S256"));
     }
     let (status, dc) = form_post(
         &agent,
@@ -245,16 +278,15 @@ pub fn device_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
         thread::sleep(Duration::from_secs_f64(interval));
         eprint!(".");
         let _ = std::io::stderr().flush();
-        let (st, tok) = form_post(
-            &agent,
-            &endpoints.token,
-            &[
-                ("grant_type", DEVICE_GRANT),
-                ("client_id", provider.client_id),
-                ("device_code", &device_code),
-            ],
-            &headers,
-        )?;
+        let mut token_form: Vec<(&str, &str)> = vec![
+            ("grant_type", DEVICE_GRANT),
+            ("client_id", provider.client_id),
+            ("device_code", &device_code),
+        ];
+        if let Some(v) = code_verifier {
+            token_form.push(("code_verifier", v));
+        }
+        let (st, tok) = form_post(&agent, &endpoints.token, &token_form, &headers)?;
         if st == 200 {
             eprintln!(" approved.\n");
             return token_set_from_json(tok);
@@ -307,6 +339,14 @@ pub fn refresh(provider: &ProviderDef, tokens: &TokenSet) -> Result<Option<Token
     let mut set = token_set_from_json(tok)?;
     if set.refresh_token.is_none() {
         set.refresh_token = tokens.refresh_token.clone();
+    }
+    // Preserve Qwen resource_url / endpoint if refresh omits them.
+    for key in ["resource_url", "endpoint"] {
+        if !set.extra.contains_key(key) {
+            if let Some(v) = tokens.extra.get(key) {
+                set.extra.insert(key.to_string(), v.clone());
+            }
+        }
     }
     Ok(Some(set))
 }

@@ -63,12 +63,28 @@ impl BackendHandle {
         Ok((token, headers, p.user_agent.to_string()))
     }
 
+    /// Prefer token `resource_url` (Qwen regional endpoint) over static config base.
+    fn oauth_base_url(&self) -> String {
+        let config_base = self.config.base_url().to_string();
+        let provider_id = match &self.config {
+            BackendConfig::Oauth { provider, .. } => provider.as_str(),
+            _ => return config_base,
+        };
+        if let Some(t) = crate::oauth::load_tokens(provider_id) {
+            if let Some(u) = crate::oauth::resource_base_url(&t) {
+                return u;
+            }
+        }
+        config_base
+    }
+
     pub fn chat(&self, body: &Value, stream: bool, oauth: &OauthStore) -> Result<UpstreamBody> {
         match &self.config {
-            BackendConfig::Oauth { base_url, .. } => {
+            BackendConfig::Oauth { .. } => {
                 let (token, headers, ua) = self.oauth_bearer(oauth)?;
+                let base_url = self.oauth_base_url();
                 openai_compat::chat(
-                    base_url,
+                    &base_url,
                     Some(&token),
                     body,
                     stream,
@@ -102,10 +118,11 @@ impl BackendHandle {
 
     pub fn get_json(&self, path: &str, oauth: &OauthStore) -> Result<Value> {
         match &self.config {
-            BackendConfig::Oauth { base_url, .. } => {
+            BackendConfig::Oauth { .. } => {
                 let (token, headers, ua) = self.oauth_bearer(oauth)?;
+                let base_url = self.oauth_base_url();
                 openai_compat::get_json(
-                    base_url,
+                    &base_url,
                     Some(&token),
                     path,
                     &headers,
@@ -143,9 +160,10 @@ impl BackendHandle {
 
     pub fn list_models(&self, oauth: &OauthStore) -> Result<Vec<String>> {
         match &self.config {
-            BackendConfig::Oauth { base_url, .. } => {
+            BackendConfig::Oauth { .. } => {
                 let (token, headers, ua) = self.oauth_bearer(oauth)?;
-                openai_compat::list_models(base_url, Some(&token), &headers, Some(&ua))
+                let base_url = self.oauth_base_url();
+                openai_compat::list_models(&base_url, Some(&token), &headers, Some(&ua))
             }
             BackendConfig::ApiKey { base_url, .. } | BackendConfig::Anthropic { base_url, .. } => {
                 let key = self.config.api_key();

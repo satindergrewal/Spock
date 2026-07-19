@@ -21,6 +21,10 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Qwen OAuth device flow requires PKCE (S256).
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"
 
 # macOS UI is a native Swift app (macos/). No wry/WebView tray in Rust.
 [features]

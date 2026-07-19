@@ -81,10 +81,52 @@ fn load_tokens_file(path: &Path) -> Option<TokenSet> {
             set.refresh_token = Some(r.to_string());
         }
     }
+    // Qwen oauth_creds.json uses expiry_date (ms epoch) instead of expires_at.
+    if set.expires_at.is_none() {
+        if let Some(ed) = set
+            .extra
+            .get("expiry_date")
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                set.extra
+                    .get("expiry_date")
+                    .and_then(|v| v.as_i64())
+                    .map(|i| i as f64)
+            })
+        {
+            set.expires_at = Some(normalize_expires_at(ed));
+        }
+    }
     if set.access_token.is_empty() {
         return None;
     }
     Some(set)
+}
+
+/// OpenAI-compat base URL from a token's `resource_url` (Qwen), if any.
+/// Ensures `https://` and a trailing `/v1` the way qwen-code does.
+pub fn resource_base_url(tokens: &TokenSet) -> Option<String> {
+    let raw = tokens
+        .extra
+        .get("resource_url")
+        .and_then(|v| v.as_str())
+        .or_else(|| tokens.extra.get("endpoint").and_then(|v| v.as_str()))?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut url = if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    while url.ends_with('/') {
+        url.pop();
+    }
+    if !url.ends_with("/v1") {
+        url.push_str("/v1");
+    }
+    Some(url)
 }
 
 pub fn save_tokens(provider_id: &str, tokens: &mut TokenSet) -> Result<()> {
@@ -275,6 +317,31 @@ pub fn status_for_provider(
             },
         ),
         _ => (false, AuthSource::None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn resource_url_normalized_to_https_v1() {
+        let mut t = TokenSet {
+            access_token: "x".into(),
+            ..Default::default()
+        };
+        t.extra.insert("resource_url".into(), json!("portal.qwen.ai/api"));
+        assert_eq!(
+            resource_base_url(&t).as_deref(),
+            Some("https://portal.qwen.ai/api/v1")
+        );
+        t.extra
+            .insert("resource_url".into(), json!("https://example.com/v1/"));
+        assert_eq!(
+            resource_base_url(&t).as_deref(),
+            Some("https://example.com/v1")
+        );
     }
 }
 

@@ -2,7 +2,7 @@
 
 **Local multi-backend proxy** that speaks the **Anthropic Messages API** so [Claude Code](https://claude.com/claude-code) (CLI + VSCodium/VS Code) can run on:
 
-- **OAuth providers** — xAI Grok, Kimi Code (device login: `spock login <provider>`)  
+- **OAuth providers** — xAI Grok, Kimi Code, Qwen Cloud (device login: `spock login <provider>`)  
 - **API Key backends** — Ollama / llama-server / OpenRouter / any OpenAI-compatible API  
 
 Claude Code always points at Spock (`http://127.0.0.1:8048`). Spock maps Haiku / Sonnet / Opus / Fable (and any model id) to different backends via profiles — without changing Claude settings when you switch vendors.
@@ -92,7 +92,7 @@ cargo build --release
 open dist/Spock.app   # or Spock from Applications
 
 # Option B — CLI
-spock login xai       # Grok subscription (or: spock login kimi)
+spock login xai       # Grok subscription (or: kimi / qwen)
 spock serve           # http://127.0.0.1:8048
 ```
 
@@ -142,7 +142,7 @@ Closing Settings/Chat **does not** quit the app (no Dock icon stuck around). Onl
 
 ---
 
-## OAuth authentication (xAI, Kimi Code, …)
+## OAuth authentication (xAI, Kimi Code, Qwen Cloud, …)
 
 Providers are registered in Spock (`spock providers`). Each OAuth backend is:
 
@@ -154,23 +154,30 @@ provider = "xai"
 [backends.kimi]
 type = "oauth"
 provider = "kimi"
+
+[backends.qwen]
+type = "oauth"
+provider = "qwen"
+# After login, Spock prefers the token's resource_url over the default base.
 ```
 
 Auth priority per provider (**first wins**):
 
 1. **API key** on that backend (Settings / config) — escape hatch  
-2. **Env token** (`XAI_TOKEN`, `KIMI_TOKEN`, …)  
+2. **Env token** (`XAI_TOKEN`, `KIMI_TOKEN`, `QWEN_TOKEN` / `DASHSCOPE_API_KEY`, …)  
 3. **OAuth device login**  
    ```bash
    spock login xai
    spock login kimi
-   # menu: Login ▸ xAI / Kimi Code
+   spock login qwen
+   # menu: Login ▸ xAI / Kimi Code / Qwen Cloud
    ```  
    Tokens: `~/.config/spock/oauth-<provider>.json` (`0600`).
 
 ```bash
 spock logout xai
 spock logout kimi
+spock logout qwen
 spock logout --all
 ```
 
@@ -183,6 +190,7 @@ base_url = "http://127.0.0.1:11434/v1"
 ```
 
 Platform Moonshot metered keys use `api.moonshot.ai` as `type = "api_key"` — that is separate from **Kimi Code** OAuth (`api.kimi.com/coding/v1`).
+Alibaba **Coding Plan** API keys (`sk-sp-…` on `coding.dashscope.aliyuncs.com`) are also `type = "api_key"` — separate from **Qwen Cloud** OAuth (`spock login qwen`).
 
 ---
 
@@ -323,7 +331,7 @@ xAI reasoning models reject OpenAI `stop`. Spock drops `stop` / presence / frequ
 ```text
 spock serve [--port N]     Headless proxy on 127.0.0.1 (default 8048)
 spock app                  Open Spock.app (macOS)
-spock login <provider> [--no-open]   OAuth device login (xai, kimi, …)
+spock login <provider> [--no-open]   OAuth device login (xai, kimi, qwen, …)
 spock logout <provider> | --all
 spock providers [--json]
 spock chat [prompt] [-m model]

@@ -6,7 +6,8 @@ pub mod store;
 
 pub use registry::{get_provider, list_providers, provider_ids_csv};
 pub use store::{
-    clear_tokens, load_tokens, save_tokens, status_for_provider, AuthSource, OauthStore, TokenSet,
+    clear_tokens, load_tokens, resource_base_url, save_tokens, status_for_provider, AuthSource,
+    OauthStore, TokenSet,
 };
 
 use crate::error::{Error, Result};

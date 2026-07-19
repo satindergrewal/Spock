@@ -29,6 +29,8 @@ pub struct ProviderDef {
     pub client_id: &'static str,
     pub auth: AuthEndpoints,
     pub scope: Option<&'static str>,
+    /// When true, device authorization uses PKCE S256 (required by Qwen).
+    pub pkce: bool,
     pub default_base_url: &'static str,
     pub user_agent: &'static str,
     pub quirk: CompletionsQuirk,
@@ -57,6 +59,7 @@ pub const PROVIDERS: &[ProviderDef] = &[
             url: "https://auth.x.ai/.well-known/openid-configuration",
         },
         scope: Some("openid profile email offline_access grok-cli:access api:access"),
+        pkce: false,
         default_base_url: DEFAULT_XAI_BASE,
         user_agent: UA,
         quirk: CompletionsQuirk::Xai,
@@ -74,6 +77,7 @@ pub const PROVIDERS: &[ProviderDef] = &[
             token: "https://auth.kimi.com/api/oauth/token",
         },
         scope: None,
+        pkce: false,
         default_base_url: "https://api.kimi.com/coding/v1",
         user_agent: "KimiCLI/1.44.0",
         quirk: CompletionsQuirk::Kimi,
@@ -81,6 +85,28 @@ pub const PROVIDERS: &[ProviderDef] = &[
         env_token_keys: &["KIMI_TOKEN", "KIMI_API_KEY", "KIMI_CODE_TOKEN", "KIMI_CODER_API_KEY"],
         legacy_token_paths: &[".kimi/credentials/kimi-code.json"],
         header_style: HeaderStyle::KimiCode,
+    },
+    // Qwen Cloud subscription via chat.qwen.ai device flow (same client as qwen-code).
+    // Docs say free Qwen OAuth tier ended 2026-04-15; paid Qwen Cloud still uses this path.
+    // Token may include resource_url — Spock prefers that over default_base_url at request time.
+    ProviderDef {
+        id: "qwen",
+        label: "Qwen Cloud",
+        client_id: "f0304373b74a44d2b584a3fb70ca9e56",
+        auth: AuthEndpoints::Fixed {
+            device_auth: "https://chat.qwen.ai/api/v1/oauth2/device/code",
+            token: "https://chat.qwen.ai/api/v1/oauth2/token",
+        },
+        scope: Some("openid profile email model.completion"),
+        pkce: true,
+        // Fallback OpenAI-compat base; live token.resource_url usually overrides.
+        default_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        user_agent: UA,
+        quirk: CompletionsQuirk::Generic,
+        token_file: "oauth-qwen.json",
+        env_token_keys: &["QWEN_TOKEN", "QWEN_API_KEY", "DASHSCOPE_API_KEY"],
+        legacy_token_paths: &[".qwen/oauth_creds.json"],
+        header_style: HeaderStyle::Default,
     },
 ];
 
@@ -276,11 +302,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn providers_include_xai_and_kimi() {
+    fn providers_include_xai_kimi_qwen() {
         assert!(get_provider("xai").is_some());
         assert!(get_provider("KIMI").is_some());
+        assert!(get_provider("qwen").is_some());
+        assert!(get_provider("qwen").unwrap().pkce);
         assert!(get_provider("nope").is_none());
-        assert_eq!(list_providers().len(), 2);
+        assert_eq!(list_providers().len(), 3);
     }
 
     #[test]

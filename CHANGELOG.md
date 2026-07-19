@@ -5,13 +5,14 @@ All notable changes to Spock are documented here.
 ## [Unreleased]
 
 ### Added
-- **Generalized OAuth providers** — registry-driven `spock login|logout <provider>` / `spock providers` (xai, kimi); status + menus follow the table
+- **Generalized OAuth providers** — registry-driven `spock login|logout <provider>` / `spock providers` (xai, kimi, qwen); status + menus follow the table
 - Backend types: `oauth` / `api_key` / `anthropic` (Settings labels: **OAuth** / **API Key** / **Anthropic**)
 - **Kimi Code** OAuth (`provider = "kimi"`, `https://api.kimi.com/coding/v1`, KimiCLI UA + X-Msh headers)
-- Token files: `~/.config/spock/oauth-<provider>.json` (imports legacy grok-test / kimi-cli paths once; logout clears them)
+- **Qwen Cloud** OAuth (`provider = "qwen"`, chat.qwen.ai device flow + PKCE S256; uses token `resource_url` when present)
+- Token files: `~/.config/spock/oauth-<provider>.json` (imports legacy grok-test / kimi-cli / qwen-code paths once; logout clears them)
 
 ### Changed
-- Breaking: bare `spock login` removed — use `spock login xai` (or `kimi`)
+- Breaking: bare `spock login` removed — use `spock login xai` (or `kimi` / `qwen`)
 - Proxy never opens a browser mid-request; refresh is single-flight per provider
 - Long streaming generations: idle read/write timeouts (1h) instead of total 600s request caps; stream clients skip server-tools buffer path; backend map lock dropped before upstream I/O
 - macOS app: Local Network + Bonjour keys so LAN backends work from Spock.app

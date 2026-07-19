@@ -8,7 +8,7 @@
 #   api_key  — OpenAI Chat Completions compatible API + bearer key
 #   anthropic — Messages passthrough
 #
-# Login:  spock login <provider>     (xai, kimi)
+# Login:  spock login <provider>     (xai, kimi, qwen)
 # Logout: spock logout <provider>
 
 [server]
@@ -30,6 +30,14 @@ type = "oauth"
 provider = "kimi"
 # base_url = "https://api.kimi.com/coding/v1"
 # Priority: api_key → env KIMI_TOKEN → OAuth (spock login kimi)
+
+[backends.qwen]
+type = "oauth"
+provider = "qwen"
+# base_url fallback; live token resource_url usually overrides after login
+# base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# Priority: api_key → env QWEN_TOKEN/DASHSCOPE_API_KEY → OAuth (spock login qwen)
+# Models e.g. qwen3-max-preview / qwen3.5-plus — Fetch models after login
 
 [backends.ollama]
 type = "api_key"
