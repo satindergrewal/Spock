@@ -853,6 +853,12 @@ fn stream_anthropic(
     let mut finish: Option<String> = None;
     let mut usage = json!({});
     let mut mid_stream_err: Option<String> = None;
+    // OpenAI tool_calls[].index → Anthropic content block index.
+    // Qwen (and others) stream args across many deltas with empty id after the first
+    // chunk. Opening a new tool_use on every id/name presence fragments one Bash call
+    // into N broken blocks (Claude Code then runs empty/invalid commands).
+    let mut tool_block_by_tc_index: std::collections::HashMap<i64, i64> =
+        std::collections::HashMap::new();
 
     let buffered = BufReader::new(reader);
     for line in buffered.lines() {
@@ -976,7 +982,18 @@ fn stream_anthropic(
         if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
             for tc in tcs {
                 let fn_ = tc.get("function").cloned().unwrap_or(json!({}));
-                if tc.get("id").is_some() || fn_.get("name").is_some() {
+                let tc_index = tc
+                    .get("index")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let id_raw = tc.get("id").and_then(|t| t.as_str()).unwrap_or("");
+                let name_raw = fn_.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                // Start a new Anthropic tool_use block only once per OpenAI tool index.
+                // Later deltas for the same index only carry argument fragments (often
+                // with id:"" / no name) — must NOT open another block.
+                let need_start = !tool_block_by_tc_index.contains_key(&tc_index)
+                    && (!id_raw.is_empty() || !name_raw.is_empty());
+                if need_start {
                     if block.is_some() {
                         emit_sse(
                             stream,
@@ -986,12 +1003,12 @@ fn stream_anthropic(
                     }
                     index += 1;
                     block = Some("tool");
-                    let id = tc
-                        .get("id")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(new_tool_id);
-                    let name = fn_.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    tool_block_by_tc_index.insert(tc_index, index);
+                    let id = if id_raw.is_empty() {
+                        new_tool_id()
+                    } else {
+                        id_raw.to_string()
+                    };
                     emit_sse(
                         stream,
                         "content_block_start",
@@ -1001,12 +1018,17 @@ fn stream_anthropic(
                             "content_block": {
                                 "type": "tool_use",
                                 "id": id,
-                                "name": name,
+                                "name": name_raw,
                                 "input": {}
                             }
                         }),
                     )?;
                 }
+                let Some(&block_idx) = tool_block_by_tc_index.get(&tc_index) else {
+                    // Argument fragment before we ever saw id/name for this index —
+                    // shouldn't happen on well-formed streams; skip rather than invent.
+                    continue;
+                };
                 if let Some(args) = fn_.get("arguments").and_then(|a| a.as_str()) {
                     if !args.is_empty() {
                         emit_sse(
@@ -1014,7 +1036,7 @@ fn stream_anthropic(
                             "content_block_delta",
                             &json!({
                                 "type": "content_block_delta",
-                                "index": index,
+                                "index": block_idx,
                                 "delta": {"type": "input_json_delta", "partial_json": args}
                             }),
                         )?;
