@@ -446,6 +446,67 @@ fn searxng_search(base: &str, q: &str, max: usize) -> Result<Value> {
     Ok(json!(results))
 }
 
+/// Content blocks Claude Code's WebSearch client tool expects on the nested
+/// Messages response: `server_tool_use` + `web_search_tool_result` (content =
+/// array of `{title,url}` hits — optional `encrypted_content`/`page_age` ignored).
+/// A trailing plain-text block keeps webviews / transcript history readable.
+fn web_search_content_blocks(
+    tool_use_id: &str,
+    query: &str,
+    results: &Value,
+    display_text: &str,
+) -> Vec<Value> {
+    let hits: Vec<Value> = results
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    let url = r.get("url").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    if url.is_empty() && title.is_empty() {
+                        return None;
+                    }
+                    let mut hit = json!({
+                        "type": "web_search_result",
+                        "title": title,
+                        "url": url,
+                    });
+                    if let Some(s) = r.get("snippet").and_then(|t| t.as_str()) {
+                        if !s.is_empty() {
+                            hit.as_object_mut()
+                                .unwrap()
+                                .insert("encrypted_content".into(), json!(s));
+                        }
+                    }
+                    Some(hit)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let result_content = if hits.is_empty() {
+        // Claude Code path: non-array content is treated as error.
+        json!({"error_code": "no_results"})
+    } else {
+        Value::Array(hits)
+    };
+
+    vec![
+        json!({
+            "type": "server_tool_use",
+            "id": tool_use_id,
+            "name": "web_search",
+            "input": {"query": query}
+        }),
+        json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
+            "content": result_content
+        }),
+        json!({"type": "text", "text": display_text}),
+    ]
+}
+
 fn duckduckgo_search(q: &str, max: usize) -> Result<Value> {
     // Instant Answer API — limited but keyless; good enough for v1 emulation.
     let url = format!(
@@ -649,13 +710,12 @@ pub fn run_with_server_tools(
                 .unwrap_or("{}");
             let args: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
 
-            // Emit plain text blocks (not server_tool_use / advisor_tool_result).
-                // Claude Code CLI has AdvisorMessage; the VSCodium/VS Code webview
-                // (2.1.207) has no renderer for those types and prints
-                // "Unsupported content type: server_tool_use|advisor_tool_result".
-                // Text is rendered everywhere; the multi-round OAI tool loop still
-                // feeds the model the full review via role=tool messages.
-                let (tool_result_content, server_blocks) = match name {
+            // Emit blocks Claude Code already knows how to parse.
+            // - advisor: plain text (webview has no advisor_tool_result renderer).
+            // - web_search: real server_tool_use + web_search_tool_result so the
+            //   WebSearch client tool (nested Messages with web_search_20250305)
+            //   can extract {title,url} hits. Plain text alone leaves WebSearch empty.
+            let (tool_result_content, server_blocks) = match name {
                 "advisor" if want_advisor => {
                     let review = run_advisor_review(
                         state,
@@ -679,12 +739,14 @@ pub fn run_with_server_tools(
                         .to_string();
                     let results = run_web_search(web_cfg, &query)?;
                     let text = results.to_string();
+                    // Also keep a human-readable text block for webviews that only
+                    // render text (and for models reading history as plain content).
                     let display = if query.is_empty() {
                         format!("Web search results:\n{text}")
                     } else {
                         format!("Web search for “{query}”:\n{text}")
                     };
-                    let blocks = vec![json!({"type": "text", "text": display})];
+                    let blocks = web_search_content_blocks(&id, &query, &results, &display);
                     (text, blocks)
                 }
                 // Unreachable (filtered above) — defensive.
@@ -723,6 +785,31 @@ mod tests {
     fn detect_web_search() {
         let a = json!({"tools":[{"type":"web_search_20250305","name":"web_search"}]});
         assert!(request_has_web_search(&a));
+    }
+
+    #[test]
+    fn web_search_blocks_have_server_tool_shape() {
+        let results = json!([
+            {"title":"Rust","url":"https://rust-lang.org/","snippet":"safe systems"}
+        ]);
+        let blocks = web_search_content_blocks("call_1", "rust", &results, "display");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "server_tool_use");
+        assert_eq!(blocks[0]["name"], "web_search");
+        assert_eq!(blocks[0]["input"]["query"], "rust");
+        assert_eq!(blocks[1]["type"], "web_search_tool_result");
+        assert_eq!(blocks[1]["tool_use_id"], "call_1");
+        let hits = blocks[1]["content"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["url"], "https://rust-lang.org/");
+        assert_eq!(hits[0]["title"], "Rust");
+        assert_eq!(blocks[2]["type"], "text");
+    }
+
+    #[test]
+    fn web_search_blocks_empty_is_error_object() {
+        let blocks = web_search_content_blocks("c2", "q", &json!([]), "none");
+        assert_eq!(blocks[1]["content"]["error_code"], "no_results");
     }
 
     #[test]

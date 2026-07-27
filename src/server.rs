@@ -612,13 +612,12 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
         && crate::server_tools::request_has_advisor(&a))
         || (web_cfg.enabled && crate::server_tools::request_has_web_search(&a));
 
-    // CRITICAL: the server-tools multi-round path forces stream:false upstream and
-    // only emits SSE after the *entire* completion is done. On a slow LAN model
-    // (~11 tok/s, 10–25 min turns) Claude Code sees zero bytes for ~600s and
-    // reports "Request timed out" while llama-server is still generating.
-    // When the client asked for streaming, always use real incremental SSE.
-    // Advisor/web_search emulation still runs for non-stream clients.
-    let use_server_tools = use_server_tools && !do_stream;
+    // Server-tools MUST run for stream clients too. Claude Code WebSearch is a
+    // client tool that opens a *nested* streaming Messages call with
+    // tools:[{type:web_search_20250305}]. If we skip emulation on stream, the
+    // schema is stripped, the model never searches, and WebSearch returns empty.
+    // Upstream chat inside the loop stays non-stream; we still speak SSE to the
+    // client, with keepalives so slow LAN rounds don't trip client idle timeouts.
 
     eprintln!(
         "  route {} → {}:{} ({}){}",
@@ -630,7 +629,9 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
             CompletionsQuirk::Kimi => "kimi",
             CompletionsQuirk::Generic => "generic",
         },
-        if use_server_tools {
+        if use_server_tools && do_stream {
+            " [server-tools+stream]"
+        } else if use_server_tools {
             " [server-tools]"
         } else if do_stream {
             " [stream]"
@@ -639,9 +640,23 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
         }
     );
 
-    // Server-tool emulation runs a multi-round non-stream loop, then returns one Anthropic JSON
-    // (or a synthetic SSE of that JSON for stream clients).
+    // Server-tool emulation: multi-round non-stream upstream loop, then one
+    // Anthropic JSON (or synthetic SSE of that JSON for stream clients).
     if use_server_tools {
+        if do_stream {
+            return run_server_tools_streaming(
+                sock,
+                state,
+                &a,
+                oai,
+                &client_model,
+                include_thinking,
+                &advisor_cfg,
+                &web_cfg,
+                &be,
+                &env,
+            );
+        }
         match crate::server_tools::run_with_server_tools(
             state,
             &a,
@@ -653,17 +668,11 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
             &be,
             &env,
         ) {
-            Ok(resp) => {
-                if do_stream {
-                    return stream_json_as_anthropic_sse(sock, &resp);
-                }
-                return write_json(sock, 200, &resp);
-            }
-            Err(e) => return write_upstream_err(sock, state, e),
+            Ok(resp) => write_json(sock, 200, &resp),
+            Err(e) => write_upstream_err(sock, state, e),
         }
-    }
-
-    if !do_stream {
+    } else if !do_stream {
+        // fall through handled below — keep structure with early return above only for server tools stream
         match be.chat(&oai, false, &state.oauth) {
             Ok(UpstreamBody::Json(o)) => {
                 let resp = openai_to_anthropic(&o, &client_model, include_thinking);
@@ -689,10 +698,83 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
     }
 }
 
+/// Stream-client path for advisor/web_search: keepalive SSE while the multi-round
+/// upstream loop runs, then emit the final Anthropic message as SSE events.
+fn run_server_tools_streaming(
+    sock: &mut TcpStream,
+    state: &AppState,
+    a: &Value,
+    oai: Value,
+    client_model: &str,
+    include_thinking: bool,
+    advisor_cfg: &crate::server_tools::AdvisorConfig,
+    web_cfg: &crate::server_tools::WebSearchConfig,
+    be: &crate::backends::BackendHandle,
+    env: &EnvOverrides,
+) -> Result<()> {
+    write_sse_headers(sock)?;
+
+    // Background keepalives so Claude Code does not idle-timeout during long
+    // LAN rounds (search + model thinking with stream:false upstream).
+    let mut keepalive = sock.try_clone().ok();
+    if let Some(ref mut ks) = keepalive {
+        let _ = ks.set_write_timeout(Some(Duration::from_secs(5)));
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    let ping = std::thread::spawn(move || {
+        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(12));
+            if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if let Some(ref mut ks) = keepalive {
+                // SSE comment — ignored by clients, resets idle timers.
+                if write!(ks, ": spock-keepalive\n\n").is_err() || ks.flush().is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = crate::server_tools::run_with_server_tools(
+        state,
+        a,
+        oai,
+        client_model,
+        include_thinking,
+        advisor_cfg,
+        web_cfg,
+        be,
+        env,
+    );
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = ping.join();
+
+    match result {
+        Ok(resp) => stream_json_as_anthropic_sse_body(sock, &resp),
+        Err(e) => {
+            let msg = format!("spock server_tools: {e}");
+            state.record_upstream_error(502, &msg);
+            let (_st, err_body) = anthropic_error(502, "api_error", &msg);
+            let _ = emit_sse(sock, "error", &err_body);
+            let _ = emit_sse(sock, "message_stop", &json!({"type": "message_stop"}));
+            Ok(())
+        }
+    }
+}
 
 /// Emit a completed Anthropic message as SSE events (for server-tool multi-round results).
+/// Writes response headers first.
+#[allow(dead_code)] // kept for non-keepalive callers / tests
 fn stream_json_as_anthropic_sse(stream: &mut TcpStream, resp: &Value) -> Result<()> {
     write_sse_headers(stream)?;
+    stream_json_as_anthropic_sse_body(stream, resp)
+}
+
+/// Body-only SSE emission — headers already written (e.g. keepalive path).
+fn stream_json_as_anthropic_sse_body(stream: &mut TcpStream, resp: &Value) -> Result<()> {
     let msg_id = resp
         .get("id")
         .and_then(|i| i.as_str())

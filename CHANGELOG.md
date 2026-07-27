@@ -20,6 +20,7 @@ All notable changes to Spock are documented here.
 - Product framing: multi-backend Anthropic Messages proxy (not Grok-only)
 
 ### Fixed
+- **WebSearch on stream**: Claude Code nested `web_search_20250305` calls now run Spock server-tool emulation (was skipped when `stream:true`); emit real `server_tool_use` + `web_search_tool_result` blocks; SSE keepalives during long rounds
 - **Login…** from the menu bar runs as a direct child process (no Terminal/AppleScript stall)
 - Menu + CLI surface already-logged-in OAuth state clearly
 - Slow LAN (llama-server) streams no longer die at ~10 minutes while the backend still generates
