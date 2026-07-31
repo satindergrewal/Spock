@@ -85,11 +85,7 @@ pub fn sanitize_upstream(req: &mut Value, is_reasoning: bool) {
         obj.remove("presence_penalty");
         obj.remove("frequency_penalty");
         // Safety net: never send reasoning_effort "none" (xAI 400).
-        if obj
-            .get("reasoning_effort")
-            .and_then(|v| v.as_str())
-            == Some("none")
-        {
+        if obj.get("reasoning_effort").and_then(|v| v.as_str()) == Some("none") {
             obj.remove("reasoning_effort");
         }
     }

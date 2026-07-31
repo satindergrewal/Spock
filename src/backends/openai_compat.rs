@@ -40,6 +40,7 @@ fn apply_headers(mut req: ureq::Request, headers: &BTreeMap<String, String>) -> 
     req
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn chat(
     base_url: &str,
     api_key: Option<&str>,
@@ -172,13 +173,7 @@ pub fn list_models(
 ) -> Result<Vec<String>> {
     let base = base_url.trim_end_matches('/');
     let models_err = match get_json(
-        base_url,
-        api_key,
-        "/models",
-        headers,
-        None,
-        None,
-        user_agent,
+        base_url, api_key, "/models", headers, None, None, user_agent,
     ) {
         Ok(v) => {
             let ids = extract_openai_model_ids(&v);
@@ -187,7 +182,7 @@ pub fn list_models(
             }
             None
         }
-        Err(Error::Http(code, ref body)) if code == 404 => Some(format!(
+        Err(Error::Http(404, ref body)) => Some(format!(
             "GET {base}/models → 404: {}",
             extract_simple_err(body)
         )),
@@ -201,7 +196,11 @@ pub fn list_models(
     let root = ollama_root(base_url);
     let tags_url = format!("{root}/api/tags");
     let agent = agent(120, user_agent.unwrap_or(UA));
-    match agent.get(&tags_url).set("Accept", "application/json").call() {
+    match agent
+        .get(&tags_url)
+        .set("Accept", "application/json")
+        .call()
+    {
         Ok(resp) => {
             let v: Value = resp.into_json()?;
             let mut ids = extract_ollama_tag_ids(&v);

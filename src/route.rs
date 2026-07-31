@@ -138,7 +138,8 @@ mod tests {
         let mut backends = BTreeMap::new();
         backends.insert(
             "xai".into(),
-            BackendConfig::Oauth { provider: "xai".into(),
+            BackendConfig::Oauth {
+                provider: "xai".into(),
                 base_url: "https://api.x.ai/v1".into(),
                 api_key: None,
             },

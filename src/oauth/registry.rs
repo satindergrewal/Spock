@@ -82,7 +82,12 @@ pub const PROVIDERS: &[ProviderDef] = &[
         user_agent: "KimiCLI/1.44.0",
         quirk: CompletionsQuirk::Kimi,
         token_file: "oauth-kimi.json",
-        env_token_keys: &["KIMI_TOKEN", "KIMI_API_KEY", "KIMI_CODE_TOKEN", "KIMI_CODER_API_KEY"],
+        env_token_keys: &[
+            "KIMI_TOKEN",
+            "KIMI_API_KEY",
+            "KIMI_CODE_TOKEN",
+            "KIMI_CODER_API_KEY",
+        ],
         legacy_token_paths: &[".kimi/credentials/kimi-code.json"],
         header_style: HeaderStyle::KimiCode,
     },
@@ -235,15 +240,15 @@ fn os_info_lite() -> (String, String) {
         .unwrap_or_else(|| "unknown".into());
     #[cfg(target_os = "macos")]
     {
-        return (format!("macOS {release} {machine}"), release);
+        (format!("macOS {release} {machine}"), release)
     }
     #[cfg(target_os = "linux")]
     {
-        return (format!("Linux {release} {machine}"), release);
+        (format!("Linux {release} {machine}"), release)
     }
     #[cfg(target_os = "windows")]
     {
-        return (format!("Windows {release} {machine}"), release);
+        (format!("Windows {release} {machine}"), release)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -321,8 +326,14 @@ mod tests {
             os_version: "25".into(),
         };
         let h = request_headers(p, &ctx);
-        assert_eq!(h.get("User-Agent").map(String::as_str), Some("KimiCLI/1.44.0"));
-        assert_eq!(h.get("X-Msh-Platform").map(String::as_str), Some("kimi_cli"));
+        assert_eq!(
+            h.get("User-Agent").map(String::as_str),
+            Some("KimiCLI/1.44.0")
+        );
+        assert_eq!(
+            h.get("X-Msh-Platform").map(String::as_str),
+            Some("kimi_cli")
+        );
         assert_eq!(h.get("X-Msh-Device-Id").map(String::as_str), Some("abc"));
     }
 }

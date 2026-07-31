@@ -249,8 +249,7 @@ fn convert_messages(a: &Value) -> Vec<Value> {
                         // silently dropped and models hallucinated screenshot contents.
                         let empty = Value::String(String::new());
                         let content = b.get("content").unwrap_or(&empty);
-                        let is_error =
-                            b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                         tool_results.push(json!({
                             "role": "tool",
                             "tool_call_id": b.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or(""),
@@ -339,9 +338,11 @@ fn apply_tools_and_choice(a: &Value, obj: &mut Map<String, Value>) {
             Some("tool") => {
                 let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 // If forced tool was stripped (server tool), drop tool_choice entirely.
-                if name.is_empty() || !oai_tools.iter().any(|t| {
-                    t.pointer("/function/name").and_then(|n| n.as_str()) == Some(name)
-                }) {
+                if name.is_empty()
+                    || !oai_tools
+                        .iter()
+                        .any(|t| t.pointer("/function/name").and_then(|n| n.as_str()) == Some(name))
+                {
                     return;
                 }
                 obj.insert(
@@ -473,10 +474,7 @@ fn apply_clear_thinking(a: &mut Value, edit: &Value) {
 
 fn apply_clear_tool_uses(a: &mut Value, edit: &Value) {
     // Optional trigger: only run when estimated input tokens >= value.
-    if let Some(trigger) = edit
-        .pointer("/trigger/value")
-        .and_then(|v| v.as_u64())
-    {
+    if let Some(trigger) = edit.pointer("/trigger/value").and_then(|v| v.as_u64()) {
         let est = count_tokens_estimate(a);
         if est < trigger {
             return;
@@ -526,7 +524,11 @@ fn apply_clear_tool_uses(a: &mut Value, edit: &Value) {
         if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
             for b in arr {
                 if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                    let id = b.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    let id = b
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let name = b
                         .get("name")
                         .and_then(|n| n.as_str())
@@ -564,7 +566,11 @@ fn apply_clear_tool_uses(a: &mut Value, edit: &Value) {
             continue;
         };
         for b in arr.iter_mut() {
-            let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            let ty = b
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
             if ty == "tool_result" {
                 let id = b
                     .get("tool_use_id")
@@ -673,11 +679,7 @@ pub fn anthropic_to_openai(
     } else if family == CompletionsQuirk::Kimi {
         // Drop effort "none" if present; keep stop for generic-like behavior.
         if let Some(obj) = req.as_object_mut() {
-            if obj
-                .get("reasoning_effort")
-                .and_then(|v| v.as_str())
-                == Some("none")
-            {
+            if obj.get("reasoning_effort").and_then(|v| v.as_str()) == Some("none") {
                 obj.remove("reasoning_effort");
             }
         }

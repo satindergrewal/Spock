@@ -18,6 +18,8 @@ pub enum UpstreamBody {
 /// cannot be blocked by hour-long LAN generations.
 #[derive(Clone)]
 pub struct BackendHandle {
+    /// Backend map key (profile route target). Kept for diagnostics / future admin.
+    #[allow(dead_code)]
     pub name: String,
     pub quirk: CompletionsQuirk,
     pub config: BackendConfig,
@@ -32,10 +34,6 @@ impl BackendHandle {
         }
     }
 
-    pub fn base_url(&self) -> &str {
-        self.config.base_url()
-    }
-
     pub fn family_name(&self) -> &'static str {
         match &self.config {
             BackendConfig::Oauth { .. } => "oauth",
@@ -48,7 +46,10 @@ impl BackendHandle {
         matches!(self.config, BackendConfig::Anthropic { .. })
     }
 
-    fn oauth_bearer(&self, store: &OauthStore) -> Result<(String, BTreeMap<String, String>, String)> {
+    fn oauth_bearer(
+        &self,
+        store: &OauthStore,
+    ) -> Result<(String, BTreeMap<String, String>, String)> {
         let (provider_id, api_key) = match &self.config {
             BackendConfig::Oauth {
                 provider, api_key, ..

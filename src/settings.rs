@@ -797,6 +797,31 @@ fn _unused() {
     let _ = json!({});
 }
 
+fn headers_to_text(h: &BTreeMap<String, String>) -> String {
+    h.iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn text_to_headers(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() {
+                out.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,7 +834,10 @@ mod tests {
         m.insert("X-Title".into(), "Spock".into());
         let text = headers_to_text(&m);
         let back = text_to_headers(&text);
-        assert_eq!(back.get("HTTP-Referer").map(String::as_str), Some("https://x.test"));
+        assert_eq!(
+            back.get("HTTP-Referer").map(String::as_str),
+            Some("https://x.test")
+        );
         assert_eq!(back.get("X-Title").map(String::as_str), Some("Spock"));
     }
 
@@ -834,30 +862,4 @@ mod tests {
             Some("ollama:qwen2.5:14b")
         );
     }
-}
-
-
-fn headers_to_text(h: &BTreeMap<String, String>) -> String {
-    h.iter()
-        .map(|(k, v)| format!("{k}: {v}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn text_to_headers(text: &str) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            let k = k.trim();
-            let v = v.trim();
-            if !k.is_empty() {
-                out.insert(k.to_string(), v.to_string());
-            }
-        }
-    }
-    out
 }

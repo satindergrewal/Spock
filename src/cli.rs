@@ -62,11 +62,7 @@ pub fn parse(args: &[String]) -> Command {
         "app" => Command::App,
         "login" => {
             let no_open = args.iter().any(|a| a == "--no-open");
-            let provider = args
-                .iter()
-                .skip(1)
-                .find(|a| !a.starts_with('-'))
-                .cloned();
+            let provider = args.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
             match provider {
                 Some(p) => Command::Login {
                     provider: p,
@@ -83,11 +79,7 @@ pub fn parse(args: &[String]) -> Command {
         }
         "logout" => {
             let all = args.iter().any(|a| a == "--all");
-            let provider = args
-                .iter()
-                .skip(1)
-                .find(|a| !a.starts_with('-'))
-                .cloned();
+            let provider = args.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
             if !all && provider.is_none() {
                 eprintln!(
                     "usage: spock logout <provider> | spock logout --all\n  providers: {}",

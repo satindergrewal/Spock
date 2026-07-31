@@ -1,9 +1,9 @@
-mod oauth;
 mod backends;
 mod cli;
 mod config;
 mod error;
 mod models;
+mod oauth;
 mod route;
 mod server;
 mod server_tools;
@@ -13,11 +13,9 @@ mod translate;
 mod tray;
 
 use cli::{parse, print_help, Command};
-use config::{
-    config_path, Config, CHAT_DEFAULT_MODEL, DEFAULT_XAI_BASE, UA, VERSION,
-};
-use oauth::{AccessMode, OauthStore};
+use config::{config_path, Config, CHAT_DEFAULT_MODEL, DEFAULT_XAI_BASE, UA, VERSION};
 use error::Result;
+use oauth::{AccessMode, OauthStore};
 use serde_json::json;
 use state::AppState;
 use std::fs::OpenOptions;
@@ -69,7 +67,10 @@ fn run() -> Result<()> {
                         p.label,
                         tokens.access_token.chars().take(12).collect::<String>()
                     );
-                    println!("  Logout first (`spock logout {}`) for a fresh device login.", p.id);
+                    println!(
+                        "  Logout first (`spock logout {}`) for a fresh device login.",
+                        p.id
+                    );
                     return Ok(());
                 }
             }
@@ -248,7 +249,12 @@ extern "C" {
 fn cmd_chat(model: Option<String>, prompt: String) -> Result<()> {
     let model = model.unwrap_or_else(|| CHAT_DEFAULT_MODEL.to_string());
     let store = OauthStore::default();
-    let token = oauth::access_token(&store, "xai", None, AccessMode::Login { open_browser: true })?;
+    let token = oauth::access_token(
+        &store,
+        "xai",
+        None,
+        AccessMode::Login { open_browser: true },
+    )?;
     let base = std::env::var("XAI_API_BASE").unwrap_or_else(|_| DEFAULT_XAI_BASE.to_string());
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
     println!("  Model: {model}\n  Prompt: {prompt}\n");
@@ -334,7 +340,9 @@ fn cmd_status() -> Result<()> {
         let key_set = cfg.oauth_config_key_set(p.id);
         let (present, source) = oauth::status_for_provider(p.id, key_set);
         let extra = match &source {
-            oauth::AuthSource::Oauth { expires_at: Some(e) } => format!(" expires_at={e:.0}"),
+            oauth::AuthSource::Oauth {
+                expires_at: Some(e),
+            } => format!(" expires_at={e:.0}"),
             _ => String::new(),
         };
         println!(

@@ -243,13 +243,7 @@ impl OauthStore {
     fn memory_set(&self, provider_id: &str, access: String, expires_at: Option<f64>) {
         let until = expires_at.unwrap_or(now_secs() + 300.0) - 120.0;
         if let Ok(mut g) = self.memory.lock() {
-            g.insert(
-                provider_id.to_string(),
-                MemEntry {
-                    access,
-                    until,
-                },
-            );
+            g.insert(provider_id.to_string(), MemEntry { access, until });
         }
     }
 
@@ -268,11 +262,7 @@ impl OauthStore {
 
     /// Cache snapshot used after login/refresh.
     pub fn put_tokens(&self, provider_id: &str, tokens: &TokenSet) {
-        self.memory_set(
-            provider_id,
-            tokens.access_token.clone(),
-            tokens.expires_at,
-        );
+        self.memory_set(provider_id, tokens.access_token.clone(), tokens.expires_at);
     }
 }
 
@@ -296,10 +286,7 @@ impl AuthSource {
     }
 }
 
-pub fn status_for_provider(
-    provider_id: &str,
-    config_api_key_set: bool,
-) -> (bool, AuthSource) {
+pub fn status_for_provider(provider_id: &str, config_api_key_set: bool) -> (bool, AuthSource) {
     let Some(p) = get_provider(provider_id) else {
         return (false, AuthSource::None);
     };
@@ -331,7 +318,8 @@ mod tests {
             access_token: "x".into(),
             ..Default::default()
         };
-        t.extra.insert("resource_url".into(), json!("portal.qwen.ai/api"));
+        t.extra
+            .insert("resource_url".into(), json!("portal.qwen.ai/api"));
         assert_eq!(
             resource_base_url(&t).as_deref(),
             Some("https://portal.qwen.ai/api/v1")
@@ -344,4 +332,3 @@ mod tests {
         );
     }
 }
-

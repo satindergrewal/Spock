@@ -124,10 +124,7 @@ fn resolve_endpoints(provider: &ProviderDef, agent: &ureq::Agent) -> Result<Endp
                 token: d.token_endpoint,
             })
         }
-        AuthEndpoints::Fixed {
-            device_auth,
-            token,
-        } => Ok(Endpoints {
+        AuthEndpoints::Fixed { device_auth, token } => Ok(Endpoints {
             device_authorization: device_auth.to_string(),
             token: token.to_string(),
         }),
@@ -173,12 +170,18 @@ fn token_set_from_json(tok: Value) -> Result<TokenSet> {
     let expires_at_abs = tok
         .get("expires_at")
         .and_then(|v| v.as_f64())
-        .or_else(|| tok.get("expires_at").and_then(|v| v.as_i64()).map(|i| i as f64))
+        .or_else(|| {
+            tok.get("expires_at")
+                .and_then(|v| v.as_i64())
+                .map(|i| i as f64)
+        })
         // Qwen oauth_creds.json uses expiry_date as ms epoch.
         .or_else(|| {
-            tok.get("expiry_date")
-                .and_then(|v| v.as_f64())
-                .or_else(|| tok.get("expiry_date").and_then(|v| v.as_i64()).map(|i| i as f64))
+            tok.get("expiry_date").and_then(|v| v.as_f64()).or_else(|| {
+                tok.get("expiry_date")
+                    .and_then(|v| v.as_i64())
+                    .map(|i| i as f64)
+            })
         })
         .map(crate::oauth::store::normalize_expires_at);
     let expires_at = expires_in
@@ -234,12 +237,7 @@ pub fn device_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
         form.push(("code_challenge", ch));
         form.push(("code_challenge_method", "S256"));
     }
-    let (status, dc) = form_post(
-        &agent,
-        &endpoints.device_authorization,
-        &form,
-        &headers,
-    )?;
+    let (status, dc) = form_post(&agent, &endpoints.device_authorization, &form, &headers)?;
     if status != 200 {
         return Err(Error::Auth(format!(
             "{} device code request failed ({status}): {dc}",
@@ -258,10 +256,7 @@ pub fn device_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
         .ok_or_else(|| Error::Auth("missing verification_uri".into()))?
         .to_string();
 
-    eprintln!(
-        "\n  {} — open this URL in your browser:\n",
-        provider.label
-    );
+    eprintln!("\n  {} — open this URL in your browser:\n", provider.label);
     eprintln!("    {url}");
     eprintln!("\n  Code: {user_code}\n");
     if open {

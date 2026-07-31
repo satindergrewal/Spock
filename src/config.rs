@@ -32,6 +32,7 @@ pub fn config_dir() -> PathBuf {
 }
 
 /// Legacy xAI token path (Python-era); still used as import source.
+#[allow(dead_code)]
 pub fn legacy_xai_auth_path() -> PathBuf {
     home_dir().join(".config/grok-test/auth.json")
 }
@@ -291,6 +292,7 @@ impl BackendConfig {
         }
     }
 
+    #[allow(dead_code)] // used by tests + status CLI paths
     pub fn oauth_provider(&self) -> Option<&str> {
         match self {
             BackendConfig::Oauth { provider, .. } => Some(provider.as_str()),
@@ -340,11 +342,7 @@ impl BackendConfig {
                 api_key_env,
                 ..
             } => {
-                if let Some(k) = api_key
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
+                if let Some(k) = api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     return Some(k.to_string());
                 }
                 if let Some(env_name) = api_key_env
@@ -383,11 +381,7 @@ impl BackendConfig {
                 api_key_env,
                 ..
             } => {
-                if let Some(k) = api_key
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
+                if let Some(k) = api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     return Some(k.to_string());
                 }
                 if let Some(env_name) = api_key_env
@@ -656,7 +650,10 @@ default = "xai:grok-4.5"
         assert_eq!(cfg.backends["xai"].oauth_provider(), Some("xai"));
         assert_eq!(cfg.backends["kimi"].oauth_provider(), Some("kimi"));
         assert_eq!(cfg.backends["ollama"].kind_name(), "api_key");
-        assert_eq!(cfg.backends["kimi"].base_url(), "https://api.kimi.com/coding/v1");
+        assert_eq!(
+            cfg.backends["kimi"].base_url(),
+            "https://api.kimi.com/coding/v1"
+        );
     }
 
     #[test]

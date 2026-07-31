@@ -2,12 +2,12 @@
 //! Spock-only — no Claude Code / VSCode changes.
 
 use crate::backends::{get_backend, BackendHandle, UpstreamBody};
+use crate::config::EnvOverrides;
 use crate::config::UA;
 use crate::error::{Error, Result};
 use crate::route;
 use crate::state::AppState;
 use crate::translate::openai_to_anthropic;
-use crate::config::EnvOverrides;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -96,10 +96,20 @@ impl WebSearchConfig {
     }
 
     pub fn resolve_key(&self) -> Option<String> {
-        if let Some(k) = self.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(k) = self
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             return Some(k.to_string());
         }
-        if let Some(env) = self.api_key_env.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(env) = self
+            .api_key_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             if let Ok(v) = std::env::var(env) {
                 let v = v.trim().to_string();
                 if !v.is_empty() {
@@ -166,30 +176,26 @@ pub fn request_has_web_search(a: &Value) -> bool {
 }
 
 pub fn advisor_model_from_request(a: &Value) -> Option<String> {
-    a.get("tools")
-        .and_then(|t| t.as_array())
-        .and_then(|arr| {
-            arr.iter().find_map(|t| {
-                if t.get("type").and_then(|x| x.as_str()) == Some("advisor_20260301")
-                    || t.get("name").and_then(|x| x.as_str()) == Some("advisor")
-                {
-                    t.get("model")
-                        .and_then(|m| m.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
+    a.get("tools").and_then(|t| t.as_array()).and_then(|arr| {
+        arr.iter().find_map(|t| {
+            if t.get("type").and_then(|x| x.as_str()) == Some("advisor_20260301")
+                || t.get("name").and_then(|x| x.as_str()) == Some("advisor")
+            {
+                t.get("model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
         })
+    })
 }
 
 /// Inject normal function tools so OpenAI-compat models can "call" server tools.
-pub fn inject_emulated_function_tools(
-    oai: &mut Value,
-    want_advisor: bool,
-    want_web_search: bool,
-) {
-    let Some(obj) = oai.as_object_mut() else { return };
+pub fn inject_emulated_function_tools(oai: &mut Value, want_advisor: bool, want_web_search: bool) {
+    let Some(obj) = oai.as_object_mut() else {
+        return;
+    };
     let mut tools = obj
         .get("tools")
         .and_then(|t| t.as_array())
@@ -197,9 +203,9 @@ pub fn inject_emulated_function_tools(
         .unwrap_or_default();
 
     if want_advisor
-        && !tools.iter().any(|t| {
-            t.pointer("/function/name").and_then(|n| n.as_str()) == Some("advisor")
-        })
+        && !tools
+            .iter()
+            .any(|t| t.pointer("/function/name").and_then(|n| n.as_str()) == Some("advisor"))
     {
         tools.push(json!({
             "type": "function",
@@ -211,9 +217,9 @@ pub fn inject_emulated_function_tools(
         }));
     }
     if want_web_search
-        && !tools.iter().any(|t| {
-            t.pointer("/function/name").and_then(|n| n.as_str()) == Some("web_search")
-        })
+        && !tools
+            .iter()
+            .any(|t| t.pointer("/function/name").and_then(|n| n.as_str()) == Some("web_search"))
     {
         tools.push(json!({
             "type": "function",
@@ -332,7 +338,7 @@ pub fn run_web_search(cfg: &WebSearchConfig, query: &str) -> Result<Value> {
     if q.is_empty() {
         return Err(Error::Msg("web_search: empty query".into()));
     }
-    let max = cfg.max_results.max(1).min(10) as usize;
+    let max = cfg.max_results.clamp(1, 10) as usize;
     let provider = cfg.provider.to_ascii_lowercase();
     let key = cfg.resolve_key();
 
@@ -376,7 +382,9 @@ fn brave_search(key: &str, q: &str, max: usize) -> Result<Value> {
         .set("X-Subscription-Token", key)
         .call()
         .map_err(|e| Error::Msg(format!("brave search: {e}")))?;
-    let v: Value = resp.into_json().map_err(|e| Error::Msg(format!("brave json: {e}")))?;
+    let v: Value = resp
+        .into_json()
+        .map_err(|e| Error::Msg(format!("brave json: {e}")))?;
     let mut results = Vec::new();
     if let Some(arr) = v.pointer("/web/results").and_then(|r| r.as_array()) {
         for r in arr.iter().take(max) {
@@ -398,7 +406,9 @@ fn serper_search(key: &str, q: &str, max: usize) -> Result<Value> {
         .set("X-API-KEY", key)
         .send_json(body)
         .map_err(|e| Error::Msg(format!("serper search: {e}")))?;
-    let v: Value = resp.into_json().map_err(|e| Error::Msg(format!("serper json: {e}")))?;
+    let v: Value = resp
+        .into_json()
+        .map_err(|e| Error::Msg(format!("serper json: {e}")))?;
     let mut results = Vec::new();
     if let Some(arr) = v.get("organic").and_then(|r| r.as_array()) {
         for r in arr.iter().take(max) {
@@ -414,10 +424,7 @@ fn serper_search(key: &str, q: &str, max: usize) -> Result<Value> {
 
 fn searxng_search(base: &str, q: &str, max: usize) -> Result<Value> {
     let base = base.trim_end_matches('/');
-    let url = format!(
-        "{base}/search?q={}&format=json",
-        urlencoding_lite(q)
-    );
+    let url = format!("{base}/search?q={}&format=json", urlencoding_lite(q));
     let resp = agent()
         .get(&url)
         .set("Accept", "application/json")
@@ -461,8 +468,16 @@ fn web_search_content_blocks(
         .map(|arr| {
             arr.iter()
                 .filter_map(|r| {
-                    let title = r.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                    let url = r.get("url").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    let title = r
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let url = r
+                        .get("url")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if url.is_empty() && title.is_empty() {
                         return None;
                     }
@@ -588,6 +603,7 @@ fn urlencoding_lite(s: &str) -> String {
 /// Critical: client tools (Read, Bash, …) are NOT executed by Spock. If the model
 /// calls any client tool, we return that turn to Claude Code so its tool runner
 /// can execute it. We only loop when the model calls advisor / web_search.
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_server_tools(
     state: &AppState,
     anthropic_req: &Value,
@@ -632,10 +648,7 @@ pub fn run_with_server_tools(
             }
         };
 
-        let choice = resp
-            .pointer("/choices/0")
-            .cloned()
-            .unwrap_or(json!({}));
+        let choice = resp.pointer("/choices/0").cloned().unwrap_or(json!({}));
         let msg = choice.get("message").cloned().unwrap_or(json!({}));
         let tool_calls = msg
             .get("tool_calls")
@@ -666,8 +679,8 @@ pub fn run_with_server_tools(
                 .pointer("/function/name")
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            let is_server = (name == "advisor" && want_advisor)
-                || (name == "web_search" && want_web);
+            let is_server =
+                (name == "advisor" && want_advisor) || (name == "web_search" && want_web);
             if is_server {
                 server_calls.push(tc);
             } else {

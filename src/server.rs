@@ -225,7 +225,6 @@ fn health_json(state: &AppState) -> Result<Value> {
     }))
 }
 
-
 /// Clone a backend handle and drop the map lock immediately so long upstream
 /// chats (LAN llama-server) cannot block config Save / reload / other writers.
 fn take_backend(state: &AppState, name: &str) -> Result<crate::backends::BackendHandle> {
@@ -318,10 +317,14 @@ fn handle_admin_status(stream: &mut TcpStream, state: &AppState) -> Result<()> {
             "source": source.as_str(),
             "label": p.label,
         });
-        if let crate::oauth::AuthSource::Oauth { expires_at } = source {
-            if let Some(exp) = expires_at {
-                entry.as_object_mut().unwrap().insert("expires_at".into(), json!(exp));
-            }
+        if let crate::oauth::AuthSource::Oauth {
+            expires_at: Some(exp),
+        } = source
+        {
+            entry
+                .as_object_mut()
+                .unwrap()
+                .insert("expires_at".into(), json!(exp));
         }
         oauth.insert(p.id.to_string(), entry);
     }
@@ -382,8 +385,6 @@ fn handle_admin_logout(stream: &mut TcpStream, state: &AppState, body: Value) ->
         Err(e) => write_json(stream, 400, &json!({"ok": false, "error": e.to_string()})),
     }
 }
-
-
 
 /// GET /spock/v1/backends/{name}/models — discover models for Settings pickers.
 fn handle_admin_backend_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result<()> {
@@ -608,8 +609,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
             max_results: c.web_search.max_results,
         }
     };
-    let use_server_tools = (advisor_cfg.enabled
-        && crate::server_tools::request_has_advisor(&a))
+    let use_server_tools = (advisor_cfg.enabled && crate::server_tools::request_has_advisor(&a))
         || (web_cfg.enabled && crate::server_tools::request_has_web_search(&a));
 
     // Server-tools MUST run for stream clients too. Claude Code WebSearch is a
@@ -700,6 +700,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
 
 /// Stream-client path for advisor/web_search: keepalive SSE while the multi-round
 /// upstream loop runs, then emit the final Anthropic message as SSE events.
+#[allow(clippy::too_many_arguments)]
 fn run_server_tools_streaming(
     sock: &mut TcpStream,
     state: &AppState,
@@ -888,7 +889,10 @@ fn stream_json_as_anthropic_sse_body(stream: &mut TcpStream, resp: &Value) -> Re
         .get("stop_reason")
         .cloned()
         .unwrap_or(json!("end_turn"));
-    let usage = resp.get("usage").cloned().unwrap_or(json!({"input_tokens":0,"output_tokens":0}));
+    let usage = resp
+        .get("usage")
+        .cloned()
+        .unwrap_or(json!({"input_tokens":0,"output_tokens":0}));
     emit_sse(
         stream,
         "message_delta",
@@ -1064,10 +1068,7 @@ fn stream_anthropic(
         if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
             for tc in tcs {
                 let fn_ = tc.get("function").cloned().unwrap_or(json!({}));
-                let tc_index = tc
-                    .get("index")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                let tc_index = tc.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                 let id_raw = tc.get("id").and_then(|t| t.as_str()).unwrap_or("");
                 let name_raw = fn_.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 // Start a new Anthropic tool_use block only once per OpenAI tool index.
@@ -1262,9 +1263,7 @@ fn label_mid_stream_upstream_error(raw: &str) -> String {
         || lower.contains("finding less tool calls")
         || lower.contains("tool call mismatch")
     {
-        return format!(
-            "upstream stream error [llama-server tool-call parser, not Spock]: {raw}"
-        );
+        return format!("upstream stream error [llama-server tool-call parser, not Spock]: {raw}");
     }
     format!("upstream stream error: {raw}")
 }
@@ -1324,76 +1323,14 @@ pub(crate) fn classify_upstream_http(code: u16, raw: &str) -> (u16, &'static str
     }
 
     (
-        if (500..600).contains(&code) { code } else { 502 },
+        if (500..600).contains(&code) {
+            code
+        } else {
+            502
+        },
         "api_error",
         format!("Spock upstream {code}: {raw}"),
     )
-}
-
-#[cfg(test)]
-mod upstream_err_tests {
-    use super::{classify_upstream_http, label_mid_stream_upstream_error};
-
-    #[test]
-    fn llama_tool_call_diff_is_labeled_upstream() {
-        let msg = label_mid_stream_upstream_error(
-            "Invalid diff: now finding less tool calls!\n  Previous (1):\n",
-        );
-        assert!(msg.contains("llama-server tool-call parser"), "{msg}");
-        assert!(msg.contains("not Spock"), "{msg}");
-        assert!(msg.contains("Invalid diff"), "{msg}");
-    }
-
-    #[test]
-    fn generic_mid_stream_error_unchanged_prefix() {
-        let msg = label_mid_stream_upstream_error("connection reset by peer");
-        assert_eq!(msg, "upstream stream error: connection reset by peer");
-    }
-
-    #[test]
-    fn quota_body_becomes_loud_502() {
-        let (st, ty, msg) = classify_upstream_http(
-            403,
-            "You have exceeded your SuperGrok usage limit. Please add credits.",
-        );
-        assert_eq!(st, 502);
-        assert_eq!(ty, "rate_limit_error");
-        assert!(msg.contains("quota_or_billing"), "{msg}");
-        assert!(msg.contains("NOT Anthropic") || msg.contains("not Anthropic"), "{msg}");
-        assert!(msg.contains("SuperGrok") || msg.contains("credits"), "{msg}");
-    }
-
-    #[test]
-    fn plain_401_not_anthropic_login() {
-        let (st, ty, msg) = classify_upstream_http(401, "Invalid API key");
-        assert_eq!(st, 502);
-        assert_eq!(ty, "authentication_error");
-        assert!(msg.contains("NOT Anthropic login"), "{msg}");
-    }
-
-    #[test]
-    fn payment_required_402() {
-        let (st, ty, msg) = classify_upstream_http(402, "Payment Required");
-        assert_eq!(st, 502);
-        assert_eq!(ty, "rate_limit_error");
-        assert!(msg.contains("402"), "{msg}");
-    }
-
-    #[test]
-    fn generic_500_passthrough_status() {
-        let (st, ty, msg) = classify_upstream_http(503, "backend down");
-        assert_eq!(st, 503);
-        assert_eq!(ty, "api_error");
-        assert!(msg.contains("503"), "{msg}");
-    }
-
-    #[test]
-    fn rate_limit_429() {
-        let (st, ty, msg) = classify_upstream_http(429, "Too Many Requests");
-        assert_eq!(st, 502);
-        assert_eq!(ty, "rate_limit_error");
-        assert!(msg.contains("429"), "{msg}");
-    }
 }
 
 fn extract_err_msg(body: &Value) -> String {
@@ -1438,4 +1375,76 @@ fn urlencoding_decode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod upstream_err_tests {
+    use super::{classify_upstream_http, label_mid_stream_upstream_error};
+
+    #[test]
+    fn llama_tool_call_diff_is_labeled_upstream() {
+        let msg = label_mid_stream_upstream_error(
+            "Invalid diff: now finding less tool calls!\n  Previous (1):\n",
+        );
+        assert!(msg.contains("llama-server tool-call parser"), "{msg}");
+        assert!(msg.contains("not Spock"), "{msg}");
+        assert!(msg.contains("Invalid diff"), "{msg}");
+    }
+
+    #[test]
+    fn generic_mid_stream_error_unchanged_prefix() {
+        let msg = label_mid_stream_upstream_error("connection reset by peer");
+        assert_eq!(msg, "upstream stream error: connection reset by peer");
+    }
+
+    #[test]
+    fn quota_body_becomes_loud_502() {
+        let (st, ty, msg) = classify_upstream_http(
+            403,
+            "You have exceeded your SuperGrok usage limit. Please add credits.",
+        );
+        assert_eq!(st, 502);
+        assert_eq!(ty, "rate_limit_error");
+        assert!(msg.contains("quota_or_billing"), "{msg}");
+        assert!(
+            msg.contains("NOT Anthropic") || msg.contains("not Anthropic"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("SuperGrok") || msg.contains("credits"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn plain_401_not_anthropic_login() {
+        let (st, ty, msg) = classify_upstream_http(401, "Invalid API key");
+        assert_eq!(st, 502);
+        assert_eq!(ty, "authentication_error");
+        assert!(msg.contains("NOT Anthropic login"), "{msg}");
+    }
+
+    #[test]
+    fn payment_required_402() {
+        let (st, ty, msg) = classify_upstream_http(402, "Payment Required");
+        assert_eq!(st, 502);
+        assert_eq!(ty, "rate_limit_error");
+        assert!(msg.contains("402"), "{msg}");
+    }
+
+    #[test]
+    fn generic_500_passthrough_status() {
+        let (st, ty, msg) = classify_upstream_http(503, "backend down");
+        assert_eq!(st, 503);
+        assert_eq!(ty, "api_error");
+        assert!(msg.contains("503"), "{msg}");
+    }
+
+    #[test]
+    fn rate_limit_429() {
+        let (st, ty, msg) = classify_upstream_http(429, "Too Many Requests");
+        assert_eq!(st, 502);
+        assert_eq!(ty, "rate_limit_error");
+        assert!(msg.contains("429"), "{msg}");
+    }
 }
