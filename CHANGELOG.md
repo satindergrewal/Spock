@@ -20,6 +20,7 @@ All notable changes to Spock are documented here.
 - Product framing: multi-backend Anthropic Messages proxy (not Grok-only)
 
 ### Fixed
+- **Vision / screenshots via path paste**: Claude Code `Read` on a `.png`/`.jpg` returns image blocks inside `tool_result.content`. Spock's translator used `blocks_text()` and silently dropped those images, so Grok/Kimi/Qwen/Ollama never saw pixels and hallucinated screenshot contents. Tool results with images are now OpenAI multipart (`text` + `image_url`); text-only tool results stay plain strings.
 - **WebSearch on stream**: Claude Code nested `web_search_20250305` calls now run Spock server-tool emulation (was skipped when `stream:true`); emit real `server_tool_use` + `web_search_tool_result` blocks; SSE keepalives during long rounds
 - **Login…** from the menu bar runs as a direct child process (no Terminal/AppleScript stall)
 - Menu + CLI surface already-logged-in OAuth state clearly

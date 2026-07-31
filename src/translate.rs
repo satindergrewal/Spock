@@ -34,6 +34,85 @@ pub fn blocks_text(content: &Value) -> String {
     parts.join("\n")
 }
 
+/// Anthropic `image` content block → OpenAI `image_url` part.
+/// Supports `source.type = base64 | url`. Returns None if unusable.
+fn image_block_to_openai(b: &Value) -> Option<Value> {
+    let src = b.get("source")?;
+    let url = match src.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "base64" => {
+            let mt = src
+                .get("media_type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("image/png");
+            let data = src.get("data").and_then(|t| t.as_str()).unwrap_or("");
+            if data.is_empty() {
+                return None;
+            }
+            format!("data:{mt};base64,{data}")
+        }
+        // Anthropic url source, or missing type with a url field.
+        _ => {
+            let u = src.get("url").and_then(|t| t.as_str()).unwrap_or("");
+            if u.is_empty() {
+                return None;
+            }
+            u.to_string()
+        }
+    };
+    Some(json!({
+        "type": "image_url",
+        "image_url": {"url": url}
+    }))
+}
+
+/// Pull OpenAI image_url parts out of an Anthropic tool_result `content`
+/// (string | block array). Images inside Read/tool results are how Claude Code
+/// delivers path-pasted screenshots — must not be text-stripped.
+fn collect_images_from_content(content: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(arr) = content.as_array() {
+        for b in arr {
+            if b.get("type").and_then(|t| t.as_str()) == Some("image") {
+                if let Some(part) = image_block_to_openai(b) {
+                    out.push(part);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// OpenAI tool message content: plain string when text-only; multipart array
+/// when the Anthropic tool_result carried image blocks (vision).
+fn tool_result_openai_content(content: &Value, is_error: bool) -> Value {
+    let mut text = blocks_text(content);
+    if is_error && !text.is_empty() {
+        text = format!("Error: {text}");
+    } else if is_error && text.is_empty() {
+        text = "Error".into();
+    }
+    let images = collect_images_from_content(content);
+    if images.is_empty() {
+        return json!(text);
+    }
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(json!({"type": "text", "text": text}));
+    } else {
+        // Some upstreams want at least one text part alongside images.
+        parts.push(json!({
+            "type": "text",
+            "text": if is_error {
+                "Error: [image tool result]"
+            } else {
+                "[image tool result]"
+            }
+        }));
+    }
+    parts.extend(images);
+    Value::Array(parts)
+}
+
 pub fn map_output_effort(effort: &str) -> Option<&'static str> {
     match effort.trim().to_lowercase().as_str() {
         "low" => Some("low"),
@@ -145,24 +224,9 @@ fn convert_messages(a: &Value) -> Vec<Value> {
                         }
                     }
                     "image" => {
-                        let src = b.get("source").cloned().unwrap_or(Value::Null);
-                        let url = if src.get("type").and_then(|t| t.as_str()) == Some("base64") {
-                            let mt = src
-                                .get("media_type")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("image/png");
-                            let data = src.get("data").and_then(|t| t.as_str()).unwrap_or("");
-                            format!("data:{mt};base64,{data}")
-                        } else {
-                            src.get("url")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("")
-                                .to_string()
-                        };
-                        images.push(json!({
-                            "type": "image_url",
-                            "image_url": {"url": url}
-                        }));
+                        if let Some(part) = image_block_to_openai(b) {
+                            images.push(part);
+                        }
                     }
                     "tool_use" => {
                         let id = b
@@ -180,15 +244,17 @@ fn convert_messages(a: &Value) -> Vec<Value> {
                         }));
                     }
                     "tool_result" => {
-                        let mut text =
-                            blocks_text(b.get("content").unwrap_or(&Value::String(String::new())));
-                        if b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            text = format!("Error: {text}");
-                        }
+                        // Claude Code Read on a .png/.jpg path returns image blocks inside
+                        // tool_result.content. blocks_text() only keeps text → vision was
+                        // silently dropped and models hallucinated screenshot contents.
+                        let empty = Value::String(String::new());
+                        let content = b.get("content").unwrap_or(&empty);
+                        let is_error =
+                            b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                         tool_results.push(json!({
                             "role": "tool",
                             "tool_call_id": b.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or(""),
-                            "content": text
+                            "content": tool_result_openai_content(content, is_error)
                         }));
                     }
                     "thinking" => {
@@ -1038,5 +1104,121 @@ mod tests {
             .unwrap()
             .iter()
             .all(|b| b["type"] != "thinking"));
+    }
+
+    #[test]
+    fn user_message_image_becomes_openai_image_url() {
+        let a = json!({
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what color?"},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "AAA"
+                    }}
+                ]
+            }]
+        });
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let content = o["messages"][0]["content"].as_array().expect("multipart");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"].as_str().unwrap(),
+            "data:image/png;base64,AAA"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_preserved_as_multipart() {
+        // Path-pasted screenshots in Claude Code: Read → tool_result with image block.
+        // Pre-fix Spock text-stripped these → model never saw pixels.
+        let a = json!({
+            "max_tokens": 32,
+            "messages": [
+                {"role": "user", "content": "look at file1.png"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Read",
+                     "input": {"file_path": "/tmp/file1.png"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                        {"type": "text", "text": "file1.png"},
+                        {"type": "image", "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgo="
+                        }}
+                    ]}
+                ]}
+            ]
+        });
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let msgs = o["messages"].as_array().unwrap();
+        // system none; user; assistant+tool_calls; tool
+        let tool = msgs
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("tool message");
+        assert_eq!(tool["tool_call_id"], "toolu_1");
+        let parts = tool["content"].as_array().expect("multipart tool content");
+        assert!(
+            parts.iter().any(|p| p["type"] == "text"),
+            "expected text part: {parts:?}"
+        );
+        let img = parts
+            .iter()
+            .find(|p| p["type"] == "image_url")
+            .expect("image_url part");
+        assert!(
+            img["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"),
+            "{img:?}"
+        );
+    }
+
+    #[test]
+    fn tool_result_text_only_stays_string() {
+        let a = json!({
+            "max_tokens": 32,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]}
+            ]
+        });
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let tool = o["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap();
+        assert_eq!(tool["content"], "ok");
+    }
+
+    #[test]
+    fn image_url_source_type() {
+        let a = json!({
+            "max_tokens": 8,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {"type": "url", "url": "https://example.com/a.png"}
+                }]
+            }]
+        });
+        let o = anthropic_to_openai(&a, "m", CompletionsQuirk::Generic, "m");
+        let content = o["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["image_url"]["url"], "https://example.com/a.png");
     }
 }
