@@ -12,6 +12,7 @@ struct SettingsView: View {
                     serverSection
                     backendsSection
                     profilesSection
+                    catalogSection
                     serverToolsSection
                 }
                 .padding(20)
@@ -319,6 +320,75 @@ struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                }
+            }
+            .padding(8)
+        }
+    }
+
+    /// Curated shortlist for Grok Build / external pickers via GET /v1/models.
+    /// Orthogonal to Profiles (Claude Code 5-slot map).
+    private var catalogSection: some View {
+        GroupBox("Catalog (Grok Build / external pickers)") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Shortlist served on GET /v1/models. Ids are backend:model. Empty catalog = dump every backend model (noisy). Profiles above stay Claude Code only.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
+                    GridRow {
+                        Text("id").font(.caption).foregroundStyle(.secondary)
+                        Text("name").font(.caption).foregroundStyle(.secondary)
+                        Text("description").font(.caption).foregroundStyle(.secondary)
+                        Text("context").font(.caption).foregroundStyle(.secondary)
+                        Text("").font(.caption)
+                    }
+                    ForEach($model.catalogRows) { $e in
+                        GridRow {
+                            routeField(text: $e.routeId, placeholder: "xai:grok-4.5")
+                                .frame(minWidth: 180)
+                            TextField("display name", text: $e.name)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 100)
+                            TextField("optional", text: $e.description)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 100)
+                            TextField("500000", text: $e.contextWindow)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 90)
+                                .help("Tokens. Leave blank to discover from backend / Grok default (~200k).")
+                            Button(role: .destructive) {
+                                model.removeCatalogEntry(e)
+                            } label: {
+                                Image(systemName: "minus.circle.fill")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+
+                HStack(alignment: .center, spacing: 12) {
+                    Button {
+                        model.addCatalogEntry()
+                    } label: {
+                        Label("Add entry", systemImage: "plus.circle")
+                    }
+                    if !model.routeSuggestions.isEmpty {
+                        Menu {
+                            ForEach(model.routeSuggestions, id: \.self) { route in
+                                Button(route) {
+                                    model.addRouteToCatalog(route)
+                                }
+                            }
+                        } label: {
+                            Label("Add from fetched models", systemImage: "plus.magnifyingglass")
+                        }
+                        .help("Fetch models on a backend row first, then pick routes here.")
+                    }
+                    Text("context = tokens (e.g. 500000). Save & Apply publishes to Grok Build.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(8)

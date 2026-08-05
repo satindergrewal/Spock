@@ -39,6 +39,8 @@ final class AppModel: ObservableObject {
     @Published var profiles: [String] = []
     @Published var backends: [BackendRow] = []
     @Published var profileRows: [ProfileRow] = []
+    /// Curated shortlist for Grok Build / external pickers (orthogonal to profiles).
+    @Published var catalogRows: [CatalogRow] = []
     @Published var bind: String = "127.0.0.1"
     @Published var configPath: String = ""
     @Published var authPresent = false
@@ -274,6 +276,19 @@ final class AppModel: ObservableObject {
             }
             profiles = profileRows.map(\.name).sorted()
         }
+        if let arr = raw["catalog"] as? [[String: Any]] {
+            catalogRows = arr.map { e in
+                CatalogRow(
+                    id: UUID(),
+                    routeId: e["id"] as? String ?? "",
+                    name: e["name"] as? String ?? "",
+                    description: e["description"] as? String ?? "",
+                    contextWindow: e["context_window"] as? String ?? ""
+                )
+            }
+        } else {
+            catalogRows = []
+        }
         if let adv = raw["advisor"] as? [String: Any] {
             advisorEnabled = adv["enabled"] as? Bool ?? false
             advisorModel = adv["model"] as? String ?? ""
@@ -360,6 +375,16 @@ final class AppModel: ObservableObject {
                     "sonnet": p.sonnet,
                     "opus": p.opus,
                     "fable": p.fable,
+                ] as [String: Any]
+            },
+            "catalog": catalogRows.compactMap { e -> [String: Any]? in
+                let rid = e.routeId.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !rid.isEmpty else { return nil }
+                return [
+                    "id": rid,
+                    "name": e.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                    "description": e.description.trimmingCharacters(in: .whitespacesAndNewlines),
+                    "context_window": e.contextWindow.trimmingCharacters(in: .whitespacesAndNewlines),
                 ] as [String: Any]
             },
             "advisor": [
@@ -601,6 +626,44 @@ final class AppModel: ObservableObject {
         profiles = profileRows.map(\.name).sorted()
     }
 
+    func addCatalogEntry(route: String = "xai:grok-4.5", contextWindow: String = "500000") {
+        let route = route.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Derive a short display name from the model side of backend:model
+        let name: String = {
+            if let idx = route.firstIndex(of: ":") {
+                return String(route[route.index(after: idx)...])
+            }
+            return route
+        }()
+        catalogRows.append(
+            CatalogRow(
+                id: UUID(),
+                routeId: route.isEmpty ? "xai:grok-4.5" : route,
+                name: name,
+                description: "",
+                contextWindow: contextWindow
+            )
+        )
+    }
+
+    func removeCatalogEntry(_ row: CatalogRow) {
+        catalogRows.removeAll { $0.id == row.id }
+    }
+
+    /// Add a discovered `backend:model` to the catalog if not already present.
+    func addRouteToCatalog(_ route: String) {
+        let route = route.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !route.isEmpty else { return }
+        if catalogRows.contains(where: {
+            $0.routeId.trimmingCharacters(in: .whitespacesAndNewlines) == route
+        }) {
+            setStatus("Already in catalog: \(route)", error: false)
+            return
+        }
+        addCatalogEntry(route: route, contextWindow: "")
+        setStatus("Added to catalog: \(route) — Save & Apply to publish", error: false)
+    }
+
     /// Fetch models from a backend (Ollama / llama-server / xAI) via Spock admin API.
     /// Uses the **live proxy** config — click Save & Apply first if you just changed the base URL.
     func fetchModels(forBackend name: String) {
@@ -802,4 +865,15 @@ struct ProfileRow: Identifiable, Equatable {
     var sonnet: String
     var opus: String
     var fable: String
+}
+
+/// One entry in the external-picker catalog (Grok Build GET /v1/models).
+struct CatalogRow: Identifiable, Equatable {
+    let id: UUID
+    /// Client-facing id, usually `backend:model`.
+    var routeId: String
+    var name: String
+    var description: String
+    /// Token count as text for the form (empty = discover / default).
+    var contextWindow: String
 }

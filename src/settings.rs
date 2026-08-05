@@ -199,10 +199,7 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
             id: e.id.clone(),
             name: e.name.clone().unwrap_or_default(),
             description: e.description.clone().unwrap_or_default(),
-            context_window: e
-                .context_window
-                .map(|n| n.to_string())
-                .unwrap_or_default(),
+            context_window: e.context_window.map(|n| n.to_string()).unwrap_or_default(),
         })
         .collect();
 

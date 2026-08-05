@@ -3,7 +3,9 @@
 use crate::backends::{get_backend, UpstreamBody};
 use crate::config::{EnvOverrides, DEFAULT_GROK_MODEL};
 use crate::error::{anthropic_error, Error, Result};
-use crate::models::{alias_models, context_window_from_card, model_card, model_card_full, stop_reason};
+use crate::models::{
+    alias_models, context_window_from_card, model_card, model_card_full, stop_reason,
+};
 use crate::route;
 use crate::state::AppState;
 use crate::translate::{
@@ -501,13 +503,9 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
             }
         }
         // Catalog hit without upstream card.
-        if let Some(entry) = state.with_config(|c| {
-            c.catalog
-                .entries
-                .iter()
-                .find(|e| e.id == model_id)
-                .cloned()
-        })? {
+        if let Some(entry) =
+            state.with_config(|c| c.catalog.entries.iter().find(|e| e.id == model_id).cloned())?
+        {
             return write_json(
                 stream,
                 200,
