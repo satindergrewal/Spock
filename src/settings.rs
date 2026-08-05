@@ -1,6 +1,6 @@
 //! In-app Settings panel (macOS tray build) — WebView UI, no external editor.
 
-use crate::config::{BackendConfig, Config, ProfileConfig, VERSION};
+use crate::config::{BackendConfig, CatalogEntry, CatalogSection, Config, ProfileConfig, VERSION};
 use crate::state::AppState;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -13,6 +13,9 @@ pub struct SettingsDoc {
     pub server: ServerDoc,
     pub backends: Vec<BackendDoc>,
     pub profiles: Vec<ProfileDoc>,
+    /// Curated external-picker shortlist (Grok Build). Orthogonal to profiles.
+    #[serde(default)]
+    pub catalog: Vec<CatalogDoc>,
     #[serde(default)]
     pub advisor: AdvisorDoc,
     #[serde(default)]
@@ -112,6 +115,20 @@ pub struct ProfileDoc {
     pub fable: String,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CatalogDoc {
+    /// Client id, usually `backend:model`.
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Empty string in UI = unset (discover / Grok default).
+    #[serde(default)]
+    pub context_window: String,
+}
+
 pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
     let backends = cfg
         .backends
@@ -174,6 +191,21 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
         })
         .collect();
 
+    let catalog = cfg
+        .catalog
+        .entries
+        .iter()
+        .map(|e| CatalogDoc {
+            id: e.id.clone(),
+            name: e.name.clone().unwrap_or_default(),
+            description: e.description.clone().unwrap_or_default(),
+            context_window: e
+                .context_window
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+        })
+        .collect();
+
     SettingsDoc {
         version: VERSION.to_string(),
         config_path: crate::config::config_path().display().to_string(),
@@ -184,6 +216,7 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
         },
         backends,
         profiles,
+        catalog,
         advisor: AdvisorDoc {
             enabled: cfg.advisor.enabled,
             model: cfg.advisor.model.clone().unwrap_or_default(),
@@ -349,6 +382,35 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
         }
     };
 
+    let mut catalog_entries = Vec::new();
+    for e in &doc.catalog {
+        let id = e.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let cw = e.context_window.trim();
+        let context_window = if cw.is_empty() {
+            None
+        } else {
+            Some(cw.parse::<u64>().map_err(|_| {
+                crate::error::Error::Msg(format!(
+                    "catalog '{id}': context_window must be a positive integer, got '{cw}'"
+                ))
+            })?)
+        };
+        if context_window == Some(0) {
+            return Err(crate::error::Error::Msg(format!(
+                "catalog '{id}': context_window must be > 0"
+            )));
+        }
+        catalog_entries.push(CatalogEntry {
+            id: id.to_string(),
+            name: opt_str(&e.name),
+            description: opt_str(&e.description),
+            context_window,
+        });
+    }
+
     Ok(Config {
         server: crate::config::ServerConfig {
             bind,
@@ -361,6 +423,9 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
         },
         backends,
         profiles,
+        catalog: CatalogSection {
+            entries: catalog_entries,
+        },
         advisor: crate::config::AdvisorSection {
             enabled: doc.advisor.enabled,
             model: opt_str(&doc.advisor.model),
@@ -582,6 +647,27 @@ pub fn settings_html(initial: &SettingsDoc) -> String {
       <button id="btnAddProfile">+ Profile</button>
     </div>
   </section>
+
+  <section>
+    <h2>Catalog (external pickers)</h2>
+    <p class="hint">Shortlist for Grok Build and other agents via <code>GET /v1/models</code>. Ids are <code>backend:model</code>. Empty catalog = legacy dump of every backend model. Profiles above stay Claude Code only.</p>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:28%">id</th>
+          <th style="width:18%">name</th>
+          <th>description</th>
+          <th style="width:14%">context</th>
+          <th style="width:40px"></th>
+        </tr>
+      </thead>
+      <tbody id="catalogBody"></tbody>
+    </table>
+    <div class="row" style="margin-top:10px">
+      <button id="btnAddCatalog">+ Catalog entry</button>
+      <span class="chip">context = tokens (e.g. 500000). Leave blank to discover from backend / Grok default.</span>
+    </div>
+  </section>
 </main>
 <script>
 const INITIAL = {data};
@@ -643,6 +729,18 @@ function profileRow(p) {{
   return tr;
 }}
 
+function catalogRow(e) {{
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td><input class="c-id" value="${{esc(e.id || '')}}" placeholder="xai:grok-4.5"/></td>
+    <td><input class="c-name" value="${{esc(e.name || '')}}" placeholder="Grok 4.5"/></td>
+    <td><input class="c-desc" value="${{esc(e.description || '')}}"/></td>
+    <td><input class="c-cw" value="${{esc(e.context_window || '')}}" placeholder="500000"/></td>
+    <td><button class="danger c-del" title="Remove">×</button></td>`;
+  tr.querySelector('.c-del').onclick = () => tr.remove();
+  return tr;
+}}
+
 function esc(s) {{
   return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
 }}
@@ -666,6 +764,9 @@ function loadDoc(doc) {{
   const pb = document.getElementById('profilesBody');
   pb.innerHTML = '';
   (doc.profiles || []).forEach(p => pb.appendChild(profileRow(p)));
+  const cb = document.getElementById('catalogBody');
+  cb.innerHTML = '';
+  (doc.catalog || []).forEach(e => cb.appendChild(catalogRow(e)));
   refreshProfileSelect();
   if (doc.server && doc.server.profile) {{
     document.getElementById('activeProfile').value = doc.server.profile;
@@ -687,6 +788,12 @@ function collectDoc() {{
     opus: tr.querySelector('.p-opus').value.trim(),
     fable: tr.querySelector('.p-fable').value.trim(),
   }}));
+  const catalog = [...document.querySelectorAll('#catalogBody tr')].map(tr => ({{
+    id: tr.querySelector('.c-id').value.trim(),
+    name: tr.querySelector('.c-name').value.trim(),
+    description: tr.querySelector('.c-desc').value.trim(),
+    context_window: tr.querySelector('.c-cw').value.trim(),
+  }}));
   return {{
     version: INITIAL.version,
     config_path: INITIAL.config_path,
@@ -697,8 +804,9 @@ function collectDoc() {{
     }},
     backends,
     profiles,
-      advisor: Default::default(),
-      web_search: Default::default(),
+    catalog,
+    advisor: INITIAL.advisor || {{ enabled: false, model: '', max_tokens: 4096 }},
+    web_search: INITIAL.web_search || {{ enabled: false, provider: 'duckduckgo', base_url: '', api_key: '', api_key_env: '', max_results: 5 }},
   }};
 }}
 
@@ -712,6 +820,11 @@ document.getElementById('btnAddProfile').onclick = () => {{
     name: 'custom', default: 'xai:grok-4.5', haiku: '', sonnet: '', opus: '', fable: ''
   }}));
   refreshProfileSelect();
+}};
+document.getElementById('btnAddCatalog').onclick = () => {{
+  document.getElementById('catalogBody').appendChild(catalogRow({{
+    id: 'xai:grok-4.5', name: 'Grok 4.5', description: '', context_window: '500000'
+  }}));
 }};
 document.getElementById('btnSave').onclick = () => {{
   setStatus('Saving…');
@@ -861,5 +974,31 @@ mod tests {
             back.profiles["hybrid"].haiku.as_deref(),
             Some("ollama:qwen2.5:14b")
         );
+        assert!(back.catalog.entries.is_empty());
+    }
+
+    #[test]
+    fn catalog_roundtrip() {
+        let mut cfg = default_config();
+        cfg.catalog.entries.push(crate::config::CatalogEntry {
+            id: "xai:grok-4.5".into(),
+            name: Some("Grok 4.5".into()),
+            description: None,
+            context_window: Some(500_000),
+        });
+        cfg.catalog.entries.push(crate::config::CatalogEntry {
+            id: "ollama:glm-5.2:cloud".into(),
+            name: None,
+            description: Some("local".into()),
+            context_window: None,
+        });
+        let doc = config_to_doc(&cfg);
+        assert_eq!(doc.catalog.len(), 2);
+        assert_eq!(doc.catalog[0].context_window, "500000");
+        let back = doc_to_config(&doc).expect("doc_to_config");
+        assert_eq!(back.catalog.entries.len(), 2);
+        assert_eq!(back.catalog.entries[0].id, "xai:grok-4.5");
+        assert_eq!(back.catalog.entries[0].context_window, Some(500_000));
+        assert_eq!(back.catalog.entries[1].context_window, None);
     }
 }

@@ -176,6 +176,7 @@ mod tests {
             },
             backends,
             profiles,
+            catalog: Default::default(),
             advisor: Default::default(),
             web_search: Default::default(),
         }

@@ -45,10 +45,39 @@ pub struct Config {
     pub backends: BTreeMap<String, BackendConfig>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
+    /// Curated shortlist for external pickers (Grok Build, etc.).
+    /// Orthogonal to `profiles` (Claude Code 5-slot role map).
+    #[serde(default)]
+    pub catalog: CatalogSection,
     #[serde(default)]
     pub advisor: AdvisorSection,
     #[serde(default)]
     pub web_search: WebSearchSection,
+}
+
+/// Hand-picked `backend:model` entries served on `GET /v1/models` for external
+/// agents. When non-empty, Spock stops dumping every upstream backend model into
+/// the list (Claude aliases still ship for Claude Code).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CatalogSection {
+    #[serde(default)]
+    pub entries: Vec<CatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    /// Client-facing id, usually `backend:model` (e.g. `xai:grok-4.5`).
+    pub id: String,
+    /// Optional picker label.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Context window in tokens. When set, emitted so Grok Build applies
+    /// per-model compaction correctly. When omitted, Spock tries live discovery
+    /// from the backend `/models` card, else leaves unset (Grok defaults ~200k).
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,6 +547,7 @@ pub fn default_config() -> Config {
         server: ServerConfig::default(),
         backends,
         profiles,
+        catalog: CatalogSection::default(),
         advisor: Default::default(),
         web_search: Default::default(),
     }

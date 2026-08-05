@@ -3,7 +3,7 @@
 use crate::backends::{get_backend, UpstreamBody};
 use crate::config::{EnvOverrides, DEFAULT_GROK_MODEL};
 use crate::error::{anthropic_error, Error, Result};
-use crate::models::{alias_models, model_card, stop_reason};
+use crate::models::{alias_models, context_window_from_card, model_card, model_card_full, stop_reason};
 use crate::route;
 use crate::state::AppState;
 use crate::translate::{
@@ -480,15 +480,120 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
                         obj.insert("id".into(), json!(model_id));
                         obj.entry("display_name".to_string())
                             .or_insert_with(|| json!(model_id));
+                        obj.entry("model".to_string())
+                            .or_insert_with(|| json!(model_id));
+                        // Catalog override wins over upstream card for context.
+                        if let Some(cw) = state.with_config(|c| {
+                            c.catalog
+                                .entries
+                                .iter()
+                                .find(|e| e.id == model_id)
+                                .and_then(|e| e.context_window)
+                        })? {
+                            if cw > 0 {
+                                obj.insert("context_window".into(), json!(cw));
+                                obj.insert("contextWindow".into(), json!(cw));
+                            }
+                        }
                     }
                     return write_json(stream, 200, &card);
                 }
             }
         }
+        // Catalog hit without upstream card.
+        if let Some(entry) = state.with_config(|c| {
+            c.catalog
+                .entries
+                .iter()
+                .find(|e| e.id == model_id)
+                .cloned()
+        })? {
+            return write_json(
+                stream,
+                200,
+                &model_card_full(
+                    &entry.id,
+                    "spock-catalog",
+                    entry.context_window,
+                    entry.name.as_deref(),
+                    entry.description.as_deref(),
+                ),
+            );
+        }
         return write_json(stream, 200, &model_card(&model_id, "spock"));
     }
 
-    // List: merge backends + aliases
+    // List: when catalog is non-empty, emit ONLY catalog + Claude aliases
+    // (external pickers like Grok Build — short curated list). Profiles stay
+    // Claude-Code-only and are not dumped here.
+    let catalog_entries = state.with_config(|c| c.catalog.entries.clone())?;
+    if !catalog_entries.is_empty() {
+        // Optional live context discovery from backend /models cards.
+        let mut upstream_cw: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        {
+            let handles: Vec<_> = {
+                let backends = state
+                    .backends
+                    .read()
+                    .map_err(|_| Error::Msg("backends lock".into()))?;
+                backends.values().cloned().collect()
+            };
+            for be in &handles {
+                if let Ok(raw) = be.get_json("/models", &state.oauth) {
+                    if let Some(data) = raw.get("data").and_then(|d| d.as_array()) {
+                        for m in data {
+                            if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
+                                if let Some(cw) = context_window_from_card(m) {
+                                    upstream_cw.insert(id.to_string(), cw);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut data: Vec<Value> = Vec::with_capacity(catalog_entries.len() + aliases.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &catalog_entries {
+            let id = entry.id.trim();
+            if id.is_empty() || !seen.insert(id.to_string()) {
+                continue;
+            }
+            // Prefer explicit catalog context_window; else map via route → upstream bare id.
+            let mut cw = entry.context_window.filter(|c| *c > 0);
+            if cw.is_none() {
+                if let Ok(resolved) = state.with_config(|c| route::resolve(c, id))? {
+                    cw = upstream_cw.get(&resolved.upstream_model).copied();
+                }
+            }
+            data.push(model_card_full(
+                id,
+                "spock-catalog",
+                cw,
+                entry.name.as_deref(),
+                entry.description.as_deref(),
+            ));
+        }
+        for card in aliases {
+            if let Some(id) = card.get("id").and_then(|i| i.as_str()) {
+                if seen.insert(id.to_string()) {
+                    data.push(card);
+                }
+            }
+        }
+        return write_json(
+            stream,
+            200,
+            &json!({
+                "object": "list",
+                "data": data
+            }),
+        );
+    }
+
+    // No catalog: legacy merge of all backend /models + aliases.
     let mut by_id: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     {
         let handles: Vec<_> = {
@@ -687,7 +792,15 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
     } else {
         match be.chat(&oai, true, &state.oauth) {
             Ok(UpstreamBody::Stream(reader)) => {
-                stream_anthropic(sock, reader, &client_model, include_thinking, state)
+                let input_estimate = count_tokens_estimate(&a);
+                stream_anthropic(
+                    sock,
+                    reader,
+                    &client_model,
+                    include_thinking,
+                    input_estimate,
+                    state,
+                )
             }
             Ok(UpstreamBody::Json(o)) => {
                 let resp = openai_to_anthropic(&o, &client_model, include_thinking);
@@ -785,6 +898,10 @@ fn stream_json_as_anthropic_sse_body(stream: &mut TcpStream, resp: &Value) -> Re
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("spock");
+    let start_usage = resp
+        .get("usage")
+        .cloned()
+        .unwrap_or(json!({"input_tokens": 0, "output_tokens": 0}));
     emit_sse(
         stream,
         "message_start",
@@ -798,7 +915,7 @@ fn stream_json_as_anthropic_sse_body(stream: &mut TcpStream, resp: &Value) -> Re
                 "content": [],
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {"input_tokens": 0, "output_tokens": 0}
+                "usage": start_usage
             }
         }),
     )?;
@@ -911,6 +1028,7 @@ fn stream_anthropic(
     reader: Box<dyn Read + Send>,
     req_model: &str,
     include_thinking: bool,
+    input_estimate: u64,
     state: &AppState,
 ) -> Result<()> {
     write_sse_headers(stream)?;
@@ -980,7 +1098,10 @@ fn stream_anthropic(
         }
 
         if let Some(u) = chunk.get("usage") {
-            usage = u.clone();
+            // Providers send "usage": null on every content chunk; keep the real one.
+            if u.is_object() {
+                usage = u.clone();
+            }
         }
         let choice = chunk
             .get("choices")
@@ -1159,6 +1280,24 @@ fn stream_anthropic(
         .get("completion_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(chunks_out);
+    // Claude Code's footer gauge and auto-compact trigger read
+    // input_tokens + cache_* from the last assistant message's usage (merged
+    // from message_delta). Zero here = gauge hidden, context silently overflows.
+    let in_tokens = usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(input_estimate);
+    let mut delta_usage = json!({"output_tokens": out_tokens});
+    if in_tokens > 0 {
+        delta_usage["input_tokens"] = json!(in_tokens);
+    }
+    if let Some(cached) = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+    {
+        delta_usage["cache_read_input_tokens"] = json!(cached);
+    }
     emit_sse(
         stream,
         "message_delta",
@@ -1168,7 +1307,7 @@ fn stream_anthropic(
                 "stop_reason": stop_reason(finish.as_deref()),
                 "stop_sequence": null
             },
-            "usage": {"output_tokens": out_tokens}
+            "usage": delta_usage
         }),
     )?;
     emit_sse(stream, "message_stop", &json!({"type": "message_stop"}))?;

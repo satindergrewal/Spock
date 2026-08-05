@@ -165,6 +165,40 @@ fable = "ollama:qwen2.5:14b"
 # [profiles.hybrid.exact]
 # "claude-haiku-4-5" = "ollama:qwen2.5:7b"
 
+# --- Catalog: curated shortlist for Grok Build / external pickers ---
+# Orthogonal to profiles (Claude Code role map). When non-empty, GET /v1/models
+# returns ONLY these ids (+ Claude aliases for CC). Empty = legacy dump of every
+# backend model (noisy for Grok's picker).
+#
+# context_window is optional; when set, Grok Build applies it per-model for
+# compaction. When omitted, Spock tries to discover it from the backend /models
+# card (e.g. max_model_len from vLLM/llama.cpp).
+#
+# [[catalog.entries]]
+# id = "xai:grok-4.5"
+# name = "Grok 4.5"
+# context_window = 500000
+#
+# [[catalog.entries]]
+# id = "ollama:glm-5.2:cloud"
+# name = "GLM 5.2 (Ollama cloud)"
+# context_window = 1000000
+#
+# [[catalog.entries]]
+# id = "qwen:qwen3-coder-plus"
+# name = "Qwen3 Coder Plus"
+# context_window = 256000
+#
+# [[catalog.entries]]
+# id = "kimi:kimi-for-coding"
+# name = "Kimi for Coding"
+# context_window = 1000000
+#
+# [[catalog.entries]]
+# id = "lan:glm-5.2"
+# name = "GLM 5.2 (LAN)"
+# # context_window omitted → discover from backend if advertised
+
 # --- Server-tool emulation (Phase 2; defaults off until implemented) ---
 # [advisor]
 # enabled = true

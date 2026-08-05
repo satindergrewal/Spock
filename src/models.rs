@@ -92,14 +92,74 @@ pub fn sanitize_upstream(req: &mut Value, is_reasoning: bool) {
 }
 
 pub fn model_card(id: &str, owned_by: &str) -> Value {
-    json!({
+    model_card_full(id, owned_by, None, None, None)
+}
+
+/// OpenAI-style model card plus fields Grok Build reads from `/v1/models`
+/// (`context_window` / `contextWindow`, `model`, optional `name`).
+pub fn model_card_full(
+    id: &str,
+    owned_by: &str,
+    context_window: Option<u64>,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> Value {
+    let display = name.unwrap_or(id);
+    let mut card = json!({
         "id": id,
         "object": "model",
         "created": 0,
         "owned_by": owned_by,
-        "display_name": id,
+        "display_name": display,
+        "name": display,
+        // Grok parse_remote_model_value prefers `model`, falls back to `id`.
+        "model": id,
         "type": "model",
-    })
+    });
+    if let Some(obj) = card.as_object_mut() {
+        if let Some(cw) = context_window.filter(|c| *c > 0) {
+            obj.insert("context_window".into(), json!(cw));
+            obj.insert("contextWindow".into(), json!(cw));
+        }
+        if let Some(d) = description.map(str::trim).filter(|s| !s.is_empty()) {
+            obj.insert("description".into(), json!(d));
+        }
+    }
+    card
+}
+
+/// Pull a context-window hint out of a backend `/models` card if present.
+pub fn context_window_from_card(card: &Value) -> Option<u64> {
+    let obj = card.as_object()?;
+    let keys = [
+        "context_window",
+        "contextWindow",
+        "context_length",
+        "contextLength",
+        "max_model_len",
+        "maxModelLen",
+        "max_sequence_length",
+    ];
+    for k in keys {
+        if let Some(n) = obj.get(k).and_then(|v| v.as_u64()).filter(|n| *n > 0) {
+            return Some(n);
+        }
+        if let Some(n) = obj
+            .get(k)
+            .and_then(|v| v.as_f64())
+            .map(|f| f as u64)
+            .filter(|n| *n > 0)
+        {
+            return Some(n);
+        }
+    }
+    // Some providers nest under `meta` / `_meta`.
+    for nest in ["meta", "_meta"] {
+        if let Some(n) = obj.get(nest).and_then(context_window_from_card) {
+            return Some(n);
+        }
+    }
+    None
 }
 
 pub const CLAUDE_ALIASES: &[&str] = &[
@@ -212,6 +272,44 @@ mod tests {
         let ids: Vec<_> = a.iter().filter_map(|v| v["id"].as_str()).collect();
         assert!(ids.contains(&"claude-opus-4-8"));
         assert!(ids.contains(&"grok-4.5[1m]"));
+    }
+
+    #[test]
+    fn model_card_full_emits_context_for_grok() {
+        let c = model_card_full(
+            "xai:grok-4.5",
+            "spock-catalog",
+            Some(500_000),
+            Some("Grok 4.5"),
+            Some("native"),
+        );
+        assert_eq!(c["id"], "xai:grok-4.5");
+        assert_eq!(c["model"], "xai:grok-4.5");
+        assert_eq!(c["context_window"], 500_000);
+        assert_eq!(c["contextWindow"], 500_000);
+        assert_eq!(c["name"], "Grok 4.5");
+        assert_eq!(c["description"], "native");
+    }
+
+    #[test]
+    fn context_window_from_card_variants() {
+        assert_eq!(
+            context_window_from_card(&json!({"context_window": 128000})),
+            Some(128000)
+        );
+        assert_eq!(
+            context_window_from_card(&json!({"contextWindow": 256000})),
+            Some(256000)
+        );
+        assert_eq!(
+            context_window_from_card(&json!({"max_model_len": 65536})),
+            Some(65536)
+        );
+        assert_eq!(
+            context_window_from_card(&json!({"_meta": {"contextWindow": 1_000_000}})),
+            Some(1_000_000)
+        );
+        assert_eq!(context_window_from_card(&json!({"id": "x"})), None);
     }
 
     #[test]
