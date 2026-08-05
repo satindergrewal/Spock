@@ -521,9 +521,11 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
         return write_json(stream, 200, &model_card(&model_id, "spock"));
     }
 
-    // List: when catalog is non-empty, emit ONLY catalog + Claude aliases
-    // (external pickers like Grok Build — short curated list). Profiles stay
-    // Claude-Code-only and are not dumped here.
+    // List: when catalog is non-empty, emit ONLY those entries — no Claude
+    // aliases, no bare grok tags, no upstream dump. Grok Build (and any
+    // external picker) gets the shortlist as-is. Claude Code does not need
+    // aliases in /v1/models; it routes role names via profiles on /v1/messages.
+    // Empty catalog keeps the legacy merge (backends + aliases) below.
     let catalog_entries = state.with_config(|c| c.catalog.entries.clone())?;
     if !catalog_entries.is_empty() {
         // Optional live context discovery from backend /models cards.
@@ -552,7 +554,7 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
             }
         }
 
-        let mut data: Vec<Value> = Vec::with_capacity(catalog_entries.len() + aliases.len());
+        let mut data: Vec<Value> = Vec::with_capacity(catalog_entries.len());
         let mut seen = std::collections::BTreeSet::new();
         for entry in &catalog_entries {
             let id = entry.id.trim();
@@ -573,13 +575,6 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
                 entry.name.as_deref(),
                 entry.description.as_deref(),
             ));
-        }
-        for card in aliases {
-            if let Some(id) = card.get("id").and_then(|i| i.as_str()) {
-                if seen.insert(id.to_string()) {
-                    data.push(card);
-                }
-            }
         }
         return write_json(
             stream,
