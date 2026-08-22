@@ -1,5 +1,7 @@
 /target/
 /dist/
+/studio/
+/run_studio.sh
 __pycache__/
 *.py[cod]
 .DS_Store

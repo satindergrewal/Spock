@@ -18,7 +18,7 @@ struct SettingsView: View {
                 .padding(20)
             }
         }
-        .frame(minWidth: 760, minHeight: 600)
+        .frame(minWidth: 860, minHeight: 600)
         .onAppear { model.refresh() }
     }
 
@@ -342,6 +342,7 @@ struct SettingsView: View {
                         Text("name").font(.caption).foregroundStyle(.secondary)
                         Text("description").font(.caption).foregroundStyle(.secondary)
                         Text("context").font(.caption).foregroundStyle(.secondary)
+                        Text("effort").font(.caption).foregroundStyle(.secondary)
                         Text("").font(.caption)
                     }
                     ForEach($model.catalogRows) { $e in
@@ -358,6 +359,14 @@ struct SettingsView: View {
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 90)
                                 .help("Tokens. Leave blank to discover from backend / Grok default (~200k).")
+                            Picker("", selection: $e.supportsReasoningEffort) {
+                                Text("auto").tag("")
+                                Text("1").tag("1")
+                                Text("0").tag("0")
+                            }
+                            .labelsHidden()
+                            .frame(width: 72)
+                            .help("auto = heuristic (xai/kimi/deepseek on). 1 = advertise effort picker. 0 = hide it.")
                             Button(role: .destructive) {
                                 model.removeCatalogEntry(e)
                             } label: {
@@ -386,9 +395,10 @@ struct SettingsView: View {
                         }
                         .help("Fetch models on a backend row first, then pick routes here.")
                     }
-                    Text("context = tokens (e.g. 500000). Save & Apply publishes to Grok Build.")
+                    Text("context = tokens. effort: auto / 1 / 0. Set 1 on Qwen (or any non-heuristic row) so /model Tab shows effort. Save & Apply publishes.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(8)
@@ -425,7 +435,7 @@ struct SettingsView: View {
                                 .disabled(!model.advisorEnabled)
                         }
                     }
-                    Text("Pick a fetched backend:model (Fetch models first), or leave empty for Claude tools[].model / fable / profile default.")
+                    Text("Pick a fetched backend:model (Fetch models first). Leave empty for Claude tools[].model / fable. Use a *different* model than the main session — same-model advisor just continues the agent voice.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }

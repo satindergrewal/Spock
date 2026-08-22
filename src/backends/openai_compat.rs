@@ -102,6 +102,11 @@ pub fn chat(
     if stream {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("stream".into(), Value::Bool(true));
+            // Many OpenAI-compat servers omit usage from streams unless asked.
+            // Spock forwards prompt_tokens in message_delta so Claude Code's
+            // context gauge / auto-compact can track real fill.
+            obj.entry("stream_options".to_string())
+                .or_insert_with(|| json!({"include_usage": true}));
         }
     }
     match req.send_json(payload) {
@@ -120,6 +125,73 @@ pub fn chat(
             Err(Error::Http(code, v))
         }
         Err(e) => Err(Error::Msg(format!("openai chat: {e}"))),
+    }
+}
+
+/// POST JSON to an arbitrary path on `base_url` (already the origin, no /v1 append).
+pub fn post_json(
+    base_url: &str,
+    api_key: Option<&str>,
+    path: &str,
+    body: &Value,
+    stream: bool,
+    headers: &BTreeMap<String, String>,
+    user_agent: Option<&str>,
+) -> Result<UpstreamBody> {
+    let ua = user_agent.unwrap_or(UA);
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let agent = agent(
+        if stream {
+            STREAM_IDLE_READ_SECS
+        } else {
+            JSON_READ_SECS
+        },
+        ua,
+    );
+    let mut req = agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .set(
+            "Accept",
+            if stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        );
+    if let Some(k) = api_key {
+        if !k.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {k}"));
+        }
+    }
+    req = apply_headers(req, headers);
+    let mut payload = body.clone();
+    if stream {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("stream".into(), Value::Bool(true));
+        }
+    }
+    match req.send_json(payload) {
+        Ok(resp) => {
+            if stream {
+                Ok(UpstreamBody::Stream(Box::new(resp.into_reader())))
+            } else {
+                Ok(UpstreamBody::Json(resp.into_json()?))
+            }
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let v: Value = serde_json::from_str(&text).unwrap_or_else(
+                |_| json!({"error": {"message": text.chars().take(500).collect::<String>()}}),
+            );
+            Err(Error::Http(code, v))
+        }
+        Err(e) => Err(Error::Msg(format!("native post {path}: {e}"))),
     }
 }
 

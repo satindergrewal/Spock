@@ -5,6 +5,9 @@ All notable changes to Spock are documented here.
 ## [Unreleased]
 
 ### Added
+- **`POST /v1/responses` search shim** — grok-build `web_search` posts OpenAI Responses (`{base}/responses` + hosted `web_search` tool). Search-only: run `[web_search]` (Brave/Serper/SearXNG/DDG) and return a completed Responses object with `output_text` + `url_citation`. No tool / search disabled / empty query → 400. Not a general Responses proxy (no chat/completions fallback).
+- **macOS Settings Catalog effort column** — auto / 1 / 0 next to context; Save & Apply writes `supports_reasoning_effort` so Grok Build `/model` Tab shows effort on non-heuristic rows (Qwen, local GGUF)
+- **llama-server KV sessions** (`kv_sessions = true` on an api_key backend) — Claude Code traffic parks a named master via native `/completion`, children `POST /fork` with `parent_session_id`, leave via `POST /close_session`. `/v1/chat/completions` is never the session path. Missing routes or unknown session **error the request** (no silent cold prefill). Inherit proof: HTTP `cache_n` / `prompt_n`. Headers: `x-spock-session`, `x-spock-parent-session`, `x-spock-close-session`. `cache_control` on the shared prefix names the master.
 - **Generalized OAuth providers** — registry-driven `spock login|logout <provider>` / `spock providers` (xai, kimi, qwen); status + menus follow the table
 - Backend types: `oauth` / `api_key` / `anthropic` (Settings labels: **OAuth** / **API Key** / **Anthropic**)
 - **Kimi Code** OAuth (`provider = "kimi"`, `https://api.kimi.com/coding/v1`, KimiCLI UA + X-Msh headers)
@@ -20,7 +23,11 @@ All notable changes to Spock are documented here.
 - Product framing: multi-backend Anthropic Messages proxy (not Grok-only)
 
 ### Fixed
-- **Vision / screenshots via path paste**: Claude Code `Read` on a `.png`/`.jpg` returns image blocks inside `tool_result.content`. Spock's translator used `blocks_text()` and silently dropped those images, so Grok/Kimi/Qwen/Ollama never saw pixels and hallucinated screenshot contents. Tool results with images are now OpenAI multipart (`text` + `image_url`); text-only tool results stay plain strings.
+- **Mid-conversation `role:"system"` reminders 400 on template-strict upstreams**: Claude Code delivers some system-reminders (e.g. the Agent-tool types list) as `role:"system"` messages *inside* `messages`. Qwen3.5+ jinja chat templates (SGLang / vLLM / llama.cpp) hard-400 with `System message must be at the beginning.` — LAN Qwen looked dead (GPU idle) while every request died at template validation. Generic (OpenAI-compat) backends and the llama-server KV path now fold non-leading system messages into user turns wrapped in `<system-reminder>` tags (the client's own idiom); xAI / Kimi keep passthrough.
+- **z.ai GLM 5.3 text-only content**: Claude Code screenshots become OpenAI `image_url` parts; GLM-5.3 400s `messages.content.type is invalid, allowed values: ['text']`. Flatten images to a text note for `glm-5.3*` only — vision backends unchanged.
+- **Accepted sockets inherit `O_NONBLOCK` on Darwin**: listen socket is nonblocking so the accept loop can poll shutdown. macOS/`accept()` copies that flag onto the client fd; `read_exact` then returns `WouldBlock` (os error 35) as soon as the kernel buffer is empty. Claude Code reports `ECONNRESET`; Grok Build reports `reqwest error stream: error sending request`. Force blocking + idle timeouts on every accepted socket. `/v1/chat/completions` now logs `route` and emits a stream error event instead of dying silent.
+- **Catalog `/v1/models`**: non-empty catalog is served from local entries only. Live backend `/models` probes no longer block Grok's ~5s catalog fetch (empty `/model` picker, `unknown` footer).
+- **Advisor protocol**: run the nested review; never leak `advisor` as client `tool_use` (`No such tool available: advisor`). Flatten leftover `server_tool_use` / `advisor_tool_result` to text on the OpenAI-compat path (xAI 400). VSCodium 2.1.226 webview cannot render those block types (`Unsupported content type: server_tool_use` as a chat line) — emit labeled **text** instead. Strip `<|eos|>`. Log advisor start/end/duration.
 - **WebSearch on stream**: Claude Code nested `web_search_20250305` calls now run Spock server-tool emulation (was skipped when `stream:true`); emit real `server_tool_use` + `web_search_tool_result` blocks; SSE keepalives during long rounds
 - **Login…** from the menu bar runs as a direct child process (no Terminal/AppleScript stall)
 - Menu + CLI surface already-logged-in OAuth state clearly

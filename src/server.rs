@@ -3,9 +3,7 @@
 use crate::backends::{get_backend, UpstreamBody};
 use crate::config::{EnvOverrides, DEFAULT_GROK_MODEL};
 use crate::error::{anthropic_error, Error, Result};
-use crate::models::{
-    alias_models, context_window_from_card, model_card, model_card_full, stop_reason,
-};
+use crate::models::{alias_models, catalog_list_cards, model_card, model_card_full, stop_reason};
 use crate::route;
 use crate::state::AppState;
 use crate::translate::{
@@ -27,7 +25,7 @@ pub fn serve(state: AppState, shutdown: Arc<AtomicBool>) -> Result<()> {
     let profile = state.with_config(|c| c.server.profile.clone())?;
     eprintln!("Spock proxy on http://{addr}");
     eprintln!("  profile: {profile}");
-    eprintln!("  POST /v1/messages | /v1/chat/completions | Ctrl-C to stop\n");
+    eprintln!("  POST /v1/messages | /v1/chat/completions | /v1/responses | Ctrl-C to stop\n");
 
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -35,7 +33,9 @@ pub fn serve(state: AppState, shutdown: Arc<AtomicBool>) -> Result<()> {
                 let st = state.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_client(stream, st) {
-                        // broken pipe etc. — ignore noisy clients
+                        // broken pipe / reset — client gone. Do not swallow
+                        // WouldBlock: that is the inherited-O_NONBLOCK bug
+                        // configure_accepted_socket is supposed to kill.
                         if !matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe
                             || io.kind() == std::io::ErrorKind::ConnectionReset)
                         {
@@ -61,16 +61,29 @@ struct Request {
     method: String,
     path: String,
     body: Vec<u8>,
+    headers: std::collections::BTreeMap<String, String>,
 }
 
-fn handle_client(mut stream: TcpStream, state: AppState) -> Result<()> {
-    // Idle timeouts only (reset on each successful read/write). Do not use short
-    // total-request caps — LAN streaming generations can run 30–60+ minutes while
-    // still producing SSE deltas.
+/// Listen socket is nonblocking so the accept loop can poll the shutdown flag.
+/// On Darwin (and some BSDs) `accept()` copies `O_NONBLOCK` onto the new fd.
+/// `read_exact` then returns `WouldBlock` / os error 35 as soon as the kernel
+/// buffer is empty — common on large Claude Code POSTs and Grok Build streams.
+/// The client sees `ECONNRESET` / reqwest `error sending request`. Linux does
+/// not inherit; `set_nonblocking(false)` is a no-op there.
+fn configure_accepted_socket(stream: &mut TcpStream) -> Result<()> {
+    stream.set_nonblocking(false)?;
+    // Idle timeouts only (reset on each successful read/write). Do not use
+    // short total-request caps — LAN streaming generations can run 30–60+
+    // minutes while still producing SSE deltas.
     let idle = Duration::from_secs(3600);
     stream.set_read_timeout(Some(idle))?;
     stream.set_write_timeout(Some(idle))?;
     let _ = stream.set_nodelay(true);
+    Ok(())
+}
+
+fn handle_client(mut stream: TcpStream, state: AppState) -> Result<()> {
+    configure_accepted_socket(&mut stream)?;
     let req = read_request(&mut stream)?;
     let path = req.path.split('?').next().unwrap_or(&req.path).to_string();
     eprintln!("  {} {path}", req.method);
@@ -123,7 +136,7 @@ fn handle_client(mut stream: TcpStream, state: AppState) -> Result<()> {
         }
         ("POST", "/v1/messages") => {
             let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
-            handle_messages(&mut stream, &state, body)?;
+            handle_messages(&mut stream, &state, body, &req.headers)?;
         }
         ("POST", "/v1/messages/count_tokens") => {
             let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
@@ -132,7 +145,11 @@ fn handle_client(mut stream: TcpStream, state: AppState) -> Result<()> {
         }
         ("POST", "/v1/chat/completions") => {
             let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
-            handle_openai(&mut stream, &state, body)?;
+            handle_openai(&mut stream, &state, body, &req.headers)?;
+        }
+        ("POST", "/v1/responses") => {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+            handle_responses(&mut stream, &state, body)?;
         }
         _ => {
             let (st, err) = anthropic_error(404, "not_found_error", &format!("not found: {path}"));
@@ -151,6 +168,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
     let path = parts.next().unwrap_or("/").to_string();
 
     let mut content_length = 0usize;
+    let mut headers = std::collections::BTreeMap::new();
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -159,16 +177,24 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim().to_string();
+            if key == "content-length" {
+                content_length = val.parse().unwrap_or(0);
             }
+            headers.insert(key, val);
         }
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
     }
-    Ok(Request { method, path, body })
+    Ok(Request {
+        method,
+        path,
+        body,
+        headers,
+    })
 }
 
 fn write_json(stream: &mut TcpStream, status: u16, body: &Value) -> Result<()> {
@@ -263,6 +289,20 @@ fn handle_admin_put_config(stream: &mut TcpStream, state: &AppState, body: Value
                     if let Some(old_p) = old.profiles.get(name) {
                         if !old_p.exact.is_empty() {
                             prof.exact = old_p.exact.clone();
+                        }
+                    }
+                }
+                // Settings form has no kv_sessions checkbox — keep TOML value.
+                for (name, be) in cfg.backends.iter_mut() {
+                    if let Some(old_b) = old.backends.get(name) {
+                        if let (
+                            crate::config::BackendConfig::ApiKey { kv_sessions, .. },
+                            crate::config::BackendConfig::ApiKey {
+                                kv_sessions: keep, ..
+                            },
+                        ) = (be, old_b)
+                        {
+                            *kv_sessions = *keep;
                         }
                     }
                 }
@@ -515,6 +555,7 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
                     entry.context_window,
                     entry.name.as_deref(),
                     entry.description.as_deref(),
+                    entry.supports_reasoning_effort,
                 ),
             );
         }
@@ -528,54 +569,9 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
     // Empty catalog keeps the legacy merge (backends + aliases) below.
     let catalog_entries = state.with_config(|c| c.catalog.entries.clone())?;
     if !catalog_entries.is_empty() {
-        // Optional live context discovery from backend /models cards.
-        let mut upstream_cw: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
-        {
-            let handles: Vec<_> = {
-                let backends = state
-                    .backends
-                    .read()
-                    .map_err(|_| Error::Msg("backends lock".into()))?;
-                backends.values().cloned().collect()
-            };
-            for be in &handles {
-                if let Ok(raw) = be.get_json("/models", &state.oauth) {
-                    if let Some(data) = raw.get("data").and_then(|d| d.as_array()) {
-                        for m in data {
-                            if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
-                                if let Some(cw) = context_window_from_card(m) {
-                                    upstream_cw.insert(id.to_string(), cw);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut data: Vec<Value> = Vec::with_capacity(catalog_entries.len());
-        let mut seen = std::collections::BTreeSet::new();
-        for entry in &catalog_entries {
-            let id = entry.id.trim();
-            if id.is_empty() || !seen.insert(id.to_string()) {
-                continue;
-            }
-            // Prefer explicit catalog context_window; else map via route → upstream bare id.
-            let mut cw = entry.context_window.filter(|c| *c > 0);
-            if cw.is_none() {
-                if let Ok(resolved) = state.with_config(|c| route::resolve(c, id))? {
-                    cw = upstream_cw.get(&resolved.upstream_model).copied();
-                }
-            }
-            data.push(model_card_full(
-                id,
-                "spock-catalog",
-                cw,
-                entry.name.as_deref(),
-                entry.description.as_deref(),
-            ));
-        }
+        // Local catalog only. Do not probe backends here — a hung LAN/Ollama
+        // `/models` would miss Grok Build's ~5s catalog fetch and empty `/model`.
+        let data = catalog_list_cards(&catalog_entries);
         return write_json(
             stream,
             200,
@@ -623,7 +619,54 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
     )
 }
 
-fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Result<()> {
+/// grok-build `web_search` POSTs OpenAI Responses (`{base}/responses` + hosted
+/// `web_search` tool). Search-only: run `[web_search]`, return a completed
+/// Responses object. Anything else is 400 — this is not a general Responses
+/// proxy and must not fall through to chat/completions.
+fn handle_responses(sock: &mut TcpStream, state: &AppState, body: Value) -> Result<()> {
+    let web_cfg = {
+        let c = state.snapshot_config()?;
+        crate::server_tools::WebSearchConfig {
+            enabled: c.web_search.enabled,
+            provider: c.web_search.provider.clone(),
+            base_url: c.web_search.base_url.clone(),
+            api_key: c.web_search.api_key.clone(),
+            api_key_env: c.web_search.api_key_env.clone(),
+            max_results: c.web_search.max_results,
+        }
+    };
+    match crate::server_tools::responses_web_search(&web_cfg, &body) {
+        Ok(out) => {
+            let q = crate::server_tools::responses_query(&body).unwrap_or("");
+            eprintln!(
+                "  responses web_search q={q:?} provider={}",
+                web_cfg.provider
+            );
+            write_json(sock, 200, &out)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!("  responses error: {msg}");
+            let (st, ty) = if msg.contains("disabled")
+                || msg.contains("search-only")
+                || msg.contains("empty input")
+            {
+                (400, "invalid_request_error")
+            } else {
+                (502, "api_error")
+            };
+            let (http, err) = anthropic_error(st, ty, &msg);
+            write_json(sock, http, &err)
+        }
+    }
+}
+
+fn handle_messages(
+    sock: &mut TcpStream,
+    state: &AppState,
+    mut a: Value,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     let client_model = a
         .get("model")
         .and_then(|m| m.as_str())
@@ -663,19 +706,7 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
             Ok(UpstreamBody::Stream(reader)) => {
                 // Raw Anthropic SSE passthrough
                 write_sse_headers(sock)?;
-                let mut buf = [0u8; 8192];
-                let mut r = reader;
-                loop {
-                    match r.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            sock.write_all(&buf[..n])?;
-                            sock.flush()?;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                Ok(())
+                pump_upstream_sse(sock, state, reader, "anthropic")
             }
             Err(e) => write_upstream_err(sock, state, e),
         };
@@ -683,6 +714,10 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
 
     // Microcompact + drop Anthropic-only keys before OpenAI-compat / xAI translation.
     prepare_for_openai_compat(&mut a);
+
+    if be.config.kv_sessions() {
+        return handle_kv_sessions(sock, state, &a, headers, &resolved, &be, false);
+    }
 
     let oai = anthropic_to_openai(&a, &resolved.upstream_model, be.quirk, &env.grok_model);
     let include_thinking = wants_thinking(&a);
@@ -801,6 +836,57 @@ fn handle_messages(sock: &mut TcpStream, state: &AppState, mut a: Value) -> Resu
             }
             Err(e) => write_upstream_err(sock, state, e),
         }
+    }
+}
+
+fn handle_kv_sessions(
+    sock: &mut TcpStream,
+    state: &AppState,
+    a: &Value,
+    headers: &std::collections::BTreeMap<String, String>,
+    resolved: &route::ResolvedRoute,
+    be: &crate::backends::BackendHandle,
+    openai_wire: bool,
+) -> Result<()> {
+    let mut work = a.clone();
+    let hint = crate::kv_sessions::take_session_hint(&mut work, headers);
+    let include_thinking = wants_thinking(a);
+    let do_stream = a.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let n_predict = a.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(1024);
+    eprintln!(
+        "  route {} → {}:{} (kv-sessions native /fork parent={:?} session={:?})",
+        resolved.client_model,
+        resolved.backend,
+        resolved.upstream_model,
+        hint.parent_session_id,
+        hint.session_id
+    );
+    match crate::kv_sessions::run_turn(state, be, &work, &hint, do_stream, n_predict) {
+        Ok((_master, UpstreamBody::Json(o))) => {
+            if openai_wire {
+                write_json(sock, 200, &o)
+            } else {
+                let resp = openai_to_anthropic(&o, &resolved.client_model, include_thinking);
+                write_json(sock, 200, &resp)
+            }
+        }
+        Ok((_master, UpstreamBody::Stream(reader))) => {
+            if openai_wire {
+                write_sse_headers(sock)?;
+                pump_upstream_sse(sock, state, reader, "kv-sessions")
+            } else {
+                let input_estimate = count_tokens_estimate(a);
+                stream_anthropic(
+                    sock,
+                    reader,
+                    &resolved.client_model,
+                    include_thinking,
+                    input_estimate,
+                    state,
+                )
+            }
+        }
+        Err(e) => write_upstream_err(sock, state, e),
     }
 }
 
@@ -1307,7 +1393,12 @@ fn stream_anthropic(
     Ok(())
 }
 
-fn handle_openai(sock: &mut TcpStream, state: &AppState, mut body: Value) -> Result<()> {
+fn handle_openai(
+    sock: &mut TcpStream,
+    state: &AppState,
+    mut body: Value,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     let client_model = body
         .get("model")
         .and_then(|m| m.as_str())
@@ -1332,40 +1423,138 @@ fn handle_openai(sock: &mut TcpStream, state: &AppState, mut body: Value) -> Res
         }
     };
 
+    if be.config.kv_sessions() {
+        // OpenAI-shaped body: wrap as a fake Anthropic request so the same
+        // native park/fork path runs. Fail loud — never chat/completions.
+        let mut fake = json!({
+            "model": resolved.upstream_model,
+            "messages": body.get("messages").cloned().unwrap_or(json!([])),
+            "max_tokens": body.get("max_tokens").cloned().unwrap_or(json!(1024)),
+            "stream": body.get("stream").cloned().unwrap_or(json!(false)),
+        });
+        if let Some(sys) = body.get("system") {
+            fake["system"] = sys.clone();
+        }
+        if let Some(tools) = body.get("tools") {
+            fake["tools"] = tools.clone();
+        }
+        if let Some(obj) = body.as_object() {
+            for k in [
+                "session_id",
+                "parent_session_id",
+                "close_session",
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "repeat_penalty",
+                "seed",
+                "stop",
+                "stop_sequences",
+            ] {
+                if let Some(v) = obj.get(k) {
+                    fake[k] = v.clone();
+                }
+            }
+        }
+        return handle_kv_sessions(sock, state, &fake, headers, &resolved, &be, true);
+    }
+
     if be.quirk == CompletionsQuirk::Xai {
         let env = EnvOverrides::from_env();
         let reasoning =
             crate::models::is_reasoning_model(&resolved.upstream_model, &env.grok_model);
         crate::models::sanitize_upstream(&mut body, reasoning);
+    } else if matches!(be.quirk, CompletionsQuirk::Kimi | CompletionsQuirk::Generic) {
+        // Never forward reasoning_effort "none" (some OpenAI-compat servers 400).
+        if let Some(obj) = body.as_object_mut() {
+            if obj.get("reasoning_effort").and_then(|v| v.as_str()) == Some("none") {
+                obj.remove("reasoning_effort");
+            }
+        }
     }
 
     let stream_flag = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    eprintln!(
+        "  route {} → {}:{} ({}) [openai{}]",
+        client_model,
+        resolved.backend,
+        resolved.upstream_model,
+        match be.quirk {
+            CompletionsQuirk::Xai => "xai",
+            CompletionsQuirk::Kimi => "kimi",
+            CompletionsQuirk::Generic => "generic",
+        },
+        if stream_flag { "+stream" } else { "" }
+    );
     match be.chat(&body, stream_flag, &state.oauth) {
         Ok(UpstreamBody::Json(v)) => write_json(sock, 200, &v),
-        Ok(UpstreamBody::Stream(mut reader)) => {
+        Ok(UpstreamBody::Stream(reader)) => {
             write_sse_headers(sock)?;
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        sock.write_all(&buf[..n])?;
-                        sock.flush()?;
-                    }
-                    Err(_) => break,
-                }
-            }
-            Ok(())
+            pump_upstream_sse(sock, state, reader, "openai")
         }
         Err(e) => write_upstream_err(sock, state, e),
     }
 }
 
+/// Copy an upstream SSE body to the client. A silent `Err(_) => break` here
+/// is what Grok Build reports as `reqwest error stream: error sending request`
+/// — the socket just dies with no error event.
+fn pump_upstream_sse(
+    sock: &mut TcpStream,
+    state: &AppState,
+    mut reader: Box<dyn Read + Send>,
+    label: &str,
+) -> Result<()> {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                sock.write_all(&buf[..n])?;
+                sock.flush()?;
+            }
+            Err(e) => {
+                let msg = format!("spock {label} stream: {e}");
+                eprintln!("  {msg}");
+                state.record_upstream_error(502, &msg);
+                let payload = json!({"error": {"message": msg, "type": "api_error"}});
+                if let Ok(s) = serde_json::to_string(&payload) {
+                    let _ = write!(sock, "data: {s}\n\n");
+                    let _ = sock.flush();
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_upstream_err(stream: &mut TcpStream, state: &AppState, e: Error) -> Result<()> {
     match e {
+        Error::Http(400, body) => {
+            let raw = extract_err_msg(&body);
+            let looks_kv = raw.contains("session")
+                || raw.contains("kv_sessions")
+                || raw.contains("/fork")
+                || raw.contains("close_session");
+            if looks_kv {
+                // Unknown session / bad native schema: pass 400. Do not remap to 502
+                // and do not retry cold.
+                let msg = format!("Spock kv_sessions 400: {raw}");
+                state.record_upstream_error(400, &msg);
+                let (st, err) = anthropic_error(400, "invalid_request_error", &msg);
+                write_json(stream, st, &err)
+            } else {
+                let (out_status, err_type, msg) = classify_upstream_http(400, &raw);
+                state.record_upstream_error(out_status, &msg);
+                let (st, err) = anthropic_error(out_status, err_type, &msg);
+                write_json(stream, st, &err)
+            }
+        }
         Error::Http(code, body) => {
             let raw = extract_err_msg(&body);
             let (out_status, err_type, msg) = classify_upstream_http(code, &raw);
@@ -1374,9 +1563,23 @@ fn write_upstream_err(stream: &mut TcpStream, state: &AppState, e: Error) -> Res
             write_json(stream, st, &err)
         }
         other => {
-            let msg = format!("spock backend error: {other}");
-            state.record_upstream_error(502, &msg);
-            let (st, err) = anthropic_error(502, "api_error", &msg);
+            let raw = other.to_string();
+            let status = if raw.contains("named master")
+                || raw.contains("cache_control")
+                || raw.contains("session_id")
+            {
+                400
+            } else {
+                502
+            };
+            let msg = format!("spock backend error: {raw}");
+            state.record_upstream_error(status, &msg);
+            let err_type = if status == 400 {
+                "invalid_request_error"
+            } else {
+                "api_error"
+            };
+            let (st, err) = anthropic_error(status, err_type, &msg);
             write_json(stream, st, &err)
         }
     }
@@ -1578,5 +1781,89 @@ mod upstream_err_tests {
         assert_eq!(st, 502);
         assert_eq!(ty, "rate_limit_error");
         assert!(msg.contains("429"), "{msg}");
+    }
+}
+
+/// Darwin `accept()` copies `O_NONBLOCK` from the listen socket. A body that
+/// arrives after headers (Claude Code / Grok Build) then `read_exact`s into
+/// WouldBlock and the client sees ECONNRESET / reqwest "error sending request".
+#[cfg(test)]
+mod accepted_socket_tests {
+    use super::{configure_accepted_socket, read_request};
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    fn bind_nonblocking() -> (TcpListener, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("listen nonblock");
+        let port = listener.local_addr().expect("addr").port();
+        (listener, port)
+    }
+
+    fn accept_one(listener: &TcpListener) -> TcpStream {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((s, _)) => return s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        panic!("accept timeout");
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
+    }
+
+    fn delayed_post(configure: bool) -> std::result::Result<super::Request, crate::error::Error> {
+        let (listener, port) = bind_nonblocking();
+        let body = b"{\"model\":\"x\"}";
+        let client = thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            let head = format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            c.write_all(head.as_bytes()).expect("headers");
+            c.flush().ok();
+            // Gap that used to trip inherited O_NONBLOCK + read_exact.
+            thread::sleep(Duration::from_millis(80));
+            c.write_all(body).expect("body");
+            c.flush().ok();
+            thread::sleep(Duration::from_millis(80));
+        });
+        let mut server = accept_one(&listener);
+        if configure {
+            configure_accepted_socket(&mut server).expect("configure");
+        }
+        let req = read_request(&mut server);
+        let _ = client.join();
+        req
+    }
+
+    /// Control: inherited O_NONBLOCK + delayed body must fail, or the Darwin
+    /// inherit theory is dead and this patch is the wrong first move.
+    #[test]
+    fn delayed_post_body_fails_without_configure() {
+        match delayed_post(false) {
+            Err(crate::error::Error::Io(io)) => assert_eq!(
+                io.kind(),
+                std::io::ErrorKind::WouldBlock,
+                "expected WouldBlock, got {io}"
+            ),
+            Err(other) => panic!("expected Io(WouldBlock), got {other}"),
+            Ok(_) => panic!("inherit theory: delayed body must EAGAIN without configure"),
+        }
+    }
+
+    #[test]
+    fn delayed_post_body_is_fully_read() {
+        let req = delayed_post(true).expect("read_request");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/messages");
+        assert_eq!(req.body, b"{\"model\":\"x\"}");
     }
 }

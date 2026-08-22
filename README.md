@@ -47,7 +47,7 @@ If something breaks after a Claude Code upgrade: note **both** Spock and Claude 
 **Known limits on the verified stack (not full breakage)**
 
 - Server-tool emulation is **opt-in** via `[advisor]` / `[web_search]` in config (defaults off). Without them, `advisor_20260301` / `web_search_*` schemas are stripped for OpenAI-compat upstreams.
-- Advisor/web_search results are rendered as **plain text** in the IDE webview (webview 2.1.207 has no `advisor_tool_result` renderer); CLI TUI still works either way.
+- Advisor runs as a nested review, then comes back as a **text** block (`Advisor review:…`). VSCodium/VS Code 2.1.226 webview has no renderer for `server_tool_use` / `advisor_tool_result` and prints those names as chat lines. Never returned as a client `tool_use` (`No such tool available: advisor`). Pin `[advisor].model` to a **different** route than the executor or the reviewer just continues the agent voice. History that still has the protocol blocks is flattened on the OpenAI-compat path.
 - OpenAI Responses API flag exists but is **not implemented** — leave `use_responses_api = false` (Chat Completions).
 - Client-side microcompact runs when Claude Code sends `context_management` edits; Anthropic passthrough leaves them for real Anthropic.
 
@@ -387,6 +387,7 @@ spock help
 | `POST /v1/messages` | Anthropic Messages (stream + tools + thinking) |
 | `POST /v1/messages/count_tokens` | Rough estimate (chars/4) |
 | `POST /v1/chat/completions` | OpenAI-style (raw stream passthrough) |
+| `POST /v1/responses` | Search-only (grok-build `web_search`). Runs `[web_search]`; not a general Responses proxy |
 | `GET /v1/models` | Merged backend lists + Claude aliases |
 | `GET /v1/models/{id}` | Never 404s for aliases |
 | `GET /v1/language-models*` | xAI extended list when available |
@@ -460,6 +461,7 @@ Workflows: [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/wor
 | xAI / backend quota or 401 in VSCodium | Prefer latest Spock — upstream 401/402/403/429 → **502** with a loud `Spock upstream …` message (not Anthropic login). Check `spock status` / `xai_auth`, credits on console.x.ai, or switch profile |
 | `tool_choice set but no tools` | Fixed when tools are stripped (server tools); upgrade Spock |
 | Auto Mode “claude-opus-… unavailable” | Often dead **opus** route or (older Spock) `reasoning_effort: none`. Point opus at a live backend; use Spock with the thinking-disabled fix |
+| Claude Code `ECONNRESET` / Grok Build `reqwest error stream: error sending request` | Darwin `accept()` used to inherit `O_NONBLOCK` from the listen socket. Rebuild (`./packaging/macos/build-app.sh`) and restart Spock. If it still happens: `spock.log` should now show `route … [openai+stream]` and `spock openai stream: …` instead of a silent drop. Direct LAN vs SSH tunnel is a separate hop. |
 
 Proxy logs each request with the resolved route, e.g.:
 

@@ -283,7 +283,8 @@ final class AppModel: ObservableObject {
                     routeId: e["id"] as? String ?? "",
                     name: e["name"] as? String ?? "",
                     description: e["description"] as? String ?? "",
-                    contextWindow: e["context_window"] as? String ?? ""
+                    contextWindow: e["context_window"] as? String ?? "",
+                    supportsReasoningEffort: Self.normalizeEffort(e["supports_reasoning_effort"])
                 )
             }
         } else {
@@ -385,6 +386,7 @@ final class AppModel: ObservableObject {
                     "name": e.name.trimmingCharacters(in: .whitespacesAndNewlines),
                     "description": e.description.trimmingCharacters(in: .whitespacesAndNewlines),
                     "context_window": e.contextWindow.trimmingCharacters(in: .whitespacesAndNewlines),
+                    "supports_reasoning_effort": e.supportsReasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines),
                 ] as [String: Any]
             },
             "advisor": [
@@ -641,7 +643,8 @@ final class AppModel: ObservableObject {
                 routeId: route.isEmpty ? "xai:grok-4.5" : route,
                 name: name,
                 description: "",
-                contextWindow: contextWindow
+                contextWindow: contextWindow,
+                supportsReasoningEffort: ""
             )
         )
     }
@@ -833,6 +836,24 @@ final class AppModel: ObservableObject {
         statusMessage = ""
         statusIsError = false
     }
+
+    /// Match web Settings: empty/auto → ""; 1/true/yes/on → "1"; 0/false/no/off → "0".
+    fileprivate static func normalizeEffort(_ raw: Any?) -> String {
+        if let b = raw as? Bool {
+            return b ? "1" : "0"
+        }
+        let s = (raw as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch s {
+        case "", "auto":
+            return ""
+        case "1", "true", "yes", "on":
+            return "1"
+        case "0", "false", "no", "off":
+            return "0"
+        default:
+            return ""
+        }
+    }
 }
 
 struct OauthProviderInfo: Identifiable, Equatable {
@@ -876,4 +897,6 @@ struct CatalogRow: Identifiable, Equatable {
     var description: String
     /// Token count as text for the form (empty = discover / default).
     var contextWindow: String
+    /// "" = auto heuristic; "1" force on; "0" force off. Same as web Settings.
+    var supportsReasoningEffort: String
 }

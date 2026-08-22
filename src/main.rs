@@ -2,6 +2,7 @@ mod backends;
 mod cli;
 mod config;
 mod error;
+mod kv_sessions;
 mod models;
 mod oauth;
 mod route;

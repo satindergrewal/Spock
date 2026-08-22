@@ -154,6 +154,7 @@ mod tests {
                 use_responses_api: false,
                 azure_deployment: None,
                 azure_api_version: None,
+                kv_sessions: false,
             },
         );
         let mut profiles = BTreeMap::new();

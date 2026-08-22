@@ -1,3 +1,4 @@
+use crate::config::CatalogEntry;
 use serde_json::{json, Value};
 
 /// Claude Code context-window hints like [1m] / [500k] — strip before upstream.
@@ -58,15 +59,22 @@ pub fn map_model_legacy(model: Option<&str>, default: &str, small: &str) -> Stri
     default.to_string()
 }
 
+/// Bare id after `[1m]` / `xai:` strip. Grok 4+ reject `stop` (and a few
+/// other OpenAI params). Match the family — pinning 4.3/4.5 already 400'd on 4.6.
+fn is_xai_reasoning_family(bare: &str) -> bool {
+    bare.starts_with("grok-4") || bare.starts_with("grok-5")
+}
+
 pub fn is_reasoning_model(model: &str, default_model: &str) -> bool {
     let m = strip_ctx_suffix(model).to_lowercase();
     if m.is_empty() {
         return false;
     }
-    if m == "grok-4.5" || m == "grok-4.3" {
+    let bare = m.strip_prefix("xai:").unwrap_or(m.as_str());
+    if is_xai_reasoning_family(bare) {
         return true;
     }
-    if m.contains("reasoning") || m.contains("multi-agent") {
+    if bare.contains("reasoning") || bare.contains("multi-agent") {
         return true;
     }
     if m == strip_ctx_suffix(default_model).to_lowercase() {
@@ -92,17 +100,19 @@ pub fn sanitize_upstream(req: &mut Value, is_reasoning: bool) {
 }
 
 pub fn model_card(id: &str, owned_by: &str) -> Value {
-    model_card_full(id, owned_by, None, None, None)
+    model_card_full(id, owned_by, None, None, None, None)
 }
 
 /// OpenAI-style model card plus fields Grok Build reads from `/v1/models`
-/// (`context_window` / `contextWindow`, `model`, optional `name`).
+/// (`context_window` / `contextWindow`, `model`, optional `name`,
+/// `supportsReasoningEffort`).
 pub fn model_card_full(
     id: &str,
     owned_by: &str,
     context_window: Option<u64>,
     name: Option<&str>,
     description: Option<&str>,
+    supports_reasoning_effort: Option<bool>,
 ) -> Value {
     let display = name.unwrap_or(id);
     let mut card = json!({
@@ -124,11 +134,57 @@ pub fn model_card_full(
         if let Some(d) = description.map(str::trim).filter(|s| !s.is_empty()) {
             obj.insert("description".into(), json!(d));
         }
+        // Grok Build gates `/effort` on this flag (top-level or `_meta`).
+        // Explicit catalog value wins; else heuristic on id/name.
+        let supports = supports_reasoning_effort
+            .unwrap_or_else(|| heuristic_supports_reasoning_effort(id, name));
+        if supports {
+            obj.insert("supportsReasoningEffort".into(), json!(true));
+            obj.insert("supports_reasoning_effort".into(), json!(true));
+        }
     }
     card
 }
 
+/// Cards for a non-empty catalog list. Local only — never probes backends.
+/// Empty / duplicate / whitespace ids are dropped. Context comes from the
+/// entry; missing windows stay unset (Grok defaults ~200k).
+pub fn catalog_list_cards(entries: &[CatalogEntry]) -> Vec<Value> {
+    let mut data = Vec::with_capacity(entries.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in entries {
+        let id = entry.id.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        data.push(model_card_full(
+            id,
+            "spock-catalog",
+            entry.context_window.filter(|c| *c > 0),
+            entry.name.as_deref(),
+            entry.description.as_deref(),
+            entry.supports_reasoning_effort,
+        ));
+    }
+    data
+}
+
+/// Conservative default when catalog omits `supports_reasoning_effort`.
+/// xAI Grok, Kimi, DeepSeek (incl. LAN gguf paths) → true; plain local
+/// chat models stay false so Grok doesn't fake a control that does nothing.
+pub fn heuristic_supports_reasoning_effort(id: &str, name: Option<&str>) -> bool {
+    let blob = format!("{} {}", id, name.unwrap_or("")).to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "grok", "xai:", "kimi", "deepseek", "dsv4", "ds-v4", "r1",
+        // common reasoning-model tags
+        "reasoner", "thinking",
+    ];
+    NEEDLES.iter().any(|n| blob.contains(n))
+}
+
 /// Pull a context-window hint out of a backend `/models` card if present.
+/// List path no longer probes; kept for tests and `GET /v1/models/{id}` fallbacks.
+#[allow(dead_code)]
 pub fn context_window_from_card(card: &Value) -> Option<u64> {
     let obj = card.as_object()?;
     let keys = [
@@ -255,6 +311,25 @@ mod tests {
         assert!(is_reasoning_model("foo-reasoning", "grok-4.5"));
         assert!(is_reasoning_model("grok-4.5[1m]", "other"));
         assert!(is_reasoning_model("custom", "custom"));
+        // Family, not a pinned id — this is the 4.6 stop-400 hole.
+        assert!(is_reasoning_model("grok-4.6", "other"));
+        assert!(is_reasoning_model("grok-4.6[1m]", "other"));
+        assert!(is_reasoning_model("grok-4", "other"));
+        assert!(is_reasoning_model("grok-4-fast", "other"));
+        assert!(is_reasoning_model("xai:grok-4.6", "other"));
+        assert!(is_reasoning_model("grok-5", "other"));
+        // Pre-4 stays non-reasoning so `stop` still forwards.
+        assert!(!is_reasoning_model("grok-3", "other"));
+        assert!(!is_reasoning_model("grok-2", "other"));
+    }
+
+    #[test]
+    fn sanitize_drops_stop_on_grok_4_6() {
+        let mut v = json!({"stop": ["</block>"], "presence_penalty": 1.0, "model": "grok-4.6"});
+        sanitize_upstream(&mut v, is_reasoning_model("grok-4.6", "grok-4.5"));
+        assert!(v.get("stop").is_none());
+        assert!(v.get("presence_penalty").is_none());
+        assert_eq!(v["model"], "grok-4.6");
     }
 
     #[test]
@@ -275,6 +350,47 @@ mod tests {
     }
 
     #[test]
+    fn catalog_list_is_local_only() {
+        let entries = vec![
+            CatalogEntry {
+                id: "xai:grok-4.5".into(),
+                name: Some("Grok 4.5".into()),
+                description: None,
+                context_window: Some(500_000),
+                supports_reasoning_effort: None,
+            },
+            CatalogEntry {
+                id: "  ".into(),
+                name: None,
+                description: None,
+                context_window: None,
+                supports_reasoning_effort: None,
+            },
+            CatalogEntry {
+                id: "xai:grok-4.5".into(),
+                name: Some("dup".into()),
+                description: None,
+                context_window: Some(1),
+                supports_reasoning_effort: None,
+            },
+            CatalogEntry {
+                id: "ollama:llama3.2".into(),
+                name: Some("Llama".into()),
+                description: None,
+                context_window: Some(128_000),
+                supports_reasoning_effort: None,
+            },
+        ];
+        let cards = catalog_list_cards(&entries);
+        assert_eq!(cards.len(), 2, "blank + duplicate ids dropped");
+        assert_eq!(cards[0]["id"], "xai:grok-4.5");
+        assert_eq!(cards[0]["context_window"], 500_000);
+        assert_eq!(cards[0]["supportsReasoningEffort"], true);
+        assert_eq!(cards[1]["id"], "ollama:llama3.2");
+        assert!(cards[1].get("supportsReasoningEffort").is_none());
+    }
+
+    #[test]
     fn model_card_full_emits_context_for_grok() {
         let c = model_card_full(
             "xai:grok-4.5",
@@ -282,6 +398,7 @@ mod tests {
             Some(500_000),
             Some("Grok 4.5"),
             Some("native"),
+            None,
         );
         assert_eq!(c["id"], "xai:grok-4.5");
         assert_eq!(c["model"], "xai:grok-4.5");
@@ -289,6 +406,44 @@ mod tests {
         assert_eq!(c["contextWindow"], 500_000);
         assert_eq!(c["name"], "Grok 4.5");
         assert_eq!(c["description"], "native");
+        assert_eq!(c["supportsReasoningEffort"], true);
+    }
+
+    #[test]
+    fn model_card_deepseek_lan_advertises_effort() {
+        let id = "lan:/mnt/nvme0/bigmodels/dsv4-flash/UD-Q4_K_XL/DeepSeek-V4-Flash-0731.gguf";
+        let c = model_card_full(
+            id,
+            "spock-catalog",
+            Some(500_000),
+            Some("DeepSeek V4 Flash 0731 - LAN"),
+            None,
+            None,
+        );
+        assert_eq!(c["supportsReasoningEffort"], true);
+    }
+
+    #[test]
+    fn model_card_plain_local_no_effort_by_default() {
+        let c = model_card_full(
+            "ollama:llama3.2",
+            "spock-catalog",
+            Some(128_000),
+            Some("Llama 3.2"),
+            None,
+            None,
+        );
+        assert!(c.get("supportsReasoningEffort").is_none());
+        // Explicit opt-in still works.
+        let c2 = model_card_full(
+            "ollama:llama3.2",
+            "spock-catalog",
+            None,
+            None,
+            None,
+            Some(true),
+        );
+        assert_eq!(c2["supportsReasoningEffort"], true);
     }
 
     #[test]

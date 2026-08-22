@@ -21,6 +21,8 @@ pub struct AppState {
     /// Internal mutexes only — do not wrap in another Mutex (refresh must not block all backends).
     pub oauth: Arc<OauthStore>,
     pub last_upstream_error: Arc<Mutex<Option<LastUpstreamError>>>,
+    /// Per-backend last `/fork` probe. `Ok` = implemented. Sticky 404 stays an error string.
+    pub kv_fork_probe: Arc<Mutex<HashMap<String, std::result::Result<(), String>>>>,
 }
 
 impl AppState {
@@ -31,6 +33,7 @@ impl AppState {
             backends: Arc::new(RwLock::new(backends)),
             oauth: Arc::new(OauthStore::default()),
             last_upstream_error: Arc::new(Mutex::new(None)),
+            kv_fork_probe: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -69,6 +72,9 @@ impl AppState {
             .backends
             .write()
             .map_err(|_| Error::Msg("backends lock".into()))? = backends;
+        if let Ok(mut g) = self.kv_fork_probe.lock() {
+            g.clear();
+        }
         Ok(())
     }
 

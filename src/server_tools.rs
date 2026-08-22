@@ -269,17 +269,26 @@ pub fn run_advisor_review(
     let mut messages = Vec::new();
     messages.push(json!({
         "role": "system",
-        "content": "You are a senior technical advisor. Review the conversation and return a concise plan or course-correction. Do not implement code. Be direct: verdict (approve/refine/pivot), plan steps, risks, and what to avoid."
+        "content": "You are a senior technical advisor reviewing another agent's work. You are NOT that agent. Do not continue its task, do not call tools, do not write first-person agent narration (\"I'll wait\", \"locking the call\"). Return only: verdict (approve / refine / pivot), plan steps, risks, and what to avoid."
     }));
-    // Flatten anthropic-ish or openai history into a single user brief if needed
+    // Flatten anthropic-ish or openai history into a single user brief if needed.
+    // History carries the converted leading system message; this body already
+    // has its own system at index 0, so demote the rest — template-strict
+    // advisor models (LAN Qwen) would 400 "System message must be at the
+    // beginning" exactly like the main path did.
     if let Some(arr) = history.as_array() {
         for m in arr {
-            messages.push(m.clone());
+            let mut m = m.clone();
+            if m.get("role").and_then(|r| r.as_str()) == Some("system") {
+                m["role"] = json!("user");
+            }
+            messages.push(m);
         }
     } else if let Some(arr) = history.get("messages").and_then(|m| m.as_array()) {
         for m in arr {
             // Convert anthropic content blocks to text if needed
             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let role = if role == "system" { "user" } else { role };
             let content = m.get("content");
             let text = match content {
                 Some(Value::String(s)) => s.clone(),
@@ -303,6 +312,7 @@ pub fn run_advisor_review(
         "temperature": 0.2
     });
 
+    let started = std::time::Instant::now();
     eprintln!(
         "  advisor → {}:{} ({})",
         resolved.backend,
@@ -310,25 +320,89 @@ pub fn run_advisor_review(
         be.family_name()
     );
 
-    match be.chat(&body, false, &state.oauth)? {
-        UpstreamBody::Json(o) => {
+    let out = match be.chat(&body, false, &state.oauth) {
+        Ok(UpstreamBody::Json(o)) => {
             let choice = o
                 .pointer("/choices/0/message/content")
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            if choice.is_empty() {
-                // reasoning-only fallback
-                let r = o
-                    .pointer("/choices/0/message/reasoning_content")
+            let text = if choice.is_empty() {
+                o.pointer("/choices/0/message/reasoning_content")
                     .and_then(|c| c.as_str())
-                    .unwrap_or("(empty advisor response)");
-                Ok(r.to_string())
+                    .unwrap_or("")
+                    .to_string()
             } else {
-                Ok(choice)
-            }
+                choice
+            };
+            Ok(sanitize_advisor_text(&text))
         }
-        UpstreamBody::Stream(_) => Err(Error::Msg("advisor: unexpected stream".into())),
+        Ok(UpstreamBody::Stream(_)) => Err(Error::Msg("advisor: unexpected stream".into())),
+        Err(e) => Err(e),
+    };
+    match &out {
+        Ok(text) => eprintln!(
+            "  advisor done {}ms ({} chars)",
+            started.elapsed().as_millis(),
+            text.len()
+        ),
+        Err(e) => eprintln!("  advisor error {}ms: {e}", started.elapsed().as_millis()),
+    }
+    out
+}
+
+/// Drop leaked stop tokens / chatml leftovers from Grok-family completions.
+fn sanitize_advisor_text(s: &str) -> String {
+    let mut t = s.replace("<|eos|>", "").replace("<|endoftext|>", "");
+    for marker in ["<|im_end|>", "<|im_start|>"] {
+        t = t.replace(marker, "");
+    }
+    t.trim().to_string()
+}
+
+/// Never hand advisor/web_search back as client `tool_use` — Claude Code has no
+/// local executor for them (`No such tool available: advisor`).
+fn strip_emulated_client_tool_use(anth: &mut Value) {
+    if let Some(content) = anth.get_mut("content").and_then(|c| c.as_array_mut()) {
+        content.retain(|b| {
+            !(b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && matches!(
+                    b.get("name").and_then(|n| n.as_str()),
+                    Some("advisor") | Some("web_search")
+                ))
+        });
+    }
+}
+
+/// VSCodium/VS Code webview (Claude Code 2.1.226) has no renderer for
+/// `server_tool_use` / `advisor_tool_result` — it prints
+/// `Unsupported content type: server_tool_use` as a chat line. The CLI TUI
+/// can render those blocks; Satinder's live client is the webview. Emit
+/// labeled text so the review is visible and the webview stays quiet.
+/// History that still carries the protocol blocks is flattened in
+/// `convert_messages` for xAI.
+fn advisor_content_blocks(_tool_use_id: &str, review: Result<String>) -> (String, Vec<Value>) {
+    match review {
+        Ok(text) => {
+            let text = if text.is_empty() {
+                "Advisor reviewed the conversation (empty response).".to_string()
+            } else {
+                text
+            };
+            let blocks = vec![json!({
+                "type": "text",
+                "text": format!("Advisor review:\n{text}")
+            })];
+            (text, blocks)
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            let blocks = vec![json!({
+                "type": "text",
+                "text": format!("Advisor unavailable: {msg}")
+            })];
+            (msg, blocks)
+        }
     }
 }
 
@@ -583,6 +657,188 @@ fn duckduckgo_search(q: &str, max: usize) -> Result<Value> {
     Ok(json!(results))
 }
 
+/// Query string from an OpenAI Responses body (`input` is a string or items).
+pub fn responses_query(body: &Value) -> Option<&str> {
+    match body.get("input") {
+        Some(Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        }
+        Some(Value::Array(items)) => items.iter().find_map(|item| {
+            if let Some(s) = item.as_str() {
+                let t = s.trim();
+                return if t.is_empty() { None } else { Some(t) };
+            }
+            let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if ty == "input_text" || ty == "text" {
+                return item
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+            }
+            if ty == "message" || item.get("role").is_some() {
+                match item.get("content") {
+                    Some(Value::String(s)) => {
+                        let t = s.trim();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t)
+                        }
+                    }
+                    Some(Value::Array(blocks)) => blocks.iter().find_map(|b| {
+                        b.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
+}
+
+fn responses_has_web_search_tool(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter().any(|t| {
+                let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                ty == "web_search"
+                    || ty == "web_search_preview"
+                    || ty.starts_with("web_search")
+                    || t.get("name").and_then(|n| n.as_str()) == Some("web_search")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Search-only OpenAI Responses object for grok-build `web_search`.
+/// Hosted search on xAI/cli-chat-proxy; here we run `[web_search]` and emit
+/// `output_text` + `url_citation` annotations the client already parses.
+pub fn responses_web_search(cfg: &WebSearchConfig, body: &Value) -> Result<Value> {
+    if !cfg.enabled {
+        return Err(Error::Msg(
+            "web_search disabled: enable [web_search] in Spock config".into(),
+        ));
+    }
+    if !responses_has_web_search_tool(body) {
+        return Err(Error::Msg(
+            "POST /v1/responses is search-only; request has no web_search tool".into(),
+        ));
+    }
+    let query = responses_query(body).ok_or_else(|| {
+        Error::Msg("POST /v1/responses: empty input (need a search query)".into())
+    })?;
+    let results = run_web_search(cfg, query)?;
+    Ok(responses_search_object(
+        body.get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("spock-web-search"),
+        query,
+        &results,
+    ))
+}
+
+fn responses_search_object(model: &str, query: &str, results: &Value) -> Value {
+    let hits: Vec<(String, String, String)> = results
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let title = r
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let url = r
+                        .get("url")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let snippet = r
+                        .get("snippet")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if url.is_empty() && title.is_empty() {
+                        None
+                    } else {
+                        Some((title, url, snippet))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut text = String::new();
+    let mut annotations = Vec::new();
+    if hits.is_empty() {
+        text = format!("No search results for {query:?}.");
+    } else {
+        for (i, (title, url, snippet)) in hits.iter().enumerate() {
+            let label = if title.is_empty() {
+                url.as_str()
+            } else {
+                title.as_str()
+            };
+            let start = text.len();
+            text.push_str(label);
+            let end = text.len();
+            if !url.is_empty() {
+                annotations.push(json!({
+                    "type": "url_citation",
+                    "url": url,
+                    "title": title,
+                    "start_index": start,
+                    "end_index": end
+                }));
+            }
+            if !snippet.is_empty() {
+                text.push_str(" — ");
+                text.push_str(snippet);
+            }
+            if i + 1 < hits.len() {
+                text.push('\n');
+            }
+        }
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let id = crate::translate::new_msg_id().replacen("msg_", "resp_", 1);
+    let msg_id = crate::translate::new_msg_id();
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": now,
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "type": "message",
+            "id": msg_id,
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": text,
+                "annotations": annotations
+            }]
+        }]
+    })
+}
+
 fn urlencoding_lite(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -659,6 +915,7 @@ pub fn run_with_server_tools(
         if tool_calls.is_empty() {
             // Final assistant message — merge any server blocks then convert
             let mut anth = openai_to_anthropic(&resp, client_model, include_thinking);
+            strip_emulated_client_tool_use(&mut anth);
             if !collected_server_blocks.is_empty() {
                 if let Some(content) = anth.get_mut("content").and_then(|c| c.as_array_mut()) {
                     let mut merged = collected_server_blocks.clone();
@@ -688,13 +945,99 @@ pub fn run_with_server_tools(
             }
         }
 
-        // If the model calls client tools, return this turn to Claude Code.
-        // Prepend any server_tool_use blocks we already collected earlier so the
-        // Advisor UI still lights up; Claude Code executes the client tool_use.
+        // Always execute server tools first — including when the same turn also
+        // has client tools. Returning early used to leak `advisor` as tool_use
+        // and Claude Code then said "No such tool available: advisor".
+        if !server_calls.is_empty() {
+            messages.push(msg.clone());
+            for tc in &server_calls {
+                let id = tc
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("call_0")
+                    .to_string();
+                let name = tc
+                    .pointer("/function/name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let args_raw = tc
+                    .pointer("/function/arguments")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("{}");
+                let args: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
+
+                let (tool_result_content, server_blocks) = match name {
+                    "advisor" if want_advisor => advisor_content_blocks(
+                        &id,
+                        run_advisor_review(
+                            state,
+                            &json!({"messages": messages}),
+                            &advisor_hint,
+                            advisor_cfg.max_tokens,
+                        ),
+                    ),
+                    "web_search" if want_web => {
+                        let query = args
+                            .get("query")
+                            .and_then(|q| q.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        match run_web_search(web_cfg, &query) {
+                            Ok(results) => {
+                                let text = results.to_string();
+                                let display = if query.is_empty() {
+                                    format!("Web search results:\n{text}")
+                                } else {
+                                    format!("Web search for “{query}”:\n{text}")
+                                };
+                                let blocks =
+                                    web_search_content_blocks(&id, &query, &results, &display);
+                                (text, blocks)
+                            }
+                            Err(e) => {
+                                let err = format!("{e}");
+                                (
+                                    err.clone(),
+                                    vec![
+                                        json!({
+                                            "type": "server_tool_use",
+                                            "id": id,
+                                            "name": "web_search",
+                                            "input": {"query": query}
+                                        }),
+                                        json!({
+                                            "type": "web_search_tool_result",
+                                            "tool_use_id": id,
+                                            "content": {"error_code": "unavailable"}
+                                        }),
+                                        json!({"type": "text", "text": format!("Web search failed: {err}")}),
+                                    ],
+                                )
+                            }
+                        }
+                    }
+                    other => {
+                        let err = format!("unknown or disabled server tool: {other}");
+                        (err, vec![])
+                    }
+                };
+
+                collected_server_blocks.extend(server_blocks);
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": tool_result_content
+                }));
+            }
+        }
+
+        // Client tools this turn: hand only those back. Advisor/web_search are
+        // already consumed as server blocks — never emit them as tool_use.
         if !client_calls.is_empty() {
             let mut anth = openai_to_anthropic(&resp, client_model, include_thinking);
-            if !collected_server_blocks.is_empty() {
-                if let Some(content) = anth.get_mut("content").and_then(|c| c.as_array_mut()) {
+            strip_emulated_client_tool_use(&mut anth);
+            if let Some(content) = anth.get_mut("content").and_then(|c| c.as_array_mut()) {
+                if !collected_server_blocks.is_empty() {
                     let mut merged = collected_server_blocks.clone();
                     merged.append(content);
                     *content = merged;
@@ -703,78 +1046,19 @@ pub fn run_with_server_tools(
             return Ok(anth);
         }
 
-        // Only server tools this turn — run them and loop.
-        // Append assistant tool_calls message
-        messages.push(msg.clone());
-
-        for tc in server_calls {
-            let id = tc
-                .get("id")
-                .and_then(|i| i.as_str())
-                .unwrap_or("call_0")
-                .to_string();
-            let name = tc
-                .pointer("/function/name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
-            let args_raw = tc
-                .pointer("/function/arguments")
-                .and_then(|a| a.as_str())
-                .unwrap_or("{}");
-            let args: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
-
-            // Emit blocks Claude Code already knows how to parse.
-            // - advisor: plain text (webview has no advisor_tool_result renderer).
-            // - web_search: real server_tool_use + web_search_tool_result so the
-            //   WebSearch client tool (nested Messages with web_search_20250305)
-            //   can extract {title,url} hits. Plain text alone leaves WebSearch empty.
-            let (tool_result_content, server_blocks) = match name {
-                "advisor" if want_advisor => {
-                    let review = run_advisor_review(
-                        state,
-                        &json!({"messages": messages}),
-                        &advisor_hint,
-                        advisor_cfg.max_tokens,
-                    )?;
-                    let display = if review.trim().is_empty() {
-                        "Advisor reviewed the conversation (empty response).".to_string()
-                    } else {
-                        format!("Advisor review:\n\n{review}")
-                    };
-                    let blocks = vec![json!({"type": "text", "text": display})];
-                    (review, blocks)
+        // Server-only turn: loop so the model can consume the review / hits.
+        if server_calls.is_empty() {
+            // Defensive: named tools we don't recognize — return as client tools.
+            let mut anth = openai_to_anthropic(&resp, client_model, include_thinking);
+            strip_emulated_client_tool_use(&mut anth);
+            if !collected_server_blocks.is_empty() {
+                if let Some(content) = anth.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    let mut merged = collected_server_blocks.clone();
+                    merged.append(content);
+                    *content = merged;
                 }
-                "web_search" if want_web => {
-                    let query = args
-                        .get("query")
-                        .and_then(|q| q.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let results = run_web_search(web_cfg, &query)?;
-                    let text = results.to_string();
-                    // Also keep a human-readable text block for webviews that only
-                    // render text (and for models reading history as plain content).
-                    let display = if query.is_empty() {
-                        format!("Web search results:\n{text}")
-                    } else {
-                        format!("Web search for “{query}”:\n{text}")
-                    };
-                    let blocks = web_search_content_blocks(&id, &query, &results, &display);
-                    (text, blocks)
-                }
-                // Unreachable (filtered above) — defensive.
-                other => {
-                    let err = format!("unknown or disabled server tool: {other}");
-                    (err, vec![])
-                }
-            };
-
-            collected_server_blocks.extend(server_blocks);
-            messages.push(json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": tool_result_content
-            }));
+            }
+            return Ok(anth);
         }
     }
 
@@ -887,5 +1171,123 @@ mod tests {
             max_results: 3,
         };
         assert!(run_web_search(&cfg, "  ").is_err());
+    }
+
+    #[test]
+    fn responses_query_from_string_input() {
+        let body = json!({"input":"  Qwen3.8 27B abliterated  ","tools":[{"type":"web_search"}]});
+        assert_eq!(responses_query(&body), Some("Qwen3.8 27B abliterated"));
+        assert!(responses_has_web_search_tool(&body));
+    }
+
+    #[test]
+    fn responses_query_from_items() {
+        let body = json!({
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"rust lang"}]}],
+            "tools":[{"type":"web_search_preview"}]
+        });
+        assert_eq!(responses_query(&body), Some("rust lang"));
+        assert!(responses_has_web_search_tool(&body));
+    }
+
+    #[test]
+    fn responses_search_object_cites_urls() {
+        let results = json!([
+            {"title":"Rust","url":"https://www.rust-lang.org/","snippet":"safe systems"}
+        ]);
+        let out = responses_search_object("test-model", "rust", &results);
+        assert_eq!(out["object"], "response");
+        assert_eq!(out["status"], "completed");
+        let text = out["output"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Rust"), "{text}");
+        assert!(text.contains("safe systems"), "{text}");
+        let cites = out["output"][0]["content"][0]["annotations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(cites.len(), 1);
+        assert_eq!(cites[0]["type"], "url_citation");
+        assert_eq!(cites[0]["url"], "https://www.rust-lang.org/");
+        assert_eq!(cites[0]["title"], "Rust");
+    }
+
+    #[test]
+    fn responses_web_search_refuses_without_tool() {
+        let cfg = WebSearchConfig {
+            enabled: true,
+            provider: "duckduckgo".into(),
+            base_url: None,
+            api_key: None,
+            api_key_env: None,
+            max_results: 3,
+        };
+        let err = responses_web_search(&cfg, &json!({"input":"hi"})).unwrap_err();
+        assert!(err.to_string().contains("search-only"), "{err}");
+    }
+
+    #[test]
+    fn responses_web_search_refuses_when_disabled() {
+        let cfg = WebSearchConfig::default();
+        let err =
+            responses_web_search(&cfg, &json!({"input":"hi","tools":[{"type":"web_search"}]}))
+                .unwrap_err();
+        assert!(err.to_string().contains("disabled"), "{err}");
+    }
+
+    #[test]
+    fn advisor_blocks_are_webview_text() {
+        let (text, blocks) =
+            advisor_content_blocks("call_adv", Ok("approve: stay the course".into()));
+        assert_eq!(text, "approve: stay the course");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(
+            blocks[0]["text"],
+            "Advisor review:\napprove: stay the course"
+        );
+        let blob = serde_json::to_string(&blocks).unwrap();
+        assert!(!blob.contains("server_tool_use"), "{blob}");
+        assert!(!blob.contains("advisor_tool_result"), "{blob}");
+    }
+
+    #[test]
+    fn advisor_blocks_error_is_text() {
+        let (text, blocks) =
+            advisor_content_blocks("c_err", Err(Error::Msg("upstream 502".into())));
+        assert_eq!(text, "upstream 502");
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(
+            blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Advisor unavailable"),
+            "{}",
+            blocks[0]
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_eos() {
+        assert_eq!(sanitize_advisor_text("ok <|eos|> leftover"), "ok  leftover");
+        assert_eq!(sanitize_advisor_text("  hi  "), "hi");
+    }
+
+    #[test]
+    fn strip_leaked_advisor_tool_use() {
+        let mut anth = json!({
+            "content": [
+                {"type":"text","text":"hi"},
+                {"type":"tool_use","id":"x","name":"advisor","input":{}},
+                {"type":"tool_use","id":"y","name":"Bash","input":{"command":"ls"}}
+            ]
+        });
+        strip_emulated_client_tool_use(&mut anth);
+        let names: Vec<_> = anth["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert_eq!(names, vec!["Bash"]);
+        assert_eq!(anth["content"].as_array().unwrap().len(), 2);
     }
 }

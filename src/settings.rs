@@ -127,6 +127,9 @@ pub struct CatalogDoc {
     /// Empty string in UI = unset (discover / Grok default).
     #[serde(default)]
     pub context_window: String,
+    /// "" = auto (heuristic), "1"/"true" = on, "0"/"false" = off.
+    #[serde(default)]
+    pub supports_reasoning_effort: String,
 }
 
 pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
@@ -200,6 +203,11 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
             name: e.name.clone().unwrap_or_default(),
             description: e.description.clone().unwrap_or_default(),
             context_window: e.context_window.map(|n| n.to_string()).unwrap_or_default(),
+            supports_reasoning_effort: match e.supports_reasoning_effort {
+                Some(true) => "1".into(),
+                Some(false) => "0".into(),
+                None => String::new(),
+            },
         })
         .collect();
 
@@ -299,6 +307,7 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
                     use_responses_api: false,
                     azure_deployment: None,
                     azure_api_version: None,
+                    kv_sessions: false,
                 }
             }
             "anthropic" => BackendConfig::Anthropic {
@@ -400,11 +409,27 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
                 "catalog '{id}': context_window must be > 0"
             )));
         }
+        let supports_reasoning_effort = match e
+            .supports_reasoning_effort
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "auto" => None,
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            other => {
+                return Err(crate::error::Error::Msg(format!(
+                    "catalog '{id}': supports_reasoning_effort must be empty/auto/true/false, got '{other}'"
+                )));
+            }
+        };
         catalog_entries.push(CatalogEntry {
             id: id.to_string(),
             name: opt_str(&e.name),
             description: opt_str(&e.description),
             context_window,
+            supports_reasoning_effort,
         });
     }
 
@@ -647,14 +672,15 @@ pub fn settings_html(initial: &SettingsDoc) -> String {
 
   <section>
     <h2>Catalog (external pickers)</h2>
-    <p class="hint">Shortlist for Grok Build and other agents via <code>GET /v1/models</code>. Ids are <code>backend:model</code>. Empty catalog = legacy dump of every backend model. Profiles above stay Claude Code only.</p>
+    <p class="hint">Shortlist for Grok Build and other agents via <code>GET /v1/models</code>. Ids are <code>backend:model</code>. Empty catalog = legacy dump of every backend model. Profiles above stay Claude Code only. <code>effort</code> empty = auto (xai/kimi/deepseek on); 1/0 force on/off so Grok enables <code>/effort</code>.</p>
     <table>
       <thead>
         <tr>
-          <th style="width:28%">id</th>
-          <th style="width:18%">name</th>
+          <th style="width:26%">id</th>
+          <th style="width:16%">name</th>
           <th>description</th>
-          <th style="width:14%">context</th>
+          <th style="width:12%">context</th>
+          <th style="width:10%">effort</th>
           <th style="width:40px"></th>
         </tr>
       </thead>
@@ -733,6 +759,7 @@ function catalogRow(e) {{
     <td><input class="c-name" value="${{esc(e.name || '')}}" placeholder="Grok 4.5"/></td>
     <td><input class="c-desc" value="${{esc(e.description || '')}}"/></td>
     <td><input class="c-cw" value="${{esc(e.context_window || '')}}" placeholder="500000"/></td>
+    <td><input class="c-effort" value="${{esc(e.supports_reasoning_effort || '')}}" placeholder="auto"/></td>
     <td><button class="danger c-del" title="Remove">×</button></td>`;
   tr.querySelector('.c-del').onclick = () => tr.remove();
   return tr;
@@ -790,6 +817,7 @@ function collectDoc() {{
     name: tr.querySelector('.c-name').value.trim(),
     description: tr.querySelector('.c-desc').value.trim(),
     context_window: tr.querySelector('.c-cw').value.trim(),
+    supports_reasoning_effort: tr.querySelector('.c-effort').value.trim(),
   }}));
   return {{
     version: INITIAL.version,
@@ -820,7 +848,7 @@ document.getElementById('btnAddProfile').onclick = () => {{
 }};
 document.getElementById('btnAddCatalog').onclick = () => {{
   document.getElementById('catalogBody').appendChild(catalogRow({{
-    id: 'xai:grok-4.5', name: 'Grok 4.5', description: '', context_window: '500000'
+    id: 'xai:grok-4.5', name: 'Grok 4.5', description: '', context_window: '500000', supports_reasoning_effort: ''
   }}));
 }};
 document.getElementById('btnSave').onclick = () => {{
@@ -869,6 +897,19 @@ pub fn handle_ipc(state: &AppState, body: &str) -> (String, bool) {
                             if let Some(old_p) = old.profiles.get(name) {
                                 if !old_p.exact.is_empty() {
                                     prof.exact = old_p.exact.clone();
+                                }
+                            }
+                        }
+                        for (name, be) in cfg.backends.iter_mut() {
+                            if let Some(old_b) = old.backends.get(name) {
+                                if let (
+                                    crate::config::BackendConfig::ApiKey { kv_sessions, .. },
+                                    crate::config::BackendConfig::ApiKey {
+                                        kv_sessions: keep, ..
+                                    },
+                                ) = (be, old_b)
+                                {
+                                    *kv_sessions = *keep;
                                 }
                             }
                         }
@@ -982,20 +1023,29 @@ mod tests {
             name: Some("Grok 4.5".into()),
             description: None,
             context_window: Some(500_000),
+            supports_reasoning_effort: None,
         });
         cfg.catalog.entries.push(crate::config::CatalogEntry {
             id: "ollama:glm-5.2:cloud".into(),
             name: None,
             description: Some("local".into()),
             context_window: None,
+            supports_reasoning_effort: Some(true),
         });
         let doc = config_to_doc(&cfg);
         assert_eq!(doc.catalog.len(), 2);
         assert_eq!(doc.catalog[0].context_window, "500000");
+        assert_eq!(doc.catalog[0].supports_reasoning_effort, "");
+        assert_eq!(doc.catalog[1].supports_reasoning_effort, "1");
         let back = doc_to_config(&doc).expect("doc_to_config");
         assert_eq!(back.catalog.entries.len(), 2);
         assert_eq!(back.catalog.entries[0].id, "xai:grok-4.5");
         assert_eq!(back.catalog.entries[0].context_window, Some(500_000));
+        assert_eq!(back.catalog.entries[0].supports_reasoning_effort, None);
         assert_eq!(back.catalog.entries[1].context_window, None);
+        assert_eq!(
+            back.catalog.entries[1].supports_reasoning_effort,
+            Some(true)
+        );
     }
 }

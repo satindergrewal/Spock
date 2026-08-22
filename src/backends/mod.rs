@@ -80,6 +80,13 @@ impl BackendHandle {
     }
 
     pub fn chat(&self, body: &Value, stream: bool, oauth: &OauthStore) -> Result<UpstreamBody> {
+        if self.config.kv_sessions() {
+            return Err(Error::Msg(
+                "kv_sessions: BackendHandle::chat is disabled. Use native /completion \
+                 + /fork + /close_session. Falling through to /chat/completions is the bug."
+                    .into(),
+            ));
+        }
         match &self.config {
             BackendConfig::Oauth { .. } => {
                 let (token, headers, ua) = self.oauth_bearer(oauth)?;
@@ -114,6 +121,49 @@ impl BackendHandle {
                 let key = self.config.api_key();
                 openai_compat::anthropic_messages(base_url, key.as_deref(), body, stream)
             }
+        }
+    }
+
+    /// POST to a native llama-server path (`/fork`, `/completion`, `/close_session`,
+    /// `/apply-template`). Origin is `base_url` with a trailing `/v1` stripped.
+    /// Never used as a chat/completions fallback.
+    pub fn native_post(
+        &self,
+        path: &str,
+        body: &Value,
+        stream: bool,
+        oauth: &OauthStore,
+    ) -> Result<UpstreamBody> {
+        match &self.config {
+            BackendConfig::ApiKey { base_url, .. } => {
+                let key = self.config.api_key();
+                let origin = crate::kv_sessions::llama_origin(base_url);
+                openai_compat::post_json(
+                    &origin,
+                    key.as_deref(),
+                    path,
+                    body,
+                    stream,
+                    self.config.extra_headers(),
+                    None,
+                )
+            }
+            BackendConfig::Oauth { .. } => {
+                let (token, headers, ua) = self.oauth_bearer(oauth)?;
+                let origin = crate::kv_sessions::llama_origin(&self.oauth_base_url());
+                openai_compat::post_json(
+                    &origin,
+                    Some(&token),
+                    path,
+                    body,
+                    stream,
+                    &headers,
+                    Some(&ua),
+                )
+            }
+            BackendConfig::Anthropic { .. } => Err(Error::Msg(
+                "kv_sessions: Anthropic backends have no llama-server native routes".into(),
+            )),
         }
     }
 

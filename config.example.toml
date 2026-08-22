@@ -69,6 +69,14 @@ base_url = "http://127.0.0.1:11434/v1"
 # [backends.lan]
 # type = "api_key"
 # base_url = "http://10.0.0.5:8080/v1"
+#
+# llama-server ds4-ports named KV sessions (fail loud — no /chat/completions fallback):
+# [backends.ds4]
+# type = "api_key"
+# base_url = "http://10.0.0.5:8080/v1"
+# kv_sessions = true
+# Then: x-spock-session / session_id, or cache_control on the shared prefix.
+# Child: x-spock-parent-session. Leave: x-spock-close-session.
 
 # --- OpenAI-compatible presets (uncomment + set key) ---
 # All stay type = "api_key". Optional:
@@ -209,6 +217,7 @@ fable = "ollama:qwen2.5:14b"
 # enabled = true
 # provider = "duckduckgo"   # or brave / serper when keys set
 # # api_key_env = "BRAVE_API_KEY"
+# # Also serves grok-build: POST /v1/responses + hosted web_search tool.
 
 # [backends.azure]
 # type = "api_key"

@@ -56,8 +56,8 @@ pub struct Config {
 }
 
 /// Hand-picked `backend:model` entries served on `GET /v1/models` for external
-/// agents. When non-empty, Spock stops dumping every upstream backend model into
-/// the list (Claude aliases still ship for Claude Code).
+/// agents. When non-empty, the list is those entries only (local, no backend
+/// probes, no Claude aliases). Empty catalog keeps the legacy merge.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CatalogSection {
     #[serde(default)]
@@ -74,10 +74,15 @@ pub struct CatalogEntry {
     #[serde(default)]
     pub description: Option<String>,
     /// Context window in tokens. When set, emitted so Grok Build applies
-    /// per-model compaction correctly. When omitted, Spock tries live discovery
-    /// from the backend `/models` card, else leaves unset (Grok defaults ~200k).
+    /// per-model compaction correctly. When omitted, the list card leaves it
+    /// unset (Grok defaults ~200k). List path never probes backends.
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// When true, `/v1/models` advertises `supportsReasoningEffort` so Grok Build
+    /// enables `/effort` and the effort picker. When omitted, Spock uses a
+    /// conservative id heuristic (xai/kimi/deepseek → true).
+    #[serde(default)]
+    pub supports_reasoning_effort: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +203,12 @@ pub enum BackendConfig {
         azure_deployment: Option<String>,
         #[serde(default)]
         azure_api_version: Option<String>,
+        /// llama-server ds4-ports named KV sessions. When true, CC traffic
+        /// uses native `/completion` + `/fork` + `/close_session`. Missing
+        /// routes or unknown session_id fail the request — never fall through
+        /// to `/v1/chat/completions`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        kv_sessions: bool,
     },
     /// Forward Anthropic Messages JSON as-is.
     Anthropic {
@@ -235,6 +246,8 @@ impl<'de> Deserialize<'de> for BackendConfig {
             azure_deployment: Option<String>,
             #[serde(default)]
             azure_api_version: Option<String>,
+            #[serde(default)]
+            kv_sessions: bool,
         }
         let r = Raw::deserialize(deserializer)?;
         let kind = r.kind.trim().to_ascii_lowercase();
@@ -291,6 +304,7 @@ impl<'de> Deserialize<'de> for BackendConfig {
                     use_responses_api: r.use_responses_api,
                     azure_deployment: r.azure_deployment,
                     azure_api_version: r.azure_api_version,
+                    kv_sessions: r.kv_sessions,
                 })
             }
             "anthropic" => {
@@ -466,6 +480,17 @@ impl BackendConfig {
             }
         )
     }
+
+    /// llama-server native session routes (ds4-ports). Off by default.
+    pub fn kv_sessions(&self) -> bool {
+        matches!(
+            self,
+            BackendConfig::ApiKey {
+                kv_sessions: true,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -505,6 +530,7 @@ pub fn default_config() -> Config {
             use_responses_api: false,
             azure_deployment: None,
             azure_api_version: None,
+            kv_sessions: false,
         },
     );
 
@@ -723,5 +749,27 @@ default = "openrouter:x"
         assert!(cfg.backends.contains_key("xai"));
         assert!(cfg.backends.contains_key("ollama"));
         assert!(!cfg.advisor.enabled);
+    }
+
+    #[test]
+    fn parse_kv_sessions_opt_in() {
+        let toml = r#"
+[server]
+profile = "p"
+[backends.ds4]
+type = "api_key"
+base_url = "http://10.0.0.5:8080/v1"
+kv_sessions = true
+[backends.ollama]
+type = "api_key"
+base_url = "http://127.0.0.1:11434/v1"
+[profiles.p]
+default = "ds4:qwen"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        assert!(cfg.backends["ds4"].kv_sessions());
+        assert!(!cfg.backends["ollama"].kv_sessions());
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("kv_sessions"));
     }
 }
