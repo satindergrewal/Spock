@@ -245,6 +245,26 @@ pub fn inject_emulated_function_tools(oai: &mut Value, want_advisor: bool, want_
     }
 }
 
+/// One retry for transient upstream failures (429 / 5xx) after a short
+/// backoff. Safe here: server-tools upstream calls are non-streaming and
+/// fail before any response bytes are committed to the client. Shared-pool
+/// routes (OpenRouter stealth) 429/502 often enough that one retry absorbs
+/// most bursts; more than that means the route itself is saturated.
+fn chat_with_retry(
+    be: &BackendHandle,
+    body: &Value,
+    oauth: &crate::oauth::OauthStore,
+) -> Result<UpstreamBody> {
+    match be.chat(body, false, oauth) {
+        Err(Error::Http(code, _)) if code == 429 || code >= 500 => {
+            eprintln!("  server_tools: upstream {code} transient — retrying once");
+            std::thread::sleep(Duration::from_millis(1200));
+            be.chat(body, false, oauth)
+        }
+        other => other,
+    }
+}
+
 /// Run advisor review via a nested chat completion.
 pub fn run_advisor_review(
     state: &AppState,
@@ -320,7 +340,7 @@ pub fn run_advisor_review(
         be.family_name()
     );
 
-    let out = match be.chat(&body, false, &state.oauth) {
+    let out = match chat_with_retry(&be, &body, &state.oauth) {
         Ok(UpstreamBody::Json(o)) => {
             let choice = o
                 .pointer("/choices/0/message/content")
@@ -897,7 +917,7 @@ pub fn run_with_server_tools(
             obj.insert("stream".into(), json!(false));
         }
 
-        let resp = match be.chat(&body, false, &state.oauth)? {
+        let resp = match chat_with_retry(be, &body, &state.oauth)? {
             UpstreamBody::Json(j) => j,
             UpstreamBody::Stream(_) => {
                 return Err(Error::Msg("server_tools: unexpected stream".into()))
