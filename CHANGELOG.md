@@ -4,6 +4,8 @@ All notable changes to Spock are documented here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-24
+
 ### Added
 - **Vision policy for text-only backends** (`text_only = true` on oauth/api_key backends + `[vision]` section) — text-only upstreams (vLLM DSV4-Flash etc.) hard-400 on image content, and clients re-send the full transcript, so one screenshot poisons every later request in the session. Spock now rewrites image content before the request leaves: `mode = "strip"` (default) replaces images with an omission note; `mode = "describe"` captions each screenshot via an OpenAI-compatible VL sidecar (llama-server + mmproj) and inlines the caption as text. Any sidecar failure degrades to strip — a request never dies here. Covers `/v1/messages` (incl. anthropic passthrough and KV sessions) and the verbatim `/v1/chat/completions` ingress. Captions cached in memory only (sha256 of image + prompt); no per-request image limit — one failed sidecar call strips the rest of that request (bounded stall), a healthy sidecar captions every image. Retroactively un-sticks poisoned sessions: the next request goes out clean. glm-5.3 name-matcher flatten unchanged as a safety net.
 - **`POST /v1/responses` search shim** — grok-build `web_search` posts OpenAI Responses (`{base}/responses` + hosted `web_search` tool). Search-only: run `[web_search]` (Brave/Serper/SearXNG/DDG) and return a completed Responses object with `output_text` + `url_citation`. No tool / search disabled / empty query → 400. Not a general Responses proxy (no chat/completions fallback).
