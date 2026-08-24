@@ -1912,6 +1912,10 @@ mod accepted_socket_tests {
 
     /// Control: inherited O_NONBLOCK + delayed body must fail, or the Darwin
     /// inherit theory is dead and this patch is the wrong first move.
+    /// Darwin-only: Linux `accept()` does not inherit O_NONBLOCK, so the
+    /// unconfigured read legitimately succeeds there and the control's
+    /// premise is inverted.
+    #[cfg(target_os = "macos")]
     #[test]
     fn delayed_post_body_fails_without_configure() {
         match delayed_post(false) {
