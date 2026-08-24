@@ -20,6 +20,39 @@ pub struct SettingsDoc {
     pub advisor: AdvisorDoc,
     #[serde(default)]
     pub web_search: WebSearchDoc,
+    #[serde(default)]
+    pub vision: VisionDoc,
+}
+
+/// UI knobs for `[vision]`. File-only subfields (prompt, sidecar keys,
+/// max_tokens, cache_max) stay in the TOML and are preserved on save.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VisionDoc {
+    /// "strip" | "describe"
+    #[serde(default = "default_vision_mode_doc")]
+    pub mode: String,
+    #[serde(default)]
+    pub sidecar_base_url: String,
+    #[serde(default)]
+    pub sidecar_model: String,
+    /// 0 = default (8s).
+    #[serde(default)]
+    pub timeout_secs: u64,
+}
+
+fn default_vision_mode_doc() -> String {
+    "strip".into()
+}
+
+impl Default for VisionDoc {
+    fn default() -> Self {
+        Self {
+            mode: default_vision_mode_doc(),
+            sidecar_base_url: String::new(),
+            sidecar_model: String::new(),
+            timeout_secs: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -98,6 +131,9 @@ pub struct BackendDoc {
     /// Optional extra headers as "Key: Value" lines (OpenRouter etc.).
     #[serde(default)]
     pub extra_headers_text: String,
+    /// Text-only upstream: images stripped/captioned before the request leaves.
+    #[serde(default)]
+    pub text_only: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -141,6 +177,7 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
                 provider,
                 base_url,
                 api_key,
+                text_only,
             } => BackendDoc {
                 name: name.clone(),
                 kind: "oauth".into(),
@@ -149,12 +186,14 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
                 api_key: api_key.clone().unwrap_or_default(),
                 api_key_env: String::new(),
                 extra_headers_text: String::new(),
+                text_only: *text_only,
             },
             BackendConfig::ApiKey {
                 base_url,
                 api_key,
                 extra_headers,
                 api_key_env,
+                text_only,
                 ..
             } => BackendDoc {
                 name: name.clone(),
@@ -164,6 +203,7 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
                 api_key: api_key.clone().unwrap_or_default(),
                 api_key_env: api_key_env.clone().unwrap_or_default(),
                 extra_headers_text: headers_to_text(extra_headers),
+                text_only: *text_only,
             },
             BackendConfig::Anthropic {
                 base_url,
@@ -177,6 +217,7 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
                 api_key: api_key.clone().unwrap_or_default(),
                 api_key_env: api_key_env.clone().unwrap_or_default(),
                 extra_headers_text: String::new(),
+                text_only: false,
             },
         })
         .collect();
@@ -247,6 +288,16 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
                 cfg.web_search.max_results
             },
         },
+        vision: VisionDoc {
+            mode: if cfg.vision.mode.trim().is_empty() {
+                "strip".into()
+            } else {
+                cfg.vision.mode.clone()
+            },
+            sidecar_base_url: cfg.vision.sidecar_base_url.clone().unwrap_or_default(),
+            sidecar_model: cfg.vision.sidecar_model.clone().unwrap_or_default(),
+            timeout_secs: cfg.vision.timeout_secs,
+        },
     }
 }
 
@@ -291,6 +342,7 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
                     provider,
                     base_url,
                     api_key: opt_key(&b.api_key),
+                    text_only: b.text_only,
                 }
             }
             "api_key" | "openai" => {
@@ -308,6 +360,7 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
                     azure_deployment: None,
                     azure_api_version: None,
                     kv_sessions: false,
+                    text_only: b.text_only,
                 }
             }
             "anthropic" => BackendConfig::Anthropic {
@@ -475,6 +528,29 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
             } else {
                 doc.web_search.max_results
             },
+        },
+        vision: crate::config::VisionSection {
+            mode: {
+                let m = doc.vision.mode.trim();
+                if m.is_empty() {
+                    "strip".into()
+                } else {
+                    m.to_string()
+                }
+            },
+            sidecar_base_url: opt_str(&doc.vision.sidecar_base_url),
+            sidecar_model: opt_str(&doc.vision.sidecar_model),
+            // File-only knobs; the save handler preserves them from disk.
+            sidecar_api_key: None,
+            sidecar_api_key_env: None,
+            prompt: None,
+            timeout_secs: if doc.vision.timeout_secs == 0 {
+                8
+            } else {
+                doc.vision.timeout_secs
+            },
+            max_tokens: 1024,
+            cache_max: 128,
         },
     })
 }
@@ -893,6 +969,14 @@ pub fn handle_ipc(state: &AppState, body: &str) -> (String, bool) {
                 Ok(mut cfg) => {
                     // Preserve per-profile exact maps from current config (not in form UI yet)
                     if let Ok(old) = state.snapshot_config() {
+                        // File-only [vision] knobs (prompt, sidecar keys, caption
+                        // tokens, cache size) are not in the form UI; keep the
+                        // file's values. mode/url/model/timeout come from the doc.
+                        cfg.vision.prompt = old.vision.prompt.clone();
+                        cfg.vision.sidecar_api_key = old.vision.sidecar_api_key.clone();
+                        cfg.vision.sidecar_api_key_env = old.vision.sidecar_api_key_env.clone();
+                        cfg.vision.max_tokens = old.vision.max_tokens;
+                        cfg.vision.cache_max = old.vision.cache_max;
                         for (name, prof) in cfg.profiles.iter_mut() {
                             if let Some(old_p) = old.profiles.get(name) {
                                 if !old_p.exact.is_empty() {
@@ -905,11 +989,12 @@ pub fn handle_ipc(state: &AppState, body: &str) -> (String, bool) {
                                 if let (
                                     crate::config::BackendConfig::ApiKey { kv_sessions, .. },
                                     crate::config::BackendConfig::ApiKey {
-                                        kv_sessions: keep, ..
+                                        kv_sessions: keep_kv,
+                                        ..
                                     },
                                 ) = (be, old_b)
                                 {
-                                    *kv_sessions = *keep;
+                                    *kv_sessions = *keep_kv;
                                 }
                             }
                         }

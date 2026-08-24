@@ -14,6 +14,7 @@ struct SettingsView: View {
                     profilesSection
                     catalogSection
                     serverToolsSection
+                    visionSection
                 }
                 .padding(20)
             }
@@ -245,6 +246,14 @@ struct SettingsView: View {
                             Text(oauthKeyHint(for: b))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
+                        }
+
+                        if b.type != "anthropic" {
+                            Toggle("Text-only upstream (images stripped / captioned via [vision] sidecar)", isOn: $b.textOnly)
+                                .toggleStyle(.checkbox)
+                                .controlSize(.small)
+                                .font(.caption)
+                                .help("For upstreams that hard-400 on image content (vLLM DSV4-Flash etc.). Spock rewrites screenshots before the request leaves: strip note, or caption when [vision] mode = describe. Sessions can never be poisoned by a screenshot again.")
                         }
 
                         if let models = model.discoveredModels[b.name], !models.isEmpty {
@@ -497,6 +506,43 @@ struct SettingsView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(8)
+        }
+    }
+
+    private var visionSection: some View {
+        GroupBox("Vision sidecar (text-only backends)") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Applies to backends ticked “Text-only upstream”. Strip replaces screenshots with a note; describe captions them via a small VL model (llama-server + mmproj) and inlines the caption as text. Any sidecar failure degrades to strip.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Picker("Mode", selection: $model.visionMode) {
+                        Text("strip").tag("strip")
+                        Text("describe").tag("describe")
+                    }
+                    .labelsHidden()
+                    .frame(width: 110)
+                    TextField("sidecar base URL (…/v1)", text: $model.visionSidecarURL)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(model.visionMode != "describe")
+                    TextField("sidecar model", text: $model.visionSidecarModel)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(minWidth: 160)
+                        .disabled(model.visionMode != "describe")
+                    TextField("8", value: $model.visionTimeoutSecs, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 60)
+                        .disabled(model.visionMode != "describe")
+                        .help("Per-caption timeout in seconds. CPU sidecars may want more.")
+                }
+                if model.visionMode != "describe" {
+                    Text("describe needs a sidecar endpoint; without one it behaves as strip.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
             .padding(8)

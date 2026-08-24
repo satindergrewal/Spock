@@ -142,6 +142,7 @@ mod tests {
                 provider: "xai".into(),
                 base_url: "https://api.x.ai/v1".into(),
                 api_key: None,
+                text_only: false,
             },
         );
         backends.insert(
@@ -155,6 +156,7 @@ mod tests {
                 azure_deployment: None,
                 azure_api_version: None,
                 kv_sessions: false,
+                text_only: false,
             },
         );
         let mut profiles = BTreeMap::new();
@@ -180,6 +182,7 @@ mod tests {
             catalog: Default::default(),
             advisor: Default::default(),
             web_search: Default::default(),
+            vision: Default::default(),
         }
     }
 

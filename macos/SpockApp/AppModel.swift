@@ -66,6 +66,11 @@ final class AppModel: ObservableObject {
     @Published var webSearchApiKey = ""
     @Published var webSearchApiKeyEnv = ""
     @Published var webSearchMaxResults: Int = 5
+    // Vision policy for text-only backends — saved under [vision]
+    @Published var visionMode = "strip"
+    @Published var visionSidecarURL = ""
+    @Published var visionSidecarModel = ""
+    @Published var visionTimeoutSecs: Int = 8
 
     /// Last upstream error from proxy (quota / 401 / mid-SSE) for Settings toast.
     @Published var lastUpstreamError: String = ""
@@ -258,7 +263,8 @@ final class AppModel: ObservableObject {
                     // Never surface a provider chip on API Key / Anthropic rows.
                     provider: t == "oauth" ? prov : "",
                     baseURL: b["base_url"] as? String ?? "",
-                    apiKey: b["api_key"] as? String ?? ""
+                    apiKey: b["api_key"] as? String ?? "",
+                    textOnly: b["text_only"] as? Bool ?? false
                 )
             }
         }
@@ -324,6 +330,24 @@ final class AppModel: ObservableObject {
             webSearchApiKeyEnv = ""
             webSearchMaxResults = 5
         }
+        if let vis = raw["vision"] as? [String: Any] {
+            let mode = (vis["mode"] as? String ?? "strip").trimmingCharacters(in: .whitespacesAndNewlines)
+            visionMode = mode.isEmpty ? "strip" : mode
+            visionSidecarURL = vis["sidecar_base_url"] as? String ?? ""
+            visionSidecarModel = vis["sidecar_model"] as? String ?? ""
+            if let t = vis["timeout_secs"] as? Int, t > 0 {
+                visionTimeoutSecs = t
+            } else if let t = vis["timeout_secs"] as? Double, t > 0 {
+                visionTimeoutSecs = Int(t)
+            } else {
+                visionTimeoutSecs = 8
+            }
+        } else {
+            visionMode = "strip"
+            visionSidecarURL = ""
+            visionSidecarModel = ""
+            visionTimeoutSecs = 8
+        }
     }
 
     func saveConfig() {
@@ -366,6 +390,7 @@ final class AppModel: ObservableObject {
                     "api_key": b.apiKey,
                     "api_key_env": "",
                     "extra_headers_text": "",
+                    "text_only": b.textOnly,
                 ] as [String: Any]
             },
             "profiles": profileRows.map { p in
@@ -401,6 +426,12 @@ final class AppModel: ObservableObject {
                 "api_key": webSearchApiKey,
                 "api_key_env": webSearchApiKeyEnv,
                 "max_results": webSearchMaxResults,
+            ] as [String: Any],
+            "vision": [
+                "mode": visionMode,
+                "sidecar_base_url": visionSidecarURL,
+                "sidecar_model": visionSidecarModel,
+                "timeout_secs": visionTimeoutSecs,
             ] as [String: Any],
         ]
         if let resp = putJSON(path: "/spock/v1/config", body: body) {
@@ -600,7 +631,8 @@ final class AppModel: ObservableObject {
                 type: "api_key",
                 provider: "",
                 baseURL: "http://127.0.0.1:8080/v1",
-                apiKey: ""
+                apiKey: "",
+                textOnly: false
             )
         )
     }
@@ -876,6 +908,8 @@ struct BackendRow: Identifiable, Equatable {
     var provider: String
     var baseURL: String
     var apiKey: String
+    /// Text-only upstream: Spock strips/captions images before the request leaves.
+    var textOnly: Bool
 }
 
 struct ProfileRow: Identifiable, Equatable {

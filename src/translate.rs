@@ -147,12 +147,12 @@ fn collect_images_from_content(content: &Value) -> Vec<Value> {
 
 /// z.ai GLM-5.3 (and point releases) reject every non-`text` content part:
 /// `messages.content.type is invalid, allowed values: ['text']`.
-fn is_text_only_model(model: &str) -> bool {
+pub fn is_text_only_model(model: &str) -> bool {
     let m = model.trim().to_ascii_lowercase();
     m == "glm-5.3" || m.starts_with("glm-5.3-") || m.starts_with("glm-5.3:")
 }
 
-fn image_omitted_note(n: usize) -> String {
+pub fn image_omitted_note(n: usize) -> String {
     if n == 1 {
         "[image omitted: this model is text-only]".into()
     } else {

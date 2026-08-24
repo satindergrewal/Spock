@@ -53,6 +53,8 @@ pub struct Config {
     pub advisor: AdvisorSection,
     #[serde(default)]
     pub web_search: WebSearchSection,
+    #[serde(default)]
+    pub vision: VisionSection,
 }
 
 /// Hand-picked `backend:model` entries served on `GET /v1/models` for external
@@ -145,6 +147,112 @@ impl Default for WebSearchSection {
     }
 }
 
+/// How text-only backends handle image content. The switch is the backend's
+/// `text_only` flag (or the built-in glm-5.3 model matcher); this section only
+/// says *how*: strip to a note, or caption via a VL sidecar and inline the
+/// caption as text. Any sidecar failure degrades to strip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisionSection {
+    /// "strip" (default) or "describe". describe additionally needs
+    /// sidecar_base_url + sidecar_model; otherwise it behaves as strip.
+    #[serde(default = "default_vision_mode")]
+    pub mode: String,
+    /// OpenAI-compatible base url of the vision sidecar (llama-server etc.).
+    #[serde(default)]
+    pub sidecar_base_url: Option<String>,
+    #[serde(default)]
+    pub sidecar_model: Option<String>,
+    #[serde(default)]
+    pub sidecar_api_key: Option<String>,
+    #[serde(default)]
+    pub sidecar_api_key_env: Option<String>,
+    /// Caption prompt. Changing it invalidates the caption cache.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default = "default_vision_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_vision_caption_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_vision_cache")]
+    pub cache_max: usize,
+}
+
+fn default_vision_mode() -> String {
+    "strip".into()
+}
+fn default_vision_timeout() -> u64 {
+    8
+}
+fn default_vision_caption_tokens() -> u32 {
+    1024
+}
+fn default_vision_cache() -> usize {
+    128
+}
+
+impl Default for VisionSection {
+    fn default() -> Self {
+        Self {
+            mode: default_vision_mode(),
+            sidecar_base_url: None,
+            sidecar_model: None,
+            sidecar_api_key: None,
+            sidecar_api_key_env: None,
+            prompt: None,
+            timeout_secs: default_vision_timeout(),
+            max_tokens: default_vision_caption_tokens(),
+            cache_max: default_vision_cache(),
+        }
+    }
+}
+
+impl VisionSection {
+    /// describe mode is live only with a full sidecar endpoint configured.
+    pub fn describe_ready(&self) -> bool {
+        self.mode.trim() == "describe"
+            && self
+                .sidecar_base_url
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            && self
+                .sidecar_model
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+    }
+
+    pub fn prompt_effective(&self) -> String {
+        self.prompt
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| {
+                "Describe this screenshot for a text-only coding assistant. \
+             Focus on visible UI state, layout, and any readable text or error \
+             messages. Be concise and factual."
+                    .into()
+            })
+    }
+
+    pub fn resolve_key(&self) -> Option<String> {
+        if let Some(k) = self.sidecar_api_key.as_deref() {
+            let k = k.trim();
+            if !k.is_empty() {
+                return Some(k.to_string());
+            }
+        }
+        if let Some(name) = self.sidecar_api_key_env.as_deref() {
+            if let Ok(v) = std::env::var(name) {
+                let v = v.trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
@@ -187,6 +295,10 @@ pub enum BackendConfig {
         /// Optional console/API key escape hatch (beats OAuth).
         #[serde(default)]
         api_key: Option<String>,
+        /// Upstream is text-only: image content is stripped (or captioned via
+        /// a `[vision]` sidecar) before the request leaves Spock.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        text_only: bool,
     },
     /// OpenAI-compatible Chat Completions with bearer / Azure key.
     ApiKey {
@@ -209,6 +321,10 @@ pub enum BackendConfig {
         /// to `/v1/chat/completions`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         kv_sessions: bool,
+        /// Upstream is text-only: image content is stripped (or captioned via
+        /// a `[vision]` sidecar) before the request leaves Spock.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        text_only: bool,
     },
     /// Forward Anthropic Messages JSON as-is.
     Anthropic {
@@ -248,6 +364,8 @@ impl<'de> Deserialize<'de> for BackendConfig {
             azure_api_version: Option<String>,
             #[serde(default)]
             kv_sessions: bool,
+            #[serde(default)]
+            text_only: bool,
         }
         let r = Raw::deserialize(deserializer)?;
         let kind = r.kind.trim().to_ascii_lowercase();
@@ -277,6 +395,7 @@ impl<'de> Deserialize<'de> for BackendConfig {
                     provider,
                     base_url,
                     api_key: r.api_key,
+                    text_only: r.text_only,
                 })
             }
             // Legacy alias
@@ -287,6 +406,7 @@ impl<'de> Deserialize<'de> for BackendConfig {
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| DEFAULT_XAI_BASE.to_string()),
                 api_key: r.api_key,
+                text_only: r.text_only,
             }),
             "api_key" | "openai" => {
                 let base_url = r
@@ -305,6 +425,7 @@ impl<'de> Deserialize<'de> for BackendConfig {
                     azure_deployment: r.azure_deployment,
                     azure_api_version: r.azure_api_version,
                     kv_sessions: r.kv_sessions,
+                    text_only: r.text_only,
                 })
             }
             "anthropic" => {
@@ -491,6 +612,22 @@ impl BackendConfig {
             }
         )
     }
+
+    /// Backend flagged text-only: images are stripped/captioned before the
+    /// request leaves Spock. Anthropic passthrough backends can carry the
+    /// flag too — the rewrite runs before the passthrough branch.
+    pub fn text_only(&self) -> bool {
+        matches!(
+            self,
+            BackendConfig::Oauth {
+                text_only: true,
+                ..
+            } | BackendConfig::ApiKey {
+                text_only: true,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -518,6 +655,7 @@ pub fn default_config() -> Config {
             provider: "xai".into(),
             base_url: DEFAULT_XAI_BASE.to_string(),
             api_key: None,
+            text_only: false,
         },
     );
     backends.insert(
@@ -531,6 +669,7 @@ pub fn default_config() -> Config {
             azure_deployment: None,
             azure_api_version: None,
             kv_sessions: false,
+            text_only: false,
         },
     );
 
@@ -576,6 +715,7 @@ pub fn default_config() -> Config {
         catalog: CatalogSection::default(),
         advisor: Default::default(),
         web_search: Default::default(),
+        vision: Default::default(),
     }
 }
 

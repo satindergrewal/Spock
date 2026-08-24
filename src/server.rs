@@ -306,6 +306,13 @@ fn handle_admin_put_config(stream: &mut TcpStream, state: &AppState, body: Value
                         }
                     }
                 }
+                // File-only [vision] knobs (prompt, sidecar keys, caption
+                // tokens, cache size) are not in the form UI; keep the file's.
+                cfg.vision.prompt = old.vision.prompt.clone();
+                cfg.vision.sidecar_api_key = old.vision.sidecar_api_key.clone();
+                cfg.vision.sidecar_api_key_env = old.vision.sidecar_api_key_env.clone();
+                cfg.vision.max_tokens = old.vision.max_tokens;
+                cfg.vision.cache_max = old.vision.cache_max;
             }
             match state.apply_and_save(cfg) {
                 Ok(()) => write_json(
@@ -661,6 +668,45 @@ fn handle_responses(sock: &mut TcpStream, state: &AppState, body: Value) -> Resu
     }
 }
 
+/// Strip/caption image content for text-only backends before the request
+/// reaches the backend (anthropic passthrough included). Never fails the
+/// request: sidecar errors degrade to strip inside vision::apply_*.
+fn apply_vision_policy(
+    state: &AppState,
+    body: &mut Value,
+    backend_flag: bool,
+    upstream_model: &str,
+    anthropic_shape: bool,
+) -> Result<()> {
+    let model_flag = crate::translate::is_text_only_model(upstream_model);
+    if !backend_flag && !model_flag {
+        return Ok(());
+    }
+    let vision = state.with_config(|c| c.vision.clone())?;
+    let action = crate::vision::decide(backend_flag, model_flag, &vision);
+    let note = if backend_flag {
+        "[image omitted: this backend is text-only]".to_string()
+    } else {
+        crate::translate::image_omitted_note(1)
+    };
+    let handled = if anthropic_shape {
+        crate::vision::apply_anthropic(body, action, &note, &vision, &state.vision_cache)
+    } else {
+        crate::vision::apply_openai(body, action, &note, &vision, &state.vision_cache)
+    };
+    if handled > 0 {
+        eprintln!(
+            "  vision: {handled} image(s) {} for text-only {upstream_model}",
+            if matches!(action, crate::vision::VisionAction::Describe) {
+                "described/stripped"
+            } else {
+                "stripped"
+            }
+        );
+    }
+    Ok(())
+}
+
 fn handle_messages(
     sock: &mut TcpStream,
     state: &AppState,
@@ -687,6 +733,16 @@ fn handle_messages(
             return write_json(sock, st, &err);
         }
     };
+
+    // Text-only backends: strip/caption images before any branch, so the
+    // anthropic passthrough and the kv_sessions path are covered too.
+    apply_vision_policy(
+        state,
+        &mut a,
+        be.config.text_only(),
+        &resolved.upstream_model,
+        true,
+    )?;
 
     let env = EnvOverrides::from_env();
     // Anthropic passthrough: forward Messages JSON with only model rewritten to upstream id.
@@ -1423,6 +1479,16 @@ fn handle_openai(
         }
     };
 
+    // Text-only backends: the OpenAI ingress forwards bodies verbatim, so
+    // image_url parts must be rewritten here — there is no later translate.
+    apply_vision_policy(
+        state,
+        &mut body,
+        be.config.text_only(),
+        &resolved.upstream_model,
+        false,
+    )?;
+
     if be.config.kv_sessions() {
         // OpenAI-shaped body: wrap as a fake Anthropic request so the same
         // native park/fork path runs. Fail loud — never chat/completions.
@@ -1865,5 +1931,157 @@ mod accepted_socket_tests {
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/v1/messages");
         assert_eq!(req.body, b"{\"model\":\"x\"}");
+    }
+}
+
+#[cfg(test)]
+mod vision_policy_e2e {
+    use crate::config::Config;
+    use crate::state::AppState;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    }
+
+    /// Read one request (headers + content-length body) and return the bytes.
+    fn read_one_request(mut s: TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let header_end = loop {
+            match s.read(&mut tmp) {
+                Ok(0) => return buf,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                }
+                Err(_) => return buf,
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let len = headers
+            .lines()
+            .find_map(|l| {
+                let l = l.to_ascii_lowercase();
+                l.strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + len {
+            match s.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
+    /// The product promise: a text_only backend never receives image content,
+    /// end to end through serve().
+    #[test]
+    fn text_only_backend_never_sees_images() {
+        let up_port = free_port();
+        let sport = free_port();
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap2 = captured.clone();
+        let upstream = TcpListener::bind(("127.0.0.1", up_port)).expect("bind upstream");
+        std::thread::spawn(move || {
+            if let Ok((s, _)) = upstream.accept() {
+                let buf = read_one_request(s.try_clone().expect("clone"));
+                *cap2.lock().unwrap() = buf;
+                let body = br#"{"id":"x","object":"chat.completion","created":0,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let mut s = s;
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body);
+            }
+        });
+
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1"
+port = {sport}
+profile = "main"
+
+[backends.t]
+type = "api_key"
+base_url = "http://127.0.0.1:{up_port}/v1"
+text_only = true
+
+[profiles.main]
+default = "t:m"
+"#
+        );
+        let cfg: Config = toml::from_str(&toml).expect("config parses");
+        let state = AppState::new(cfg);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let sh2 = shutdown.clone();
+        std::thread::spawn(move || {
+            let _ = crate::server::serve(state, sh2);
+        });
+
+        let mut sock = None;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", sport)) {
+                sock = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut sock = sock.expect("server up");
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "t:m",
+            "max_tokens": 50,
+            "messages": [
+                {"role":"user","content":[
+                    {"type":"text","text":"look"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAA"}},
+                ]},
+            ],
+        }))
+        .expect("body");
+        let head = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(head.as_bytes()).expect("write head");
+        sock.write_all(&body).expect("write body");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !captured.lock().unwrap().is_empty() || Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shutdown.store(true, Ordering::SeqCst);
+        let cap = captured.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&cap).to_string();
+        assert!(!s.is_empty(), "upstream must receive the request");
+        assert!(
+            !s.contains("image_url"),
+            "text-only upstream saw image_url: {s}"
+        );
+        assert!(
+            !s.contains(r#""type":"image""#),
+            "text-only upstream saw image block: {s}"
+        );
+        assert!(
+            s.contains("this backend is text-only"),
+            "strip note must reach upstream: {s}"
+        );
     }
 }

@@ -77,6 +77,16 @@ base_url = "http://127.0.0.1:11434/v1"
 # kv_sessions = true
 # Then: x-spock-session / session_id, or cache_control on the shared prefix.
 # Child: x-spock-parent-session. Leave: x-spock-close-session.
+#
+# Text-only upstreams (vLLM DSV4-Flash etc. hard-400 on image content, and the
+# client re-sends the poisoned transcript forever): flag the backend and Spock
+# strips screenshots to a note before the request leaves — sessions survive.
+# [backends.dsv4]
+# type = "api_key"
+# base_url = "http://10.0.0.5:8080/v1"
+# text_only = true
+# With text_only = true, [vision] mode = "describe" captions screenshots via a
+# small VL sidecar (llama-server + mmproj) and inlines the caption as text.
 
 # --- OpenAI-compatible presets (uncomment + set key) ---
 # All stay type = "api_key". Optional:
@@ -218,6 +228,24 @@ fable = "ollama:qwen2.5:14b"
 # provider = "duckduckgo"   # or brave / serper when keys set
 # # api_key_env = "BRAVE_API_KEY"
 # # Also serves grok-build: POST /v1/responses + hosted web_search tool.
+#
+# --- Vision policy for text_only backends ---
+# The switch is the backend's text_only = true flag; this section is the how.
+# "strip" (default): screenshots become "[image omitted: …]" text.
+# "describe": a small VL sidecar captions each screenshot and the caption is
+# inlined as text; any sidecar failure degrades to strip. Captions are cached
+# in memory (sha256 of image + prompt), never on disk.
+# [vision]
+# mode = "describe"
+# sidecar_base_url = "http://10.0.0.5:8090/v1"   # llama-server with mmproj
+# sidecar_model = "lfm2.5-vl-3b"
+# # sidecar_api_key_env = "SIDECAR_KEY"
+# # timeout_secs = 8        # per caption; CPU sidecars may want more
+# # No per-request image limit: a healthy sidecar captions every image.
+# # One failed caption call strips the rest of that request (bounded stall).
+# # max_tokens = 1024       # caption length
+# # cache_max = 128         # cached captions
+# # prompt = "Describe this screenshot for a text-only coding assistant."
 
 # [backends.azure]
 # type = "api_key"

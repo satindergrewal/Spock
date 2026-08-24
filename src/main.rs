@@ -12,6 +12,7 @@ mod settings;
 mod state;
 mod translate;
 mod tray;
+mod vision;
 
 use cli::{parse, print_help, Command};
 use config::{config_path, Config, CHAT_DEFAULT_MODEL, DEFAULT_XAI_BASE, UA, VERSION};

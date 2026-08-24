@@ -23,6 +23,8 @@ pub struct AppState {
     pub last_upstream_error: Arc<Mutex<Option<LastUpstreamError>>>,
     /// Per-backend last `/fork` probe. `Ok` = implemented. Sticky 404 stays an error string.
     pub kv_fork_probe: Arc<Mutex<HashMap<String, std::result::Result<(), String>>>>,
+    /// Vision sidecar caption cache (in-memory only).
+    pub vision_cache: Arc<crate::vision::VisionCache>,
 }
 
 impl AppState {
@@ -34,6 +36,7 @@ impl AppState {
             oauth: Arc::new(OauthStore::default()),
             last_upstream_error: Arc::new(Mutex::new(None)),
             kv_fork_probe: Arc::new(Mutex::new(HashMap::new())),
+            vision_cache: Arc::new(crate::vision::VisionCache::default()),
         }
     }
 
