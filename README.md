@@ -24,6 +24,7 @@ Spock is protocol-compatible with Claude Code’s Anthropic Messages client. Ver
 
 | Spock | Claude Code CLI | Claude Code IDE extension | Host (example) | Status | Notes |
 |---|---|---|---|---|---|
+| **0.3.0** | **2.1.233** | **2.1.233** | VSCodium / VS Code | **OK** | Vision policy + KV sessions + catalog UI (2026-08-24) |
 | **0.2.0** | **2.1.207** | **2.1.207** (`cc_version=2.1.207.6dd`) | VSCodium **1.128.0** (also VS Code) | **OK** | Microcompact + mid-SSE errors + log-file + webview text server tools (2026-07-13) |
 | **0.2.0** | **2.1.206** | **2.1.206** (`cc_version=2.1.206.87c`) | VSCodium **1.128.0** (also VS Code) | **OK** | Server-tool emulation + presets + Auto Mode reasoning_effort fix (2026-07-13) |
 | **0.1.0** | **2.1.206** | **2.1.206** | VSCodium **1.128.0** | **OK** | Baseline Rust multi-backend release (2026-07-11) |
@@ -135,9 +136,12 @@ Closing Settings/Chat **does not** quit the app (no Dock icon stuck around). Onl
 **Settings highlights**
 
 - Active profile (persists immediately on change)
-- Backends: `xai` or `openai`, base URL, optional API key  
-- **Fetch models** — pulls model ids from Ollama (`/v1/models` then `/api/tags`) or xAI  
-- Profiles & routes — `backend:model` per role, with dropdowns from fetched models  
+- Backends: **OAuth** / **API Key** / **Anthropic** rows, base URL, optional API key, per-backend **Text-only upstream** tick
+- **Fetch models** — pulls model ids from any OpenAI-compatible backend
+- Profiles & routes — `backend:model` per role, with dropdowns from fetched models
+- Catalog — curated `GET /v1/models` shortlist for external pickers (Grok Build), with context + effort columns
+- Server tools — `[advisor]` / `[web_search]` emulation toggles
+- Vision sidecar — `mode = strip|describe` + endpoint for text-only backends
 - **Save & Apply** — writes TOML and hot-reloads the proxy  
 
 ---
@@ -245,11 +249,11 @@ Example (`config.example.toml`):
 profile = "hybrid"
 
 [backends.xai]
-type = "xai"
-# api_key = "xai-..."
+type = "oauth"
+provider = "xai"
 
 [backends.ollama]
-type = "openai"
+type = "api_key"
 base_url = "http://127.0.0.1:11434/v1"
 
 [profiles.hybrid]
@@ -270,7 +274,7 @@ fable   = "ollama:glm-5.2:cloud"
 
 **Tip:** Different backends have different “personalities.” Grok often follows Claude Code’s “you are Claude” system prompt; other models may answer as themselves (or in another language). For a single-brain session, point **default + fable + main roles** at the same `backend:model`.
 
-Many public OpenAI-compatible gateways already work as `type = "openai"` with the right `base_url` + `api_key` (or `api_key_env`). Examples (see [`config.example.toml`](config.example.toml)):
+Many public OpenAI-compatible gateways already work as `type = "api_key"` with the right `base_url` + `api_key` (or `api_key_env`). Examples (see [`config.example.toml`](config.example.toml)):
 
 | Backend name | base_url | Key |
 |---|---|---|
@@ -294,6 +298,37 @@ Then route e.g. `default = "openrouter:anthropic/claude-sonnet-4"`. No Claude Co
 Switch profiles live: app menu **Profile**, Settings active profile, or edit TOML + **Reload** / `spock reload`.
 
 Config path: `~/.config/spock/config.toml` (created on first run). Full sample: [`config.example.toml`](config.example.toml).
+
+---
+
+## Vision for text-only backends
+
+Text-only upstreams (vLLM DSV4-Flash, GLM-5.3, …) hard-400 on image content, and clients re-send the full transcript — one screenshot poisons every later request in the session. Flag the backend and Spock rewrites images before the request leaves:
+
+```toml
+[backends.lan]
+type = "api_key"
+base_url = "http://10.0.0.5:8080/v1"
+text_only = true
+
+[vision]
+mode = "describe"                      # or "strip" (default)
+sidecar_base_url = "http://10.0.0.5:8090/v1"
+sidecar_model = "your-vl-model"
+timeout_secs = 30
+```
+
+- `strip` — screenshots become `[image omitted: this backend is text-only]`.
+- `describe` — each screenshot is captioned by a small VL sidecar (any OpenAI-compatible vision endpoint, e.g. llama-server + mmproj) and the caption is inlined as text. Any sidecar failure degrades to strip; a request never dies here.
+- Captions are cached in memory only (sha256 of image + prompt), so re-sent history is free. No per-request image limit — one failed sidecar call strips the rest of that request; a healthy sidecar captions every image.
+- Retroactively un-sticks poisoned sessions: the next request goes out clean, no new chat needed.
+- Settings UI: per-backend **Text-only upstream** tick + Vision section. Unflagged / vision backends pass images through untouched.
+
+---
+
+## llama-server KV sessions
+
+`kv_sessions = true` on an api_key backend parks a named master context on llama-server's native `/completion` + `/fork` + `/close_session` routes instead of re-prefilling every turn. Missing routes or unknown sessions **error the request** — never a silent fall-through to `/v1/chat/completions`.
 
 ---
 
@@ -388,7 +423,7 @@ spock help
 | `POST /v1/messages/count_tokens` | Rough estimate (chars/4) |
 | `POST /v1/chat/completions` | OpenAI-style (raw stream passthrough) |
 | `POST /v1/responses` | Search-only (grok-build `web_search`). Runs `[web_search]`; not a general Responses proxy |
-| `GET /v1/models` | Merged backend lists + Claude aliases |
+| `GET /v1/models` | Curated catalog when configured, else merged backend lists + Claude aliases |
 | `GET /v1/models/{id}` | Never 404s for aliases |
 | `GET /v1/language-models*` | xAI extended list when available |
 | `GET /health` | Status, profile, backends, version |
@@ -461,6 +496,7 @@ Workflows: [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/wor
 | xAI / backend quota or 401 in VSCodium | Prefer latest Spock — upstream 401/402/403/429 → **502** with a loud `Spock upstream …` message (not Anthropic login). Check `spock status` / `xai_auth`, credits on console.x.ai, or switch profile |
 | `tool_choice set but no tools` | Fixed when tools are stripped (server tools); upgrade Spock |
 | Auto Mode “claude-opus-… unavailable” | Often dead **opus** route or (older Spock) `reasoning_effort: none`. Point opus at a live backend; use Spock with the thinking-disabled fix |
+| `upstream 400: … is not a multimodal model` | Text-only backend received a screenshot. Set `text_only = true` on that backend (see [Vision](#vision-for-text-only-backends)); the poisoned session heals on the next request |
 | Claude Code `ECONNRESET` / Grok Build `reqwest error stream: error sending request` | Darwin `accept()` used to inherit `O_NONBLOCK` from the listen socket. Rebuild (`./packaging/macos/build-app.sh`) and restart Spock. If it still happens: `spock.log` should now show `route … [openai+stream]` and `spock openai stream: …` instead of a silent drop. Direct LAN vs SSH tunnel is a separate hop. |
 
 Proxy logs each request with the resolved route, e.g.:
@@ -474,7 +510,7 @@ Proxy logs each request with the resolved route, e.g.:
 
 ## Architecture (short)
 
-- **Rust** proxy: minimal deps (`ureq`, `serde`, `toml`), threaded `TcpListener`, Anthropic ↔ OpenAI translation  
+- **Rust** proxy: minimal deps (`ureq`, `serde`, `toml`, `sha2`), threaded `TcpListener`, Anthropic ↔ OpenAI translation  
 - **SwiftUI** macOS shell: menu bar + Settings + Chat; talks to proxy admin API  
 - **Profiles** hot-reload without restarting Claude Code  
 
