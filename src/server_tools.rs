@@ -265,6 +265,78 @@ fn chat_with_retry(
     }
 }
 
+/// Reduce arbitrary history to the universal chat-completions subset:
+/// user/assistant text messages only. Strict backends (kimi) 400 on
+/// role:"tool" messages whose tool_call_id they can't match, and there is
+/// no capability-negotiation API to ask a backend what it accepts — so
+/// target the shape every backend accepts. The advisor needs a readable
+/// digest of the work, not protocol fidelity: tool calls and results are
+/// rendered as labeled text instead of dropped.
+fn advisor_brief_messages(history: &Value) -> Vec<Value> {
+    let arr = if history.is_array() {
+        history.as_array().cloned().unwrap_or_default()
+    } else {
+        history
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut out: Vec<Value> = Vec::new();
+    for m in &arr {
+        let raw_role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        // Demote system (this body has its own at index 0) and tool
+        // (orphan without tool_call_id on strict backends) to user.
+        let role = match raw_role {
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(calls) = m.get("tool_calls").and_then(|t| t.as_array()) {
+            for tc in calls {
+                let name = tc
+                    .pointer("/function/name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("tool");
+                let args = tc
+                    .pointer("/function/arguments")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("{}");
+                // An empty-args call carries no signal, and its render line
+                // comes back verbatim as the "review" — kimi:k3 and
+                // zai:glm-5.3 both echoed it instead of reviewing.
+                if matches!(args.trim(), "" | "{}") {
+                    continue;
+                }
+                parts.push(format!("[called tool {name} with arguments: {args}]"));
+            }
+        }
+        let text = match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        };
+        if !text.is_empty() {
+            let prefix = if raw_role == "tool" {
+                "[tool result] "
+            } else {
+                ""
+            };
+            parts.push(format!("{prefix}{text}"));
+        }
+        let joined = parts.join("\n");
+        if !joined.is_empty() {
+            out.push(json!({"role": role, "content": joined}));
+        }
+    }
+    out
+}
+
 /// Run advisor review via a nested chat completion.
 pub fn run_advisor_review(
     state: &AppState,
@@ -291,41 +363,20 @@ pub fn run_advisor_review(
         "role": "system",
         "content": "You are a senior technical advisor reviewing another agent's work. You are NOT that agent. Do not continue its task, do not call tools, do not write first-person agent narration (\"I'll wait\", \"locking the call\"). Return only: verdict (approve / refine / pivot), plan steps, risks, and what to avoid."
     }));
-    // Flatten anthropic-ish or openai history into a single user brief if needed.
     // History carries the converted leading system message; this body already
     // has its own system at index 0, so demote the rest — template-strict
     // advisor models (LAN Qwen) would 400 "System message must be at the
     // beginning" exactly like the main path did.
-    if let Some(arr) = history.as_array() {
-        for m in arr {
-            let mut m = m.clone();
-            if m.get("role").and_then(|r| r.as_str()) == Some("system") {
-                m["role"] = json!("user");
-            }
-            messages.push(m);
-        }
-    } else if let Some(arr) = history.get("messages").and_then(|m| m.as_array()) {
-        for m in arr {
-            // Convert anthropic content blocks to text if needed
-            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            let role = if role == "system" { "user" } else { role };
-            let content = m.get("content");
-            let text = match content {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Array(blocks)) => blocks
-                    .iter()
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                _ => content.map(|c| c.to_string()).unwrap_or_default(),
-            };
-            if !text.is_empty() {
-                messages.push(json!({"role": role, "content": text}));
-            }
-        }
-    }
+    messages.extend(advisor_brief_messages(history));
+    // End on a user turn. A history ending in the assistant's own tool-call
+    // render invites completion-of-pattern: the reviewer echoes the last
+    // assistant line back as the review. A closing directive removes that.
+    messages.push(json!({
+        "role": "user",
+        "content": "Review the conversation above now. Reply with your verdict (approve / refine / pivot), plan steps, risks, and what to avoid."
+    }));
 
-    let body = json!({
+    let mut body = json!({
         "model": resolved.upstream_model,
         "messages": messages,
         "max_tokens": max_tokens,
@@ -340,7 +391,14 @@ pub fn run_advisor_review(
         be.family_name()
     );
 
-    let out = match chat_with_retry(&be, &body, &state.oauth) {
+    let mut attempt = chat_with_retry(&be, &body, &state.oauth);
+    if let Err(e) = &attempt {
+        if let Some(param) = strip_rejected_param(e, &mut body) {
+            eprintln!("  advisor: backend rejected {param} — retrying without");
+            attempt = chat_with_retry(&be, &body, &state.oauth);
+        }
+    }
+    let out = match attempt {
         Ok(UpstreamBody::Json(o)) => {
             let choice = o
                 .pointer("/choices/0/message/content")
@@ -369,6 +427,52 @@ pub fn run_advisor_review(
         Err(e) => eprintln!("  advisor error {}ms: {e}", started.elapsed().as_millis()),
     }
     out
+}
+
+/// Fill missing or empty tool-call ids — some generic backends emit "".
+/// Returns true when anything was patched.
+fn normalize_tool_call_ids(tool_calls: &mut [Value], round: usize) -> bool {
+    let mut changed = false;
+    for (i, tc) in tool_calls.iter_mut().enumerate() {
+        let empty = tc
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.is_empty())
+            .unwrap_or(true);
+        if empty {
+            tc["id"] = json!(format!("call_{round}_{i}"));
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Backends differ in which sampling parameters they accept — reasoning
+/// models pin temperature, some reject top_p or stop. There is no
+/// capability-negotiation API to ask, so learn from the rejection: strip
+/// the named parameter and retry once. No per-model quirk code needed.
+fn strip_rejected_param(err: &Error, body: &mut Value) -> Option<&'static str> {
+    if !matches!(err, Error::Http(400, _) | Error::Http(422, _)) {
+        return None;
+    }
+    let msg = match err {
+        Error::Http(_, v) => v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default(),
+        _ => return None,
+    };
+    let lower = msg.to_lowercase();
+    for param in ["temperature", "top_p", "top_k", "stop", "presence_penalty", "frequency_penalty"] {
+        if lower.contains(param) {
+            if let Some(obj) = body.as_object_mut() {
+                if obj.remove(param).is_some() {
+                    return Some(param);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Drop leaked stop tokens / chatml leftovers from Grok-family completions.
@@ -917,7 +1021,7 @@ pub fn run_with_server_tools(
             obj.insert("stream".into(), json!(false));
         }
 
-        let resp = match chat_with_retry(be, &body, &state.oauth)? {
+        let mut resp = match chat_with_retry(be, &body, &state.oauth)? {
             UpstreamBody::Json(j) => j,
             UpstreamBody::Stream(_) => {
                 return Err(Error::Msg("server_tools: unexpected stream".into()))
@@ -925,12 +1029,20 @@ pub fn run_with_server_tools(
         };
 
         let choice = resp.pointer("/choices/0").cloned().unwrap_or(json!({}));
-        let msg = choice.get("message").cloned().unwrap_or(json!({}));
-        let tool_calls = msg
+        let mut msg = choice.get("message").cloned().unwrap_or(json!({}));
+        let mut tool_calls = msg
             .get("tool_calls")
             .and_then(|t| t.as_array())
             .cloned()
             .unwrap_or_default();
+        // Normalize empty/missing ids once so the echoed assistant message,
+        // the tool results, and the client-side conversion all agree.
+        if normalize_tool_call_ids(&mut tool_calls, round) {
+            msg["tool_calls"] = Value::Array(tool_calls.clone());
+            if let Some(mc) = resp.pointer_mut("/choices/0/message/tool_calls") {
+                *mc = Value::Array(tool_calls.clone());
+            }
+        }
 
         if tool_calls.is_empty() {
             // Final assistant message — merge any server blocks then convert
@@ -943,7 +1055,6 @@ pub fn run_with_server_tools(
                     *content = merged;
                 }
             }
-            let _ = round;
             return Ok(anth);
         }
 
@@ -974,6 +1085,7 @@ pub fn run_with_server_tools(
                 let id = tc
                     .get("id")
                     .and_then(|i| i.as_str())
+                    .filter(|s| !s.is_empty())
                     .unwrap_or("call_0")
                     .to_string();
                 let name = tc
@@ -1309,5 +1421,111 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["Bash"]);
         assert_eq!(anth["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn advisor_brief_strips_tool_protocol() {
+        // Real coding history: system, user, assistant tool-call (no text),
+        // orphan role:"tool" result. Strict backends 400 on the orphan.
+        let history = json!({"messages": [
+            {"role": "system", "content": "You are Claude Code."},
+            {"role": "user", "content": "fix the bug"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "Bash", "arguments": "{\"command\":\"ls\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "src\nREADME"},
+            {"role": "assistant", "content": "Done."}
+        ]});
+        let brief = advisor_brief_messages(&history);
+        // Universal subset only: user/assistant, no tool role, no tool_calls.
+        for m in &brief {
+            let role = m["role"].as_str().unwrap();
+            assert!(role == "user" || role == "assistant", "role={role}");
+            assert!(m.get("tool_calls").is_none());
+            assert!(m.get("tool_call_id").is_none());
+            assert!(m["content"].is_string());
+        }
+        assert_eq!(brief.len(), 5);
+        // system demoted, tool call + result rendered as labeled text
+        assert!(brief[0]["content"].as_str().unwrap().contains("Claude Code"));
+        assert_eq!(brief[1]["content"].as_str().unwrap(), "fix the bug");
+        assert!(brief[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("called tool Bash"));
+        assert!(brief[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[tool result] src\nREADME"));
+        assert_eq!(brief[4]["content"].as_str().unwrap(), "Done.");
+    }
+
+    #[test]
+    fn advisor_brief_drops_empty_arg_renders() {
+        // Empty-args advisor calls must not render: both kimi:k3 and
+        // zai:glm-5.3 returned "[called tool advisor with arguments: {}]"
+        // as the entire review when the brief ended on that line.
+        let history = json!({"messages": [
+            {"role": "user", "content": "plan the rename"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_a", "type": "function",
+                 "function": {"name": "advisor", "arguments": "{}"}},
+                {"id": "call_b", "type": "function",
+                 "function": {"name": "advisor",
+                              "arguments": "{\"question\":\"is this safe?\"}"}}
+            ]}
+        ]});
+        let brief = advisor_brief_messages(&history);
+        assert_eq!(brief.len(), 2);
+        let text = brief[1]["content"].as_str().unwrap();
+        assert!(!text.contains("with arguments: {}"), "{text}");
+        assert!(text.contains("is this safe?"), "{text}");
+    }
+
+    #[test]
+    fn advisor_brief_accepts_bare_array() {
+        let history = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "block text"}
+            ]}
+        ]);
+        let brief = advisor_brief_messages(&history);
+        assert_eq!(brief.len(), 2);
+        assert_eq!(brief[1]["content"].as_str().unwrap(), "block text");
+    }
+
+    #[test]
+    fn strip_rejected_param_on_400() {
+        let err = Error::Http(
+            400,
+            json!({"error": {"message": "invalid temperature: only 1 is allowed for this model"}}),
+        );
+        let mut body = json!({"model": "k3", "messages": [], "temperature": 0.2, "max_tokens": 4096});
+        assert_eq!(strip_rejected_param(&err, &mut body), Some("temperature"));
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("max_tokens").is_some());
+        // Non-400 and unrelated errors strip nothing.
+        let err500 = Error::Http(500, json!({"error": {"message": "temperature"}}));
+        assert_eq!(strip_rejected_param(&err500, &mut body), None);
+        let err400 = Error::Http(400, json!({"error": {"message": "model not found"}}));
+        assert_eq!(strip_rejected_param(&err400, &mut body), None);
+    }
+
+    #[test]
+    fn normalize_empty_tool_call_ids() {
+        let mut calls = json!([
+            {"id": "", "function": {"name": "advisor"}},
+            {"function": {"name": "web_search"}},
+            {"id": "real_1", "function": {"name": "Bash"}}
+        ]);
+        let arr = calls.as_array_mut().unwrap();
+        assert!(normalize_tool_call_ids(arr, 2));
+        assert_eq!(arr[0]["id"], "call_2_0");
+        assert_eq!(arr[1]["id"], "call_2_1");
+        assert_eq!(arr[2]["id"], "real_1");
+        // Idempotent once filled.
+        assert!(!normalize_tool_call_ids(arr, 3));
     }
 }
