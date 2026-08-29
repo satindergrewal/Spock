@@ -1250,7 +1250,12 @@ fn stream_anthropic(
         let delta = choice.get("delta").cloned().unwrap_or(json!({}));
 
         if include_thinking {
-            if let Some(reasoning) = delta.get("reasoning_content").and_then(|t| t.as_str()) {
+            // vLLM reasoning-parser emits `reasoning`; z.ai/xAI/Kimi emit `reasoning_content`.
+            if let Some(reasoning) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(|t| t.as_str())
+            {
                 if !reasoning.is_empty() {
                     if block != Some("thinking") {
                         if block.is_some() {

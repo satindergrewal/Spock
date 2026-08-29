@@ -883,7 +883,12 @@ pub fn openai_to_anthropic(o: &Value, req_model: &str, include_thinking: bool) -
     let mut content = Vec::new();
 
     if include_thinking {
-        if let Some(r) = msg.get("reasoning_content").and_then(|t| t.as_str()) {
+        // vLLM reasoning-parser emits `reasoning`; z.ai/xAI/Kimi emit `reasoning_content`.
+        if let Some(r) = msg
+            .get("reasoning_content")
+            .or_else(|| msg.get("reasoning"))
+            .and_then(|t| t.as_str())
+        {
             if !r.is_empty() {
                 content.push(json!({"type": "thinking", "thinking": r}));
             }
@@ -1201,6 +1206,40 @@ mod tests {
         let c = a["content"].as_array().unwrap();
         assert_eq!(c[0]["type"], "thinking");
         assert_eq!(c[1]["type"], "text");
+    }
+
+    #[test]
+    fn o2a_thinking_vllm_reasoning_field() {
+        // vLLM reasoning-parser emits `reasoning`, not `reasoning_content` (DGX Spark).
+        let o = json!({
+            "id": "x",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"reasoning": "think-vllm", "content": "hello"}
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        });
+        let a = openai_to_anthropic(&o, "claude-opus-4-8", true);
+        let c = a["content"].as_array().unwrap();
+        assert_eq!(c[0]["type"], "thinking");
+        assert_eq!(c[0]["thinking"], "think-vllm");
+        assert_eq!(c[1]["type"], "text");
+    }
+
+    #[test]
+    fn o2a_reasoning_content_wins_over_reasoning() {
+        let o = json!({
+            "id": "x",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"reasoning_content": "primary", "reasoning": "fallback", "content": "hello"}
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+        });
+        let a = openai_to_anthropic(&o, "claude-opus-4-8", true);
+        let c = a["content"].as_array().unwrap();
+        assert_eq!(c[0]["type"], "thinking");
+        assert_eq!(c[0]["thinking"], "primary");
     }
 
     #[test]

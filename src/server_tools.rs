@@ -406,7 +406,9 @@ pub fn run_advisor_review(
                 .unwrap_or("")
                 .to_string();
             let text = if choice.is_empty() {
+                // vLLM reasoning-parser emits `reasoning`; z.ai/xAI/Kimi emit `reasoning_content`.
                 o.pointer("/choices/0/message/reasoning_content")
+                    .or_else(|| o.pointer("/choices/0/message/reasoning"))
                     .and_then(|c| c.as_str())
                     .unwrap_or("")
                     .to_string()
@@ -463,7 +465,14 @@ fn strip_rejected_param(err: &Error, body: &mut Value) -> Option<&'static str> {
         _ => return None,
     };
     let lower = msg.to_lowercase();
-    for param in ["temperature", "top_p", "top_k", "stop", "presence_penalty", "frequency_penalty"] {
+    for param in [
+        "temperature",
+        "top_p",
+        "top_k",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+    ] {
         if lower.contains(param) {
             if let Some(obj) = body.as_object_mut() {
                 if obj.remove(param).is_some() {
@@ -1448,7 +1457,10 @@ mod tests {
         }
         assert_eq!(brief.len(), 5);
         // system demoted, tool call + result rendered as labeled text
-        assert!(brief[0]["content"].as_str().unwrap().contains("Claude Code"));
+        assert!(brief[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Claude Code"));
         assert_eq!(brief[1]["content"].as_str().unwrap(), "fix the bug");
         assert!(brief[2]["content"]
             .as_str()
@@ -1502,7 +1514,8 @@ mod tests {
             400,
             json!({"error": {"message": "invalid temperature: only 1 is allowed for this model"}}),
         );
-        let mut body = json!({"model": "k3", "messages": [], "temperature": 0.2, "max_tokens": 4096});
+        let mut body =
+            json!({"model": "k3", "messages": [], "temperature": 0.2, "max_tokens": 4096});
         assert_eq!(strip_rejected_param(&err, &mut body), Some("temperature"));
         assert!(body.get("temperature").is_none());
         assert!(body.get("max_tokens").is_some());
