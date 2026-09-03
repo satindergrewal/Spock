@@ -1261,9 +1261,9 @@ fn stream_anthropic(
         return Ok(());
     }
 
-    tracker.close(&mut sink)?;
     crate::server_tools::finalize_live_message(
         &mut sink,
+        &mut tracker,
         stop_reason(finish.as_deref()),
         &usage,
         chunks_out,

@@ -1468,6 +1468,7 @@ pub(crate) fn run_with_server_tools_live(
             }
             return finalize_live_message(
                 sink,
+                &mut tracker,
                 crate::models::stop_reason(finish.as_deref()),
                 &usage,
                 chunks_out,
@@ -1479,6 +1480,7 @@ pub(crate) fn run_with_server_tools_live(
             // Plain final answer — nothing emulated, nothing for the client.
             return finalize_live_message(
                 sink,
+                &mut tracker,
                 crate::models::stop_reason(finish.as_deref()),
                 &usage,
                 chunks_out,
@@ -1487,19 +1489,24 @@ pub(crate) fn run_with_server_tools_live(
         }
     }
 
+    tracker.close(sink)?;
     let msg = "server_tools: exceeded max advisor/web_search rounds";
     finish_live_stream_error(sink, state, msg)
 }
 
-/// Close out the message_delta/message_stop pair with the same usage mapping
-/// the generic passthrough uses (footer gauge + auto-compact read this).
+/// Close out the message: close any open content block, then the
+/// message_delta/message_stop pair with the same usage mapping the generic
+/// passthrough uses (footer gauge + auto-compact read this). Owning the
+/// close makes a start/stop mismatch impossible on any exit path.
 pub(crate) fn finalize_live_message(
     sink: &mut dyn crate::sse::SseSink,
+    tracker: &mut crate::sse::BlockTracker,
     stop: &str,
     usage: &Value,
     chunks_out: u64,
     input_estimate: u64,
 ) -> crate::error::Result<()> {
+    tracker.close(sink)?;
     let out_tokens = usage
         .get("completion_tokens")
         .and_then(|v| v.as_u64())
@@ -1967,6 +1974,22 @@ mod tests {
             &mut exec,
         );
         res.unwrap();
+        // Every open block must be closed before message_stop — an unclosed
+        // final block is a protocol hole even when text arrived paced.
+        let starts = sink
+            .events
+            .iter()
+            .filter(|(n, _)| n == "content_block_start")
+            .count();
+        let stops = sink
+            .events
+            .iter()
+            .filter(|(n, _)| n == "content_block_stop")
+            .count();
+        assert_eq!(
+            starts, stops,
+            "unbalanced content blocks: {starts} starts / {stops} stops"
+        );
         (sink, exec_log)
     }
 
