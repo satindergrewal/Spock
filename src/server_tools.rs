@@ -1105,64 +1105,18 @@ pub fn run_with_server_tools(
                     .pointer("/function/arguments")
                     .and_then(|a| a.as_str())
                     .unwrap_or("{}");
-                let args: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
-
-                let (tool_result_content, server_blocks) = match name {
-                    "advisor" if want_advisor => advisor_content_blocks(
-                        &id,
-                        run_advisor_review(
-                            state,
-                            &json!({"messages": messages}),
-                            &advisor_hint,
-                            advisor_cfg.max_tokens,
-                        ),
-                    ),
-                    "web_search" if want_web => {
-                        let query = args
-                            .get("query")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        match run_web_search(web_cfg, &query) {
-                            Ok(results) => {
-                                let text = results.to_string();
-                                let display = if query.is_empty() {
-                                    format!("Web search results:\n{text}")
-                                } else {
-                                    format!("Web search for “{query}”:\n{text}")
-                                };
-                                let blocks =
-                                    web_search_content_blocks(&id, &query, &results, &display);
-                                (text, blocks)
-                            }
-                            Err(e) => {
-                                let err = format!("{e}");
-                                (
-                                    err.clone(),
-                                    vec![
-                                        json!({
-                                            "type": "server_tool_use",
-                                            "id": id,
-                                            "name": "web_search",
-                                            "input": {"query": query}
-                                        }),
-                                        json!({
-                                            "type": "web_search_tool_result",
-                                            "tool_use_id": id,
-                                            "content": {"error_code": "unavailable"}
-                                        }),
-                                        json!({"type": "text", "text": format!("Web search failed: {err}")}),
-                                    ],
-                                )
-                            }
-                        }
-                    }
-                    other => {
-                        let err = format!("unknown or disabled server tool: {other}");
-                        (err, vec![])
-                    }
-                };
-
+                let (tool_result_content, server_blocks) = execute_emulated_tool(
+                    state,
+                    &messages,
+                    &id,
+                    name,
+                    args_raw,
+                    want_advisor,
+                    want_web,
+                    &advisor_hint,
+                    advisor_cfg,
+                    web_cfg,
+                );
                 collected_server_blocks.extend(server_blocks);
                 messages.push(json!({
                     "role": "tool",
@@ -1206,6 +1160,389 @@ pub fn run_with_server_tools(
     Err(Error::Msg(
         "server_tools: exceeded max advisor/web_search rounds".into(),
     ))
+}
+
+/// Run one emulated server tool (advisor / web_search) and produce both the
+/// role:"tool" content for the upstream conversation and the Anthropic
+/// content blocks for the client. Shared by the buffered (non-stream) and
+/// live (stream) round loops — behavior must stay identical between them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_emulated_tool(
+    state: &AppState,
+    messages: &[Value],
+    id: &str,
+    name: &str,
+    args_raw: &str,
+    want_advisor: bool,
+    want_web: bool,
+    advisor_hint: &str,
+    advisor_cfg: &AdvisorConfig,
+    web_cfg: &WebSearchConfig,
+) -> (String, Vec<Value>) {
+    let args: Value = serde_json::from_str(args_raw).unwrap_or(json!({}));
+    match name {
+        "advisor" if want_advisor => advisor_content_blocks(
+            id,
+            run_advisor_review(
+                state,
+                &json!({"messages": messages}),
+                advisor_hint,
+                advisor_cfg.max_tokens,
+            ),
+        ),
+        "web_search" if want_web => {
+            let query = args
+                .get("query")
+                .and_then(|q| q.as_str())
+                .unwrap_or("")
+                .to_string();
+            match run_web_search(web_cfg, &query) {
+                Ok(results) => {
+                    let text = results.to_string();
+                    let display = if query.is_empty() {
+                        format!("Web search results:\n{text}")
+                    } else {
+                        format!("Web search for “{query}”:\n{text}")
+                    };
+                    let blocks = web_search_content_blocks(id, &query, &results, &display);
+                    (text, blocks)
+                }
+                Err(e) => {
+                    let err = format!("{e}");
+                    (
+                        err.clone(),
+                        vec![
+                            json!({
+                                "type": "server_tool_use",
+                                "id": id,
+                                "name": "web_search",
+                                "input": {"query": query}
+                            }),
+                            json!({
+                                "type": "web_search_tool_result",
+                                "tool_use_id": id,
+                                "content": {"error_code": "unavailable"}
+                            }),
+                            json!({"type": "text", "text": format!("Web search failed: {err}")}),
+                        ],
+                    )
+                }
+            }
+        }
+        other => {
+            let err = format!("unknown or disabled server tool: {other}");
+            (err, vec![])
+        }
+    }
+}
+
+/// Chat connector for the live loop: takes the request body, returns a reader
+/// of a connected upstream SSE body. HTTP-level failures (429/5xx) come back
+/// as `Err` before any body bytes exist. Injected so tests can drive rounds
+/// from fixtures.
+pub(crate) type LiveChat<'a> =
+    &'a mut dyn FnMut(
+        &Value,
+    )
+        -> std::result::Result<Box<dyn std::io::Read + Send>, crate::error::Error>;
+
+/// Emulated-tool executor for the live loop: (messages, id, name, args_raw)
+/// → (role:"tool" content, Anthropic content blocks). Production wiring
+/// delegates to [`execute_emulated_tool`]; tests substitute fixtures.
+pub(crate) type LiveExec<'a> =
+    &'a mut dyn FnMut(&[Value], &str, &str, &str) -> (String, Vec<Value>);
+
+const MAX_LIVE_ROUNDS: usize = 6;
+
+/// Streaming server-tools path: every upstream round runs with stream:true and
+/// thinking/text deltas reach the client live. tool_call fragments are held
+/// back until the round completes, then emulated (advisor/web_search) calls
+/// execute server-side between keepalive gaps while client calls emit as
+/// tool_use blocks — all inside ONE Anthropic message (single message_start,
+/// continuous block indexes, single message_stop).
+///
+/// `first_reader` is an already-connected round-0 body: the caller opens it
+/// before writing SSE headers so a total upstream failure still gets a real
+/// HTTP error response instead of an SSE error event.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_server_tools_live(
+    state: &AppState,
+    anthropic_req: &Value,
+    mut oai: Value,
+    client_model: &str,
+    include_thinking: bool,
+    advisor_cfg: &AdvisorConfig,
+    web_cfg: &WebSearchConfig,
+    sink: &mut dyn crate::sse::SseSink,
+    input_estimate: u64,
+    first_reader: Box<dyn std::io::Read + Send>,
+    chat: LiveChat,
+    exec: LiveExec,
+) -> crate::error::Result<()> {
+    use crate::sse::{BlockTracker, ToolCallAccumulator, UpstreamEvent, UpstreamEvents};
+
+    let want_advisor = advisor_cfg.enabled && request_has_advisor(anthropic_req);
+    let want_web = web_cfg.enabled && request_has_web_search(anthropic_req);
+    inject_emulated_function_tools(&mut oai, want_advisor, want_web);
+
+    let mut messages: Vec<Value> = oai
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut tracker = BlockTracker::new();
+    // Token proxy across ALL rounds for the usage fallback — thinking-heavy
+    // turns must not report ~0 output when the backend omits stream usage.
+    let mut chunks_out: u64 = 0;
+
+    sink.event(
+        "message_start",
+        &json!({
+            "type": "message_start",
+            "message": {
+                "id": crate::translate::new_msg_id(),
+                "type": "message",
+                "role": "assistant",
+                "model": client_model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        }),
+    )?;
+
+    let mut reader = Some(first_reader);
+    for _round in 0..MAX_LIVE_ROUNDS {
+        let body = {
+            let mut b = oai.clone();
+            if let Some(obj) = b.as_object_mut() {
+                obj.insert("messages".into(), Value::Array(messages.clone()));
+            }
+            b
+        };
+        let round_reader = match reader.take() {
+            Some(r) => r,
+            None => match chat(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    return finish_live_stream_error(
+                        sink,
+                        state,
+                        &format!("spock server_tools: {e}"),
+                    );
+                }
+            },
+        };
+
+        let mut acc = ToolCallAccumulator::default();
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut finish: Option<String> = None;
+        let mut usage = json!({});
+        let mut mid_err: Option<String> = None;
+        for ev in UpstreamEvents::new(round_reader) {
+            match ev {
+                Err(e) => {
+                    mid_err = Some(e.to_string());
+                    break;
+                }
+                Ok(UpstreamEvent::Thinking(s)) => {
+                    reasoning.push_str(&s);
+                    chunks_out += 1;
+                    if include_thinking {
+                        tracker.ensure_thinking(sink)?;
+                        sink.event(
+                            "content_block_delta",
+                            &json!({
+                                "type": "content_block_delta",
+                                "index": tracker.index(),
+                                "delta": {"type": "thinking_delta", "thinking": s}
+                            }),
+                        )?;
+                    }
+                }
+                Ok(UpstreamEvent::Text(s)) => {
+                    text.push_str(&s);
+                    chunks_out += 1;
+                    tracker.ensure_text(sink)?;
+                    sink.event(
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": tracker.index(),
+                            "delta": {"type": "text_delta", "text": s}
+                        }),
+                    )?;
+                }
+                Ok(UpstreamEvent::ToolCallFrag {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                }) => acc.push(index, &id, &name, &arguments),
+                Ok(UpstreamEvent::Finish(f)) => finish = Some(f),
+                Ok(UpstreamEvent::Usage(u)) => usage = u,
+            }
+        }
+        if let Some(raw) = mid_err {
+            let labeled = crate::sse::label_mid_stream_upstream_error(&raw);
+            tracker.close(sink)?;
+            return finish_live_stream_error(sink, state, &labeled);
+        }
+
+        let calls = acc.finish();
+        // Echoed assistant message for follow-up rounds: same shape the
+        // buffered loop pushes upstream (content + reasoning_content when the
+        // model thought, tool_calls as OpenAI function calls).
+        let mut msg = json!({"role": "assistant", "content": text});
+        if !reasoning.is_empty() {
+            msg["reasoning_content"] = json!(reasoning);
+        }
+        if !calls.is_empty() {
+            msg["tool_calls"] = Value::Array(
+                calls
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {"name": c.name, "arguments": c.arguments}
+                        })
+                    })
+                    .collect(),
+            );
+        }
+
+        let mut server_calls: Vec<&crate::sse::PartialCall> = Vec::new();
+        let mut client_calls: Vec<&crate::sse::PartialCall> = Vec::new();
+        for c in &calls {
+            let is_server =
+                (c.name == "advisor" && want_advisor) || (c.name == "web_search" && want_web);
+            if is_server {
+                server_calls.push(c);
+            } else {
+                client_calls.push(c);
+            }
+        }
+
+        if !server_calls.is_empty() {
+            // Close streamed text/thinking before emitting result blocks, run
+            // the emulated tools inside a keepalive gap, then either return
+            // client calls (mixed round — buffered-path parity) or loop so the
+            // model can consume the results.
+            tracker.close(sink)?;
+            messages.push(msg.clone());
+            sink.begin_gap();
+            for c in &server_calls {
+                let (tool_result, blocks) = exec(&messages, &c.id, &c.name, &c.arguments);
+                for b in &blocks {
+                    tracker.emit_standalone_block(sink, b)?;
+                }
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": c.id,
+                    "content": tool_result
+                }));
+            }
+            sink.end_gap();
+            if client_calls.is_empty() {
+                continue;
+            }
+        }
+
+        if !client_calls.is_empty() {
+            tracker.close(sink)?;
+            for c in &client_calls {
+                let input: Value = serde_json::from_str(&c.arguments).unwrap_or(json!({}));
+                tracker.emit_standalone_block(
+                    sink,
+                    &json!({
+                        "type": "tool_use",
+                        "id": c.id,
+                        "name": c.name,
+                        "input": input
+                    }),
+                )?;
+            }
+            return finalize_live_message(
+                sink,
+                crate::models::stop_reason(finish.as_deref()),
+                &usage,
+                chunks_out,
+                input_estimate,
+            );
+        }
+
+        if server_calls.is_empty() {
+            // Plain final answer — nothing emulated, nothing for the client.
+            return finalize_live_message(
+                sink,
+                crate::models::stop_reason(finish.as_deref()),
+                &usage,
+                chunks_out,
+                input_estimate,
+            );
+        }
+    }
+
+    let msg = "server_tools: exceeded max advisor/web_search rounds";
+    finish_live_stream_error(sink, state, msg)
+}
+
+/// Close out the message_delta/message_stop pair with the same usage mapping
+/// the generic passthrough uses (footer gauge + auto-compact read this).
+pub(crate) fn finalize_live_message(
+    sink: &mut dyn crate::sse::SseSink,
+    stop: &str,
+    usage: &Value,
+    chunks_out: u64,
+    input_estimate: u64,
+) -> crate::error::Result<()> {
+    let out_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(chunks_out);
+    let in_tokens = usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(input_estimate);
+    let mut delta_usage = json!({"output_tokens": out_tokens});
+    if in_tokens > 0 {
+        delta_usage["input_tokens"] = json!(in_tokens);
+    }
+    if let Some(cached) = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+    {
+        delta_usage["cache_read_input_tokens"] = json!(cached);
+    }
+    sink.event(
+        "message_delta",
+        &json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": null},
+            "usage": delta_usage
+        }),
+    )?;
+    sink.event("message_stop", &json!({"type": "message_stop"}))?;
+    Ok(())
+}
+
+/// SSE error event + message_stop after headers are committed. Records the
+/// failure for the dashboard like every other upstream error.
+fn finish_live_stream_error(
+    sink: &mut dyn crate::sse::SseSink,
+    state: &AppState,
+    msg: &str,
+) -> crate::error::Result<()> {
+    state.record_upstream_error(502, msg);
+    let (_st, err_body) = crate::error::anthropic_error(502, "api_error", msg);
+    let _ = sink.event("error", &err_body);
+    let _ = sink.event("message_stop", &json!({"type": "message_stop"}));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1540,5 +1877,301 @@ mod tests {
         assert_eq!(arr[2]["id"], "real_1");
         // Idempotent once filled.
         assert!(!normalize_tool_call_ids(arr, 3));
+    }
+
+    // ---- live (streaming) server-tools loop ----
+
+    struct Rec {
+        events: Vec<(String, Value)>,
+        gaps: Vec<&'static str>,
+    }
+    impl crate::sse::SseSink for Rec {
+        fn event(&mut self, name: &str, data: &Value) -> crate::error::Result<()> {
+            self.events.push((name.to_string(), data.clone()));
+            Ok(())
+        }
+        fn begin_gap(&mut self) {
+            self.gaps.push("begin");
+        }
+        fn end_gap(&mut self) {
+            self.gaps.push("end");
+        }
+    }
+
+    fn sse_body(lines: &[&str]) -> Box<dyn std::io::Read + Send> {
+        let mut s = String::new();
+        for l in lines {
+            s.push_str("data: ");
+            s.push_str(l);
+            s.push_str("\n\n");
+        }
+        s.push_str("data: [DONE]\n\n");
+        Box::new(std::io::Cursor::new(s.into_bytes()))
+    }
+
+    fn test_state() -> AppState {
+        AppState::new(crate::config::Config::default())
+    }
+
+    fn anth_req_with_advisor() -> Value {
+        json!({"tools": [{"type": "advisor_20260301"}], "messages": []})
+    }
+
+    fn advisor_cfg_on() -> AdvisorConfig {
+        AdvisorConfig {
+            enabled: true,
+            model: None,
+            max_tokens: 128,
+        }
+    }
+
+    fn run_live(
+        rounds: Vec<Box<dyn std::io::Read + Send>>,
+        req: &Value,
+    ) -> (Rec, Vec<(String, String, String)>) {
+        let mut sink = Rec {
+            events: Vec::new(),
+            gaps: Vec::new(),
+        };
+        let mut exec_log: Vec<(String, String, String)> = Vec::new();
+        let mut it = rounds.into_iter();
+        let first = it.next().unwrap();
+        let mut chat = move |_body: &Value| {
+            it.next()
+                .ok_or_else(|| crate::error::Error::Msg("no more rounds".into()))
+        };
+        let log = &mut exec_log;
+        let exec_sink = &mut sink;
+        let mut exec = |msgs: &[Value], id: &str, name: &str, args: &str| {
+            log.push((id.to_string(), name.to_string(), args.to_string()));
+            assert_eq!(msgs.last().unwrap()["role"], "assistant");
+            (
+                "review text".to_string(),
+                vec![json!({"type": "text", "text": "Advisor review:\napprove"})],
+            )
+        };
+        let _ = exec_sink;
+        let web = WebSearchConfig::default();
+        let res = run_with_server_tools_live(
+            &test_state(),
+            req,
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+            "claude-opus-5",
+            true,
+            &advisor_cfg_on(),
+            &web,
+            &mut sink,
+            10,
+            first,
+            &mut chat,
+            &mut exec,
+        );
+        res.unwrap();
+        (sink, exec_log)
+    }
+
+    fn event_names(r: &Rec) -> Vec<&str> {
+        r.events.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn live_advisor_round_streams_then_final_answer() {
+        // Round 0: thinking + narration + fragmented advisor call.
+        // Round 1: final answer. Advisor must NEVER appear as client tool_use.
+        let rounds = vec![
+            sse_body(&[
+                r#"{"choices":[{"delta":{"reasoning":"pondering"}}]}"#,
+                r#"{"choices":[{"delta":{"content":"Let me consult."}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"advisor","arguments":"{"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ]),
+            sse_body(&[
+                r#"{"choices":[{"delta":{"reasoning":"wrap up"}}]}"#,
+                r#"{"choices":[{"delta":{"content":"Final answer."}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#,
+            ]),
+        ];
+        let (sink, exec_log) = run_live(rounds, &anth_req_with_advisor());
+
+        // Advisor executed once with assembled arguments.
+        assert_eq!(exec_log.len(), 1);
+        assert_eq!(exec_log[0].1, "advisor");
+        assert_eq!(exec_log[0].2, "{}");
+
+        let names = event_names(&sink);
+        assert_eq!(
+            names.iter().filter(|n| **n == "message_start").count(),
+            1,
+            "one message_start"
+        );
+        assert_eq!(
+            names.iter().filter(|n| **n == "message_stop").count(),
+            1,
+            "one message_stop"
+        );
+        let text = serde_json::to_string(&sink.events).unwrap();
+        assert!(
+            !text.contains("\"name\":\"advisor\""),
+            "advisor leaked as tool_use: {text}"
+        );
+        assert!(text.contains("Advisor review"), "{text}");
+
+        // Live deltas from BOTH rounds; blocks continue one message's index run:
+        // 0 thinking, 1 text, 2 advisor text, 3 thinking, 4 text.
+        let block_starts: Vec<i64> = sink
+            .events
+            .iter()
+            .filter(|(n, _)| n == "content_block_start")
+            .map(|(_, d)| d["index"].as_i64().unwrap())
+            .collect();
+        assert_eq!(block_starts, vec![0, 1, 2, 3, 4], "{text}");
+        // Round-1 thinking arrives AFTER the advisor block (chronological).
+        let advisor_pos = text.find("Advisor review").unwrap();
+        let late_think_pos = text.find("wrap up").unwrap();
+        assert!(advisor_pos < late_think_pos);
+
+        // Final message_delta carries usage + end_turn.
+        let md = sink
+            .events
+            .iter()
+            .find(|(n, _)| n == "message_delta")
+            .map(|(_, d)| d.clone())
+            .unwrap();
+        assert_eq!(md["delta"]["stop_reason"], "end_turn");
+        assert_eq!(md["usage"]["input_tokens"], 11);
+        assert_eq!(md["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn live_client_tool_round_emits_tool_use_and_stops() {
+        // A Bash call is a CLIENT tool: emitted as tool_use with full args via
+        // input_json_delta, stop_reason tool_use, no server execution, no
+        // further rounds consumed.
+        let rounds = vec![
+            sse_body(&[
+                r#"{"choices":[{"delta":{"content":"Checking."}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_b","function":{"name":"Bash","arguments":"{\"command\":"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":5}}"#,
+            ]),
+            sse_body(&[r#"{"choices":[{"delta":{"content":"never reached"}}]}"#]),
+        ];
+        let (sink, exec_log) = run_live(rounds, &anth_req_with_advisor());
+        assert!(
+            exec_log.is_empty(),
+            "client tools never execute server-side"
+        );
+
+        let text = serde_json::to_string(&sink.events).unwrap();
+        assert!(text.contains("\"name\":\"Bash\""), "{text}");
+        let args = sink
+            .events
+            .iter()
+            .find(|(n, d)| n == "content_block_delta" && d["delta"]["type"] == "input_json_delta")
+            .map(|(_, d)| d["delta"]["partial_json"].as_str().unwrap().to_string())
+            .unwrap();
+        assert_eq!(args, "{\"command\":\"ls\"}");
+        assert!(!text.contains("never reached"), "{text}");
+        let md = sink
+            .events
+            .iter()
+            .find(|(n, _)| n == "message_delta")
+            .map(|(_, d)| d.clone())
+            .unwrap();
+        assert_eq!(md["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn live_mixed_round_executes_advisor_and_returns_client_tool() {
+        // advisor + Bash in ONE round: advisor executes (gap-bracketed), Bash
+        // is emitted as tool_use, message ends with stop_reason tool_use.
+        let rounds = vec![sse_body(&[
+            r#"{"choices":[{"delta":{"content":"both now"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"advisor","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"Bash","arguments":"{\"command\":\"pwd\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])];
+        let (sink, exec_log) = run_live(rounds, &anth_req_with_advisor());
+        assert_eq!(exec_log.len(), 1);
+        let text = serde_json::to_string(&sink.events).unwrap();
+        assert!(text.contains("Advisor review"), "{text}");
+        assert!(text.contains("\"name\":\"Bash\""), "{text}");
+        assert!(
+            !text.contains("\"name\":\"advisor\""),
+            "advisor leaked: {text}"
+        );
+        let md = sink
+            .events
+            .iter()
+            .find(|(n, _)| n == "message_delta")
+            .map(|(_, d)| d.clone())
+            .unwrap();
+        assert_eq!(md["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn live_execution_wrapped_in_gap() {
+        // Keepalive gap must bracket exactly the executor window — pings may
+        // only write while the main thread emits nothing.
+        let rounds = vec![
+            sse_body(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"advisor","arguments":"{}"}}]}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ]),
+            sse_body(&[
+                r#"{"choices":[{"delta":{"content":"done"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ]),
+        ];
+        let (sink, exec_log) = run_live(rounds, &anth_req_with_advisor());
+        assert_eq!(exec_log.len(), 1);
+        assert_eq!(sink.gaps, vec!["begin", "end"]);
+        let text = serde_json::to_string(&sink.events).unwrap();
+        // Emission after the gap (round-1 text) — nothing interleaves inside it.
+        let gap_end_ok = text.contains("done");
+        assert!(gap_end_ok);
+    }
+
+    #[test]
+    fn live_web_search_partition_uses_flags() {
+        // web_search named but web emulation disabled → treated as a CLIENT
+        // tool (handed to Claude Code), not executed.
+        let rounds = vec![sse_body(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"w1","function":{"name":"web_search","arguments":"{\"query\":\"rust\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ])];
+        let mut sink = Rec {
+            events: Vec::new(),
+            gaps: Vec::new(),
+        };
+        let mut exec_log: Vec<(String, String, String)> = Vec::new();
+        let first = rounds.into_iter().next().unwrap();
+        let mut chat = |_b: &Value| -> std::result::Result<Box<dyn std::io::Read + Send>, _> {
+            Err(crate::error::Error::Msg("no round 2".into()))
+        };
+        let log = &mut exec_log;
+        let mut exec = |_m: &[Value], i: &str, n: &str, a: &str| {
+            log.push((i.into(), n.into(), a.into()));
+            ("x".into(), vec![])
+        };
+        run_with_server_tools_live(
+            &test_state(),
+            &anth_req_with_advisor(),
+            json!({"model": "m", "messages": []}),
+            "claude-opus-5",
+            true,
+            &advisor_cfg_on(),
+            &WebSearchConfig::default(),
+            &mut sink,
+            0,
+            first,
+            &mut chat,
+            &mut exec,
+        )
+        .unwrap();
+        assert!(exec_log.is_empty());
+        let text = serde_json::to_string(&sink.events).unwrap();
+        assert!(text.contains("\"name\":\"web_search\""), "{text}");
     }
 }

@@ -9,6 +9,7 @@ mod route;
 mod server;
 mod server_tools;
 mod settings;
+mod sse;
 mod state;
 mod translate;
 mod tray;

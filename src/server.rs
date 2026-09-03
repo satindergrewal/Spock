@@ -801,12 +801,11 @@ fn handle_messages(
     let use_server_tools = (advisor_cfg.enabled && crate::server_tools::request_has_advisor(&a))
         || (web_cfg.enabled && crate::server_tools::request_has_web_search(&a));
 
-    // Server-tools MUST run for stream clients too. Claude Code WebSearch is a
-    // client tool that opens a *nested* streaming Messages call with
-    // tools:[{type:web_search_20250305}]. If we skip emulation on stream, the
-    // schema is stripped, the model never searches, and WebSearch returns empty.
-    // Upstream chat inside the loop stays non-stream; we still speak SSE to the
-    // client, with keepalives so slow LAN rounds don't trip client idle timeouts.
+    // Server-tool emulation: advisor/web_search run as multi-round upstream
+    // loops. Stream clients get LIVE streaming — every round runs upstream
+    // with stream:true and thinking/text deltas forward as they arrive; only
+    // emulated tool execution (advisor review, web search) happens between
+    // keepalive gaps. Non-stream clients keep the buffered JSON loop.
 
     eprintln!(
         "  route {} → {}:{} ({}){}",
@@ -946,8 +945,12 @@ fn handle_kv_sessions(
     }
 }
 
-/// Stream-client path for advisor/web_search: keepalive SSE while the multi-round
-/// upstream loop runs, then emit the final Anthropic message as SSE events.
+/// Stream-client path for advisor/web_search emulation: LIVE streaming.
+/// Round 0's upstream connection is opened BEFORE SSE headers so a total
+/// upstream failure still produces a real HTTP error (not an SSE error event
+/// after 200 OK); every round then streams thinking/text deltas through
+/// [`server_tools::run_with_server_tools_live`] while emulated tool calls are
+/// intercepted and executed server-side between keepalive gaps.
 #[allow(clippy::too_many_arguments)]
 fn run_server_tools_streaming(
     sock: &mut TcpStream,
@@ -959,34 +962,54 @@ fn run_server_tools_streaming(
     advisor_cfg: &crate::server_tools::AdvisorConfig,
     web_cfg: &crate::server_tools::WebSearchConfig,
     be: &crate::backends::BackendHandle,
-    env: &EnvOverrides,
+    _env: &EnvOverrides,
 ) -> Result<()> {
-    write_sse_headers(sock)?;
-
-    // Background keepalives so Claude Code does not idle-timeout during long
-    // LAN rounds (search + model thinking with stream:false upstream).
-    let mut keepalive = sock.try_clone().ok();
-    if let Some(ref mut ks) = keepalive {
-        let _ = ks.set_write_timeout(Some(Duration::from_secs(5)));
-    }
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_flag = stop.clone();
-    let ping = std::thread::spawn(move || {
-        while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs(12));
-            if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            if let Some(ref mut ks) = keepalive {
-                // SSE comment — ignored by clients, resets idle timers.
-                if write!(ks, ": spock-keepalive\n\n").is_err() || ks.flush().is_err() {
-                    break;
-                }
-            }
+    // Same request shape the live loop builds per round; needed once here to
+    // open round 0 before committing to SSE.
+    let advisor_on = advisor_cfg.enabled && crate::server_tools::request_has_advisor(a);
+    let web_on = web_cfg.enabled && crate::server_tools::request_has_web_search(a);
+    let mut oai0 = oai.clone();
+    crate::server_tools::inject_emulated_function_tools(&mut oai0, advisor_on, web_on);
+    let first_body = {
+        let mut b = oai0;
+        if let Some(obj) = b.as_object_mut() {
+            obj.insert(
+                "messages".into(),
+                oai.get("messages").cloned().unwrap_or(json!([])),
+            );
         }
-    });
+        b
+    };
+    let first_reader = match chat_stream_with_retry(be, &first_body, &state.oauth) {
+        Ok(r) => r,
+        Err(e) => return write_upstream_err(sock, state, e),
+    };
 
-    let result = crate::server_tools::run_with_server_tools(
+    write_sse_headers(sock)?;
+    let mut sink = SocketSink::new(sock);
+    let input_estimate = count_tokens_estimate(a);
+    let oauth = &state.oauth;
+    let mut chat = |body: &Value| chat_stream_with_retry(be, body, oauth);
+    let mut exec = |messages: &[Value], id: &str, name: &str, args_raw: &str| {
+        let hint = advisor_cfg
+            .model
+            .clone()
+            .or_else(|| crate::server_tools::advisor_model_from_request(a))
+            .unwrap_or_else(|| "fable".into());
+        crate::server_tools::execute_emulated_tool(
+            state,
+            messages,
+            id,
+            name,
+            args_raw,
+            advisor_on,
+            web_on,
+            &hint,
+            advisor_cfg,
+            web_cfg,
+        )
+    };
+    crate::server_tools::run_with_server_tools_live(
         state,
         a,
         oai,
@@ -994,170 +1017,109 @@ fn run_server_tools_streaming(
         include_thinking,
         advisor_cfg,
         web_cfg,
-        be,
-        env,
-    );
+        &mut sink,
+        input_estimate,
+        first_reader,
+        &mut chat,
+        &mut exec,
+    )
+}
 
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = ping.join();
+/// One upstream streaming round, retrying once on transient 429/5xx. Safe at
+/// any point in a live loop: ureq surfaces HTTP status errors before any body
+/// bytes are read, and once a body exists we return it without retrying.
+fn chat_stream_with_retry(
+    be: &crate::backends::BackendHandle,
+    body: &Value,
+    oauth: &crate::oauth::OauthStore,
+) -> std::result::Result<Box<dyn Read + Send>, Error> {
+    match be.chat(body, true, oauth) {
+        Ok(UpstreamBody::Stream(reader)) => Ok(reader),
+        Ok(UpstreamBody::Json(_)) => Err(Error::Msg("expected stream, got json".into())),
+        Err(Error::Http(code, _)) if code == 429 || code >= 500 => {
+            eprintln!("  server_tools: upstream {code} transient — retrying once");
+            std::thread::sleep(Duration::from_millis(1200));
+            match be.chat(body, true, oauth) {
+                Ok(UpstreamBody::Stream(reader)) => Ok(reader),
+                Ok(UpstreamBody::Json(_)) => Err(Error::Msg("expected stream, got json".into())),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
 
-    match result {
-        Ok(resp) => stream_json_as_anthropic_sse_body(sock, &resp),
-        Err(e) => {
-            let msg = format!("spock server_tools: {e}");
-            state.record_upstream_error(502, &msg);
-            let (_st, err_body) = anthropic_error(502, "api_error", &msg);
-            let _ = emit_sse(sock, "error", &err_body);
-            let _ = emit_sse(sock, "message_stop", &json!({"type": "message_stop"}));
-            Ok(())
+/// SseSink over the client socket. `begin_gap`/`end_gap` bracket slow emulated
+/// tool execution: inside a gap the main thread emits nothing, so a keepalive
+/// ping thread may safely write SSE comments without ever interleaving with a
+/// half-written event. Outside gaps there is exactly one writer — the main
+/// thread — so live deltas can never be torn by a ping.
+struct SocketSink<'a> {
+    sock: &'a mut TcpStream,
+    ping: Option<thread::JoinHandle<()>>,
+    ping_stop: Arc<AtomicBool>,
+}
+
+impl<'a> SocketSink<'a> {
+    fn new(sock: &'a mut TcpStream) -> Self {
+        SocketSink {
+            sock,
+            ping: None,
+            ping_stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn stop_ping(&mut self) {
+        if let Some(h) = self.ping.take() {
+            self.ping_stop.store(true, Ordering::Relaxed);
+            let _ = h.join();
         }
     }
 }
 
-/// Emit a completed Anthropic message as SSE events (for server-tool multi-round results).
-/// Writes response headers first.
-#[allow(dead_code)] // kept for non-keepalive callers / tests
-fn stream_json_as_anthropic_sse(stream: &mut TcpStream, resp: &Value) -> Result<()> {
-    write_sse_headers(stream)?;
-    stream_json_as_anthropic_sse_body(stream, resp)
+impl Drop for SocketSink<'_> {
+    fn drop(&mut self) {
+        self.stop_ping();
+    }
 }
 
-/// Body-only SSE emission — headers already written (e.g. keepalive path).
-fn stream_json_as_anthropic_sse_body(stream: &mut TcpStream, resp: &Value) -> Result<()> {
-    let msg_id = resp
-        .get("id")
-        .and_then(|i| i.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(new_msg_id);
-    let model = resp
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("spock");
-    let start_usage = resp
-        .get("usage")
-        .cloned()
-        .unwrap_or(json!({"input_tokens": 0, "output_tokens": 0}));
-    emit_sse(
-        stream,
-        "message_start",
-        &json!({
-            "type": "message_start",
-            "message": {
-                "id": msg_id,
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": start_usage
-            }
-        }),
-    )?;
-    let blocks = resp
-        .get("content")
-        .and_then(|c| c.as_array())
-        .cloned()
-        .unwrap_or_default();
-    for (i, block) in blocks.iter().enumerate() {
-        let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        // Anthropic streaming clients (Claude Code) expect tool_use / server_tool_use
-        // to start with empty input and receive arguments via input_json_delta.
-        // Dumping the full input only in content_block_start leaves input={} →
-        // "missing parameter" on every client tool when advisor/web_search force
-        // this synthetic-SSE path.
-        let start_block = match kind {
-            "tool_use" | "server_tool_use" => {
-                let mut b = block.clone();
-                if let Some(obj) = b.as_object_mut() {
-                    obj.insert("input".into(), json!({}));
-                }
-                b
-            }
-            _ => block.clone(),
+impl crate::sse::SseSink for SocketSink<'_> {
+    fn event(&mut self, name: &str, data: &Value) -> Result<()> {
+        emit_sse(self.sock, name, data)
+    }
+
+    fn begin_gap(&mut self) {
+        self.stop_ping();
+        self.ping_stop.store(false, Ordering::Relaxed);
+        let Ok(mut ping_sock) = self.sock.try_clone() else {
+            return;
         };
-        emit_sse(
-            stream,
-            "content_block_start",
-            &json!({"type":"content_block_start","index": i, "content_block": start_block}),
-        )?;
-        match kind {
-            "text" => {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    if !text.is_empty() {
-                        emit_sse(
-                            stream,
-                            "content_block_delta",
-                            &json!({
-                                "type":"content_block_delta",
-                                "index": i,
-                                "delta": {"type":"text_delta","text": text}
-                            }),
-                        )?;
-                    }
+        let stop = self.ping_stop.clone();
+        self.ping = Some(thread::spawn(move || {
+            let _ = ping_sock.set_write_timeout(Some(Duration::from_secs(5)));
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(12));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // SSE comment — ignored by clients, resets idle timers.
+                if write!(ping_sock, ": spock-keepalive\n\n").is_err() || ping_sock.flush().is_err()
+                {
+                    break;
                 }
             }
-            "thinking" => {
-                if let Some(th) = block.get("thinking").and_then(|t| t.as_str()) {
-                    if !th.is_empty() {
-                        emit_sse(
-                            stream,
-                            "content_block_delta",
-                            &json!({
-                                "type":"content_block_delta",
-                                "index": i,
-                                "delta": {"type":"thinking_delta","thinking": th}
-                            }),
-                        )?;
-                    }
-                }
-            }
-            "tool_use" | "server_tool_use" => {
-                let input = block.get("input").cloned().unwrap_or(json!({}));
-                let partial = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
-                if partial != "{}" {
-                    emit_sse(
-                        stream,
-                        "content_block_delta",
-                        &json!({
-                            "type":"content_block_delta",
-                            "index": i,
-                            "delta": {"type":"input_json_delta","partial_json": partial}
-                        }),
-                    )?;
-                }
-            }
-            // advisor_tool_result / web_search_tool_result / other full blocks:
-            // start already carried the whole payload; no delta needed.
-            _ => {}
-        }
-        emit_sse(
-            stream,
-            "content_block_stop",
-            &json!({"type":"content_block_stop","index": i}),
-        )?;
+        }));
     }
-    let stop = resp
-        .get("stop_reason")
-        .cloned()
-        .unwrap_or(json!("end_turn"));
-    let usage = resp
-        .get("usage")
-        .cloned()
-        .unwrap_or(json!({"input_tokens":0,"output_tokens":0}));
-    emit_sse(
-        stream,
-        "message_delta",
-        &json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop, "stop_sequence": null},
-            "usage": usage
-        }),
-    )?;
-    emit_sse(stream, "message_stop", &json!({"type": "message_stop"}))?;
-    Ok(())
+
+    fn end_gap(&mut self) {
+        self.stop_ping();
+    }
 }
 
+/// Generic live translation of an upstream OpenAI SSE body into Anthropic
+/// SSE on the client socket. Parsing lives in [`crate::sse`] and is shared
+/// with the server-tools live loop; this wrapper keeps the generic path's
+/// emission policy: tool_call fragments forward LIVE as tool_use blocks.
 fn stream_anthropic(
     stream: &mut TcpStream,
     reader: Box<dyn Read + Send>,
@@ -1166,15 +1128,16 @@ fn stream_anthropic(
     input_estimate: u64,
     state: &AppState,
 ) -> Result<()> {
+    use crate::sse::{BlockTracker, SseSink, UpstreamEvent, UpstreamEvents};
+
     write_sse_headers(stream)?;
-    let msg_id = new_msg_id();
-    emit_sse(
-        stream,
+    let mut sink = SocketSink::new(stream);
+    sink.event(
         "message_start",
         &json!({
             "type": "message_start",
             "message": {
-                "id": msg_id,
+                "id": new_msg_id(),
                 "type": "message",
                 "role": "assistant",
                 "model": req_model,
@@ -1186,179 +1149,75 @@ fn stream_anthropic(
         }),
     )?;
 
-    let mut block: Option<&str> = None;
-    let mut index: i64 = -1;
-    let mut chunks_out: u64 = 0;
-    let mut finish: Option<String> = None;
-    let mut usage = json!({});
-    let mut mid_stream_err: Option<String> = None;
+    let mut tracker = BlockTracker::new();
     // OpenAI tool_calls[].index → Anthropic content block index.
     // Qwen (and others) stream args across many deltas with empty id after the first
     // chunk. Opening a new tool_use on every id/name presence fragments one Bash call
     // into N broken blocks (Claude Code then runs empty/invalid commands).
     let mut tool_block_by_tc_index: std::collections::HashMap<i64, i64> =
         std::collections::HashMap::new();
+    let mut chunks_out: u64 = 0;
+    let mut finish: Option<String> = None;
+    let mut usage = json!({});
+    let mut mid_stream_err: Option<String> = None;
 
-    let buffered = BufReader::new(reader);
-    for line in buffered.lines() {
-        let line = match line {
-            Ok(l) => l,
+    for ev in UpstreamEvents::new(reader) {
+        match ev {
             Err(e) => {
-                mid_stream_err = Some(format!("stream read error: {e}"));
+                mid_stream_err = Some(crate::sse::label_mid_stream_upstream_error(&e.to_string()));
                 break;
             }
-        };
-        let line = line.trim();
-        if !line.starts_with("data:") {
-            continue;
-        }
-        let payload = line[5..].trim();
-        if payload == "[DONE]" {
-            break;
-        }
-        let chunk: Value = match serde_json::from_str(payload) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Some OpenAI-compat servers emit error objects mid-SSE after 200 headers.
-        if let Some(err) = chunk.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| err.to_string());
-            mid_stream_err = Some(label_mid_stream_upstream_error(&msg));
-            break;
-        }
-
-        if let Some(u) = chunk.get("usage") {
-            // Providers send "usage": null on every content chunk; keep the real one.
-            if u.is_object() {
-                usage = u.clone();
-            }
-        }
-        let choice = chunk
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .cloned()
-            .unwrap_or(json!({}));
-        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-            finish = Some(fr.to_string());
-        }
-        let delta = choice.get("delta").cloned().unwrap_or(json!({}));
-
-        if include_thinking {
-            // vLLM reasoning-parser emits `reasoning`; z.ai/xAI/Kimi emit `reasoning_content`.
-            if let Some(reasoning) = delta
-                .get("reasoning_content")
-                .or_else(|| delta.get("reasoning"))
-                .and_then(|t| t.as_str())
-            {
-                if !reasoning.is_empty() {
-                    if block != Some("thinking") {
-                        if block.is_some() {
-                            emit_sse(
-                                stream,
-                                "content_block_stop",
-                                &json!({"type":"content_block_stop","index": index}),
-                            )?;
-                        }
-                        index += 1;
-                        block = Some("thinking");
-                        emit_sse(
-                            stream,
-                            "content_block_start",
-                            &json!({
-                                "type": "content_block_start",
-                                "index": index,
-                                "content_block": {"type": "thinking", "thinking": ""}
-                            }),
-                        )?;
-                    }
-                    emit_sse(
-                        stream,
+            Ok(UpstreamEvent::Thinking(reasoning)) => {
+                if include_thinking {
+                    tracker.ensure_thinking(&mut sink)?;
+                    sink.event(
                         "content_block_delta",
                         &json!({
                             "type": "content_block_delta",
-                            "index": index,
+                            "index": tracker.index(),
                             "delta": {"type": "thinking_delta", "thinking": reasoning}
                         }),
                     )?;
                     chunks_out += 1;
                 }
             }
-        }
-
-        if let Some(text) = delta.get("content").and_then(|t| t.as_str()) {
-            if !text.is_empty() {
-                if block != Some("text") {
-                    if block.is_some() {
-                        emit_sse(
-                            stream,
-                            "content_block_stop",
-                            &json!({"type":"content_block_stop","index": index}),
-                        )?;
-                    }
-                    index += 1;
-                    block = Some("text");
-                    emit_sse(
-                        stream,
-                        "content_block_start",
-                        &json!({
-                            "type": "content_block_start",
-                            "index": index,
-                            "content_block": {"type": "text", "text": ""}
-                        }),
-                    )?;
-                }
-                emit_sse(
-                    stream,
+            Ok(UpstreamEvent::Text(text)) => {
+                tracker.ensure_text(&mut sink)?;
+                sink.event(
                     "content_block_delta",
                     &json!({
                         "type": "content_block_delta",
-                        "index": index,
+                        "index": tracker.index(),
                         "delta": {"type": "text_delta", "text": text}
                     }),
                 )?;
                 chunks_out += 1;
             }
-        }
-
-        if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-            for tc in tcs {
-                let fn_ = tc.get("function").cloned().unwrap_or(json!({}));
-                let tc_index = tc.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                let id_raw = tc.get("id").and_then(|t| t.as_str()).unwrap_or("");
-                let name_raw = fn_.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            Ok(UpstreamEvent::ToolCallFrag {
+                index: tc_index,
+                id: id_raw,
+                name: name_raw,
+                arguments,
+            }) => {
                 // Start a new Anthropic tool_use block only once per OpenAI tool index.
                 // Later deltas for the same index only carry argument fragments (often
                 // with id:"" / no name) — must NOT open another block.
                 let need_start = !tool_block_by_tc_index.contains_key(&tc_index)
                     && (!id_raw.is_empty() || !name_raw.is_empty());
                 if need_start {
-                    if block.is_some() {
-                        emit_sse(
-                            stream,
-                            "content_block_stop",
-                            &json!({"type":"content_block_stop","index": index}),
-                        )?;
-                    }
-                    index += 1;
-                    block = Some("tool");
-                    tool_block_by_tc_index.insert(tc_index, index);
+                    tracker.close(&mut sink)?;
+                    let block_idx = tracker.mark_tool();
+                    tool_block_by_tc_index.insert(tc_index, block_idx);
                     let id = if id_raw.is_empty() {
                         new_tool_id()
                     } else {
-                        id_raw.to_string()
+                        id_raw.clone()
                     };
-                    emit_sse(
-                        stream,
+                    sink.event(
                         "content_block_start",
                         &json!({
                             "type": "content_block_start",
-                            "index": index,
+                            "index": block_idx,
                             "content_block": {
                                 "type": "tool_use",
                                 "id": id,
@@ -1373,85 +1232,43 @@ fn stream_anthropic(
                     // shouldn't happen on well-formed streams; skip rather than invent.
                     continue;
                 };
-                if let Some(args) = fn_.get("arguments").and_then(|a| a.as_str()) {
-                    if !args.is_empty() {
-                        emit_sse(
-                            stream,
-                            "content_block_delta",
-                            &json!({
-                                "type": "content_block_delta",
-                                "index": block_idx,
-                                "delta": {"type": "input_json_delta", "partial_json": args}
-                            }),
-                        )?;
-                        chunks_out += 1;
-                    }
+                if !arguments.is_empty() {
+                    sink.event(
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "input_json_delta", "partial_json": arguments}
+                        }),
+                    )?;
+                    chunks_out += 1;
                 }
             }
+            Ok(UpstreamEvent::Finish(f)) => finish = Some(f),
+            Ok(UpstreamEvent::Usage(u)) => usage = u,
         }
     }
 
     if let Some(err_msg) = mid_stream_err {
         // Close open content block, then emit Anthropic error event so the IDE
         // shows a real failure instead of a silent truncated stream.
-        if block.is_some() {
-            let _ = emit_sse(
-                stream,
-                "content_block_stop",
-                &json!({"type":"content_block_stop","index": index}),
-            );
-        }
+        tracker.close(&mut sink)?;
         state.record_upstream_error(502, &err_msg);
         let (_st, err_body) = anthropic_error(502, "api_error", &format!("Spock {err_msg}"));
-        let _ = emit_sse(stream, "error", &err_body);
-        let _ = emit_sse(stream, "message_stop", &json!({"type": "message_stop"}));
+        let _ = sink.event("error", &err_body);
+        let _ = sink.event("message_stop", &json!({"type": "message_stop"}));
         eprintln!("  mid-SSE error: {err_msg}");
         return Ok(());
     }
 
-    if block.is_some() {
-        emit_sse(
-            stream,
-            "content_block_stop",
-            &json!({"type":"content_block_stop","index": index}),
-        )?;
-    }
-    let out_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(chunks_out);
-    // Claude Code's footer gauge and auto-compact trigger read
-    // input_tokens + cache_* from the last assistant message's usage (merged
-    // from message_delta). Zero here = gauge hidden, context silently overflows.
-    let in_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(input_estimate);
-    let mut delta_usage = json!({"output_tokens": out_tokens});
-    if in_tokens > 0 {
-        delta_usage["input_tokens"] = json!(in_tokens);
-    }
-    if let Some(cached) = usage
-        .get("prompt_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64())
-    {
-        delta_usage["cache_read_input_tokens"] = json!(cached);
-    }
-    emit_sse(
-        stream,
-        "message_delta",
-        &json!({
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": stop_reason(finish.as_deref()),
-                "stop_sequence": null
-            },
-            "usage": delta_usage
-        }),
-    )?;
-    emit_sse(stream, "message_stop", &json!({"type": "message_stop"}))?;
-    Ok(())
+    tracker.close(&mut sink)?;
+    crate::server_tools::finalize_live_message(
+        &mut sink,
+        stop_reason(finish.as_deref()),
+        &usage,
+        chunks_out,
+        input_estimate,
+    )
 }
 
 fn handle_openai(
@@ -1656,24 +1473,6 @@ fn write_upstream_err(stream: &mut TcpStream, state: &AppState, e: Error) -> Res
     }
 }
 
-/// Label mid-SSE `error` objects from OpenAI-compat backends so Claude Code / status
-/// toasts don't look like Spock itself aborted the stream.
-///
-/// llama.cpp `common_chat_msg_diff::compute_diffs` throws
-/// `"Invalid diff: now finding less tool calls!"` when a model retracts a partial
-/// tool_call mid-stream (common on damaged quants). That is upstream — Spock only
-/// forwards it.
-fn label_mid_stream_upstream_error(raw: &str) -> String {
-    let lower = raw.to_ascii_lowercase();
-    if lower.contains("invalid diff")
-        || lower.contains("finding less tool calls")
-        || lower.contains("tool call mismatch")
-    {
-        return format!("upstream stream error [llama-server tool-call parser, not Spock]: {raw}");
-    }
-    format!("upstream stream error: {raw}")
-}
-
 /// Map vendor HTTP failures to Anthropic-shaped errors that Claude Code (CLI + VSCodium)
 /// will **show as text**, not misread as "log in to Anthropic".
 ///
@@ -1785,7 +1584,8 @@ fn urlencoding_decode(s: &str) -> String {
 
 #[cfg(test)]
 mod upstream_err_tests {
-    use super::{classify_upstream_http, label_mid_stream_upstream_error};
+    use super::classify_upstream_http;
+    use crate::sse::label_mid_stream_upstream_error;
 
     #[test]
     fn llama_tool_call_diff_is_labeled_upstream() {
