@@ -246,7 +246,19 @@ pub fn device_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
     }
     let device_code = dc["device_code"]
         .as_str()
-        .ok_or_else(|| Error::Auth("missing device_code".into()))?
+        .ok_or_else(|| {
+            // The auth.openai.com device endpoint sits behind a Cloudflare
+            // managed challenge that plain HTTP cannot pass (the body is HTML,
+            // parsed as Null). Give a real remedy instead of a bare parse error.
+            let hint = if provider.id == "openai" {
+                " — auth.openai.com is behind a Cloudflare challenge; log in through the \
+                 Codex app/CLI (`codex login`) so ~/.codex/auth.json is fresh and Spock \
+                 imports it, or skip OAuth and set an api_key"
+            } else {
+                ""
+            };
+            Error::Auth(format!("missing device_code from {} device auth{hint}", provider.id))
+        })?
         .to_string();
     let user_code = dc["user_code"].as_str().unwrap_or("?").to_string();
     let url = dc
@@ -351,9 +363,186 @@ pub fn refresh(provider: &ProviderDef, tokens: &TokenSet) -> Result<Option<Token
     Ok(Some(set))
 }
 
-/// Full interactive login + save.
+/// Percent-encode a query value (space → %20, not `+` — OpenAI's auth server
+/// rejects `+`-encoded spaces).
+fn query_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn rand_hex(n: usize) -> String {
+    let mut b = vec![0u8; n];
+    getrandom::getrandom(&mut b).ok();
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for x in b {
+        let _ = write!(s, "{x:02x}");
+    }
+    s
+}
+
+fn query_get(query: &str, key: &str) -> Option<String> {
+    let q = query.split_once('?').map(|(_, q)| q).unwrap_or(query);
+    for pair in q.split('&') {
+        let mut it = pair.splitn(2, '=');
+        let k = it.next().unwrap_or("");
+        let v = it.next().unwrap_or("");
+        if k == key {
+            return Some(percent_decode(v));
+        }
+    }
+    None
+}
+
+/// Login via the browser **authorization-code PKCE** flow. A real browser is
+/// the user agent, so any Cloudflare challenge passes; Spock then exchanges
+/// the code at the token endpoint (which is not challenged) and saves the
+/// tokens. No third-party CLI or app is required — used for providers that
+/// carry an `authorize_url` (currently OpenAI/Codex).
+pub fn pkce_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
+    use std::io::{BufRead as _, Write as _};
+    use std::net::TcpListener;
+
+    let port = provider.callback_port.max(1);
+    let redirect_uri = format!("http://localhost:{port}/auth/callback");
+    let mut vbuf = vec![0u8; 32];
+    getrandom::getrandom(&mut vbuf).ok();
+    let code_verifier = URL_SAFE_NO_PAD.encode(&vbuf);
+    let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+    let state = rand_hex(10);
+
+    let authorize_url = provider
+        .authorize_url
+        .unwrap_or("https://auth.openai.com/oauth/authorize");
+    let params = [
+        ("response_type", "code"),
+        ("client_id", provider.client_id),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("scope", provider.scope.unwrap_or("openid profile email offline_access")),
+        ("code_challenge", code_challenge.as_str()),
+        ("code_challenge_method", "S256"),
+        ("id_token_add_organizations", "true"),
+        ("codex_cli_simplified_flow", "true"),
+        ("state", state.as_str()),
+        ("originator", "codex_cli_rs"),
+    ];
+    let qs = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", query_encode(k), query_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = format!("{authorize_url}?{qs}");
+
+    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
+        Error::Auth(format!(
+            "could not bind localhost:{port} for the OAuth callback (is something else on it?): {e}"
+        ))
+    })?;
+    listener.set_nonblocking(true).ok();
+
+    eprintln!("\n  {} — a browser window should open for sign-in.\n", provider.label);
+    if open {
+        open_browser(&url);
+    } else {
+        eprintln!("    {url}\n");
+    }
+
+    let deadline = now_secs() + 300.0;
+    let stream = loop {
+        match listener.accept() {
+            Ok((s, _)) => break s,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if now_secs() > deadline {
+                    return Err(Error::Auth(
+                        "OAuth callback timed out — no browser approval received".into(),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            Err(e) => return Err(Error::Auth(format!("OAuth callback accept error: {e}"))),
+        }
+    };
+
+    let mut rd = std::io::BufReader::new(stream);
+    let mut req_line = String::new();
+    rd.read_line(&mut req_line).ok();
+    let target = req_line.split(' ').nth(1).unwrap_or("/").to_string();
+    let mut resp = rd.into_inner();
+    let _ = resp.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+          <html><body><h2>Spock</h2><p>Signed in. You can close this window and return to the terminal.</p></body></html>",
+    );
+
+    let code = query_get(&target, "code")
+        .ok_or_else(|| Error::Auth("OAuth callback carried no `code`".into()))?
+        .to_string();
+    if let Some(s) = query_get(&target, "state") {
+        if s != state {
+            return Err(Error::Auth("OAuth callback state mismatch (stale page?)".into()));
+        }
+    }
+
+    let ctx = DeviceCtx::current();
+    let headers = request_headers(provider, &ctx);
+    let agent = agent(provider.user_agent);
+    let endpoints = resolve_endpoints(provider, &agent)?;
+    let (st, tok) = form_post(
+        &agent,
+        &endpoints.token,
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", provider.client_id),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("code_verifier", code_verifier.as_str()),
+        ],
+        &headers,
+    )?;
+    if st != 200 {
+        return Err(Error::Auth(format!(
+            "{} token exchange failed ({st}): {tok}",
+            provider.id
+        )));
+    }
+    token_set_from_json(tok)
+}
+
+/// Full interactive login + save. Providers with an `authorize_url` use the
+/// browser PKCE flow; the rest use the device-code flow.
 pub fn login_and_save(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
-    let mut set = device_login(provider, open)?;
+    let mut set = if provider.authorize_url.is_some() {
+        pkce_login(provider, open)?
+    } else {
+        device_login(provider, open)?
+    };
     save_tokens(provider.id, &mut set)?;
     Ok(set)
 }

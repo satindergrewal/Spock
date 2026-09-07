@@ -1,4 +1,5 @@
 pub mod openai_compat;
+pub mod responses;
 
 use crate::config::{BackendConfig, Config};
 use crate::error::{Error, Result};
@@ -39,11 +40,75 @@ impl BackendHandle {
             BackendConfig::Oauth { .. } => "oauth",
             BackendConfig::ApiKey { .. } => "api_key",
             BackendConfig::Anthropic { .. } => "anthropic",
+            BackendConfig::Responses { .. } => "responses",
         }
     }
 
     pub fn is_anthropic(&self) -> bool {
         matches!(self.config, BackendConfig::Anthropic { .. })
+    }
+
+    /// The Codex/OpenAI wire: the `responses` backend kind, or an `oauth`
+    /// backend whose provider is `openai` (its endpoint speaks Responses API
+    /// only — never chat completions).
+    pub fn is_codex(&self) -> bool {
+        matches!(&self.config, BackendConfig::Responses { .. })
+            || matches!(&self.config, BackendConfig::Oauth { provider, .. } if provider == "openai")
+    }
+
+    /// Bearer for the Codex wire: configured api_key, or the OAuth provider token.
+    fn codex_bearer(&self, oauth: &OauthStore) -> Result<String> {
+        if let Some(k) = self.config.api_key() {
+            return Ok(k);
+        }
+        let provider = self.codex_provider();
+        crate::oauth::access_token(oauth, provider, None, crate::oauth::AccessMode::Proxy)
+    }
+
+    fn codex_provider(&self) -> &str {
+        match &self.config {
+            BackendConfig::Responses { provider, .. } => provider.as_str(),
+            BackendConfig::Oauth { provider, .. } => provider.as_str(),
+            _ => "openai",
+        }
+    }
+
+    /// Probe the Codex `/models` route (requires `client_version`). Falls back
+    /// to a static shortlist so `/v1/models` never silently 400s.
+    fn codex_list_models(&self, oauth: &OauthStore) -> Result<Vec<String>> {
+        let base_url = self.config.base_url();
+        let key = self.codex_bearer(oauth)?;
+        let path = self.config.responses_path();
+        let dir = match path.rsplit_once('/') {
+            Some((d, _)) if !d.is_empty() => d,
+            _ => "",
+        };
+        let models_path = if dir.is_empty() {
+            "/models?client_version=0.131.0".to_string()
+        } else {
+            format!("/{dir}/models?client_version=0.131.0")
+        };
+        let v = openai_compat::get_json(
+            base_url,
+            Some(&key),
+            &models_path,
+            self.config.extra_headers(),
+            None,
+            None,
+            None,
+        )?;
+        let mut out = Vec::new();
+        if let Some(models) = v.get("models").and_then(|m| m.as_array()) {
+            for m in models {
+                if let Some(slug) = m.get("slug").and_then(|s| s.as_str()) {
+                    out.push(slug.to_string());
+                }
+            }
+        }
+        if out.is_empty() {
+            out = vec!["gpt-5.5".into(), "gpt-5.4".into(), "gpt-5.2".into()];
+        }
+        Ok(out)
     }
 
     fn oauth_bearer(
@@ -87,6 +152,49 @@ impl BackendHandle {
                     .into(),
             ));
         }
+        // The OpenAI/Codex provider speaks ONLY the Responses API (stream-only),
+        // never chat completions. Route it to the responses wire regardless of
+        // whether it was configured as an `oauth` backend or the `responses` kind.
+        if self.is_codex() {
+            let provider = match &self.config {
+                BackendConfig::Responses { provider, .. } => provider.as_str(),
+                BackendConfig::Oauth { provider, .. } => provider.as_str(),
+                _ => "openai",
+            };
+            let api_key = self.config.api_key();
+            let (token, acct) = match api_key {
+                Some(k) => (k, None),
+                None => {
+                    let t = crate::oauth::access_token(
+                        oauth,
+                        provider,
+                        None,
+                        crate::oauth::AccessMode::Proxy,
+                    )?;
+                    let acct = crate::oauth::load_tokens(provider).and_then(|toks| {
+                        toks.extra
+                            .get("account_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    });
+                    (t, acct)
+                }
+            };
+            let path = if self.config.responses_path().is_empty() {
+                "codex/responses"
+            } else {
+                self.config.responses_path()
+            };
+            return responses::chat(
+                self.config.base_url(),
+                path,
+                Some(token.as_str()),
+                acct.as_deref(),
+                body,
+                stream,
+                self.config.extra_headers(),
+            );
+        }
         match &self.config {
             BackendConfig::Oauth { .. } => {
                 let (token, headers, ua) = self.oauth_bearer(oauth)?;
@@ -120,6 +228,44 @@ impl BackendHandle {
             BackendConfig::Anthropic { base_url, .. } => {
                 let key = self.config.api_key();
                 openai_compat::anthropic_messages(base_url, key.as_deref(), body, stream)
+            }
+            BackendConfig::Responses { .. } => {
+                // Codex / ChatGPT subscription Responses wire. An explicit
+                // api_key means an API-key gateway (no account header);
+                // otherwise the `provider` OAuth token is the bearer.
+                let api_key = self.config.api_key();
+                let provider = match &self.config {
+                    BackendConfig::Responses { provider, .. } => provider.as_str(),
+                    _ => "openai",
+                };
+                let (token, acct) = match api_key {
+                    Some(k) => (k, None),
+                    None => {
+                        let t = crate::oauth::access_token(
+                            oauth,
+                            provider,
+                            None,
+                            crate::oauth::AccessMode::Proxy,
+                        )?;
+                        let acct = crate::oauth::load_tokens(provider)
+                            .and_then(|toks| {
+                                toks.extra
+                                    .get("account_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            });
+                        (t, acct)
+                    }
+                };
+                responses::chat(
+                    self.config.base_url(),
+                    self.config.responses_path(),
+                    Some(token.as_str()),
+                    acct.as_deref(),
+                    body,
+                    stream,
+                    self.config.extra_headers(),
+                )
             }
         }
     }
@@ -164,6 +310,9 @@ impl BackendHandle {
             BackendConfig::Anthropic { .. } => Err(Error::Msg(
                 "kv_sessions: Anthropic backends have no llama-server native routes".into(),
             )),
+            BackendConfig::Responses { .. } => Err(Error::Msg(
+                "kv_sessions: Responses backends have no llama-server native routes".into(),
+            )),
         }
     }
 
@@ -206,10 +355,38 @@ impl BackendHandle {
                     None,
                 )
             }
+            BackendConfig::Responses { base_url, .. } => {
+                let key = self.responses_bearer(oauth)?;
+                openai_compat::get_json(
+                    base_url,
+                    Some(&key),
+                    path,
+                    self.config.extra_headers(),
+                    None,
+                    None,
+                    None,
+                )
+            }
         }
     }
 
+    /// Bearer for the Responses backend: the configured api_key, or the OAuth
+    /// provider token. Used for status/model probes, not the chat path.
+    fn responses_bearer(&self, oauth: &OauthStore) -> Result<String> {
+        if let Some(k) = self.config.api_key() {
+            return Ok(k);
+        }
+        let provider = match &self.config {
+            BackendConfig::Responses { provider, .. } => provider.as_str(),
+            _ => "openai",
+        };
+        crate::oauth::access_token(oauth, provider, None, crate::oauth::AccessMode::Proxy)
+    }
+
     pub fn list_models(&self, oauth: &OauthStore) -> Result<Vec<String>> {
+        if self.is_codex() {
+            return self.codex_list_models(oauth);
+        }
         match &self.config {
             BackendConfig::Oauth { .. } => {
                 let (token, headers, ua) = self.oauth_bearer(oauth)?;
@@ -225,6 +402,7 @@ impl BackendHandle {
                     None,
                 )
             }
+            BackendConfig::Responses { .. } => self.codex_list_models(oauth),
         }
     }
 }

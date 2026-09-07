@@ -4,6 +4,12 @@ All notable changes to Spock are documented here.
 
 ## [Unreleased]
 
+### Added
+- **ChatGPT / Codex subscription backend** (`type = "responses"`) — use a ChatGPT subscription, not separate billing. New `openaai` OAuth provider imports the token from `~/.codex/auth.json` (Codex CLI/Desktop) and refreshes via `auth.openai.com/oauth/token` (device-code re-login is secondary — that endpoint sits behind a Cloudflare challenge). The `responses` backend transliterates completions-shaped bodies to the Codex Responses API (`POST {base}/codex/responses`, stream-only, `store:false`) and back — `translate.rs`, `server_tools`, and KV sessions are untouched. Subscription-gated models (`gpt-5.5`, `gpt-5.4`, …) route normally; an explicit `api_key`/`api_key_env` switches to the official OpenAI Responses gateway (`{base}/responses`).
+
+### Changed
+- Breaking: text-only image handling is keyed **only** on the backend's `text_only = true` flag — the built-in glm-5.3 model-id matcher is deleted. `glm-5.3-*` served by a healthy multimodal upstream (vLLM) carries image parts natively end to end: the `/v1/messages` translate layer, the vision policy, and the KV/anthropic passthrough are all keyed on the same flag. z.ai Completions hard-400s non-text parts and needs `text_only = true` on its own backend section — without it image requests 400 loudly. Live case: a multimodal `glm-5.3-*` upstream omitted a session's one supplied image behind the matcher while the box itself accepted the image (vLLM) all along. The serving Spock must restart to pick this up.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added

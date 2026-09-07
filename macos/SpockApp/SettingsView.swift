@@ -183,7 +183,12 @@ struct SettingsView: View {
                                 Picker("", selection: $b.provider) {
                                     Text("xai").tag("xai")
                                     Text("kimi").tag("kimi")
-                                    if !b.provider.isEmpty && b.provider != "xai" && b.provider != "kimi" {
+                                    Text("qwen").tag("qwen")
+                                    Text("openai").tag("openai")
+                                    if !b.provider.isEmpty
+                                        && b.provider != "xai" && b.provider != "kimi"
+                                        && b.provider != "qwen" && b.provider != "openai"
+                                    {
                                         Text(b.provider).tag(b.provider)
                                     }
                                 }
@@ -194,11 +199,17 @@ struct SettingsView: View {
                                     if url.isEmpty
                                         || url.contains("api.x.ai")
                                         || url.contains("api.kimi.com")
+                                        || url.contains("chatgpt.com")
+                                        || url.contains("dashscope")
                                     {
                                         if newVal == "kimi" {
                                             b.baseURL = "https://api.kimi.com/coding/v1"
                                         } else if newVal == "xai" {
                                             b.baseURL = "https://api.x.ai/v1"
+                                        } else if newVal == "openai" {
+                                            b.baseURL = "https://chatgpt.com/backend-api"
+                                        } else if newVal == "qwen" {
+                                            b.baseURL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
                                         }
                                     }
                                 }

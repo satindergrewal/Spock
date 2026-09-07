@@ -2,8 +2,9 @@
 
 **Local multi-backend proxy** that speaks the **Anthropic Messages API** so [Claude Code](https://claude.com/claude-code) (CLI + VSCodium/VS Code) can run on:
 
-- **OAuth providers** — xAI Grok, Kimi Code, optional chat.qwen.ai (`spock login <provider>`)  
+- **OAuth providers** — xAI Grok, Kimi Code, optional chat.qwen.ai, OpenAI (ChatGPT/Codex) (`spock login <provider>`)  
 - **API Key backends** — Qwen Cloud (qwencloud.com), Ollama / llama-server / OpenRouter / any OpenAI-compatible API  
+- **Responses backends** — the OpenAI **ChatGPT / Codex** subscription (see [ChatGPT subscription](#chatgpt-subscription)) — no separate API billing  
 
 Claude Code always points at Spock (`http://127.0.0.1:8048`). Spock maps Haiku / Sonnet / Opus / Fable (and any model id) to different backends via profiles — without changing Claude settings when you switch vendors.
 
@@ -210,6 +211,25 @@ api_key_env = "DASHSCOPE_API_KEY"
 `/models` only lists what **that plan’s host** exposes. Docs can advertise `qwen3.8-max-preview` while a Coding Plan key’s catalog stays at 10 fixed models — that is upstream plan gating, not Spock.
 
 Optional: `spock login qwen` is the **chat.qwen.ai** OAuth path (qwen-code). Different product again.
+
+### ChatGPT / Codex subscription (OAuth)
+
+Your **ChatGPT subscription** is not the OpenAI platform API — the platform rejects the `chatgpt` token, and subscription-gated models (e.g. `gpt-5.5`) are only reachable through the **Codex consumer backend** (`POST https://chatgpt.com/backend-api/codex/responses`), which speaks the OpenAI **Responses API** and is **stream-only**. Spock hides that wire: **`openai` is a plain OAuth provider** — you configure it exactly like xAI/Kimi.
+
+```toml
+[backends.chatgpt]
+type = "oauth"
+provider = "openai"
+base_url = "https://chatgpt.com/backend-api"
+```
+
+**No Codex app is required.** Login is a real OAuth authorization-code PKCE flow — `spock login openai` (or menu-bar **Login ▸ OpenAI**) opens a browser, you sign in, and Spock exchanges the code for tokens and stores them in its own `~/.config/spock/oauth-openai.json`. The browser passes any Cloudflare challenge, so the `auth.openai.com` device-flow-blocking does not apply; Spock keeps its own token alive via `auth.openai.com/oauth/token`. If you previously used Codex, the import from `~/.codex/auth.json` is used only as a convenience; once logged in via Spock it self-sustains.
+
+Optionally, for an **OpenAI API key** (separate billing, official gateway) use the `type = "responses"` kind with `base_url = "https://api.openai.com/v1"` + `path = "responses"` + `api_key_env = "OPENAI_API_KEY"`.
+
+1. `spock login openai` (one-time; browser opens) — or leave it if you already have a Codex login  
+2. Route e.g. `fable = "chatgpt:gpt-5.5"` · `opus = "chatgpt:gpt-5.5"`  
+3. Reload Spock / Save & Apply. Model ids: `gpt-5.5`, `gpt-5.4`, `gpt-5.2`, … (effort `low`…`xhigh` via `reasoning_effort`).
 
 ### API Key backends (not OAuth)
 

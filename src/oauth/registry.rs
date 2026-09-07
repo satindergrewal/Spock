@@ -28,9 +28,16 @@ pub struct ProviderDef {
     pub label: &'static str,
     pub client_id: &'static str,
     pub auth: AuthEndpoints,
+    /// When set, login uses the browser authorization-code PKCE flow (the
+    /// browser passes any Cloudflare challenge; Spock exchanges the code at
+    /// `auth.token`). The callback port lives in `auth`-adjacent `callback_port`.
+    pub authorize_url: Option<&'static str>,
     pub scope: Option<&'static str>,
     /// When true, device authorization uses PKCE S256 (required by Qwen).
     pub pkce: bool,
+    /// Localhost port for the PKCE callback (authorize flow only). 1455 is the
+    /// port OpenAI's auth server whitelists for the codex client_id.
+    pub callback_port: u16,
     pub default_base_url: &'static str,
     pub user_agent: &'static str,
     pub quirk: CompletionsQuirk,
@@ -58,6 +65,9 @@ pub const PROVIDERS: &[ProviderDef] = &[
         auth: AuthEndpoints::Discovery {
             url: "https://auth.x.ai/.well-known/openid-configuration",
         },
+        authorize_url: None,
+        callback_port: 0,
+
         scope: Some("openid profile email offline_access grok-cli:access api:access"),
         pkce: false,
         default_base_url: DEFAULT_XAI_BASE,
@@ -76,6 +86,9 @@ pub const PROVIDERS: &[ProviderDef] = &[
             device_auth: "https://auth.kimi.com/api/oauth/device_authorization",
             token: "https://auth.kimi.com/api/oauth/token",
         },
+        authorize_url: None,
+        callback_port: 0,
+
         scope: None,
         pkce: false,
         default_base_url: "https://api.kimi.com/coding/v1",
@@ -102,6 +115,9 @@ pub const PROVIDERS: &[ProviderDef] = &[
             device_auth: "https://chat.qwen.ai/api/v1/oauth2/device/code",
             token: "https://chat.qwen.ai/api/v1/oauth2/token",
         },
+        authorize_url: None,
+        callback_port: 0,
+
         scope: Some("openid profile email model.completion"),
         pkce: true,
         default_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
@@ -111,6 +127,35 @@ pub const PROVIDERS: &[ProviderDef] = &[
         // Do NOT list DASHSCOPE_API_KEY here — that is Qwen Cloud api_key backends.
         env_token_keys: &["QWEN_OAUTH_TOKEN", "QWEN_TOKEN"],
         legacy_token_paths: &[".qwen/oauth_creds.json"],
+        header_style: HeaderStyle::Default,
+    },
+    // OpenAI Codex — the ChatGPT subscription coding API. Bearer is the
+    // chatgpt OAuth access token (imported from ~/.codex/auth.json, refreshed
+    // via auth.openai.com/oauth/token). NOT the platform API: the consumer
+    // backend lives at chatgpt.com/backend-api/codex/responses (see the
+    // `responses` backend kind). Device-code re-login is secondary — the
+    // auth.openai.com device endpoint sits behind a Cloudflare managed
+    // challenge that plain HTTP cannot pass, so Spock prefers importing the
+    // token Codex CLI/Desktop already wrote and fails loud if it's stale.
+    ProviderDef {
+        id: "openai",
+        label: "OpenAI (ChatGPT/Codex)",
+        client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+        auth: AuthEndpoints::Fixed {
+            device_auth: "https://auth.openai.com/oauth/device/code",
+            token: "https://auth.openai.com/oauth/token",
+        },
+        authorize_url: Some("https://auth.openai.com/oauth/authorize"),
+        callback_port: 1455,
+
+        scope: Some("openid profile email offline_access"),
+        pkce: false,
+        default_base_url: "https://chatgpt.com/backend-api",
+        user_agent: UA,
+        quirk: CompletionsQuirk::Generic,
+        token_file: "oauth-openai.json",
+        env_token_keys: &["OPENAI_OAUTH_TOKEN", "CODEX_ACCESS_TOKEN"],
+        legacy_token_paths: &[".codex/auth.json"],
         header_style: HeaderStyle::Default,
     },
 ];
@@ -311,9 +356,10 @@ mod tests {
         assert!(get_provider("xai").is_some());
         assert!(get_provider("KIMI").is_some());
         assert!(get_provider("qwen").is_some());
+        assert!(get_provider("openai").is_some());
         assert!(get_provider("qwen").unwrap().pkce);
         assert!(get_provider("nope").is_none());
-        assert_eq!(list_providers().len(), 3);
+        assert_eq!(list_providers().len(), 4);
     }
 
     #[test]

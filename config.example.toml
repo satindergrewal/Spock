@@ -8,7 +8,7 @@
 #   api_key  — OpenAI Chat Completions compatible API + bearer key
 #   anthropic — Messages passthrough
 #
-# Login:  spock login <provider>     (xai, kimi, qwen)
+# Login:  spock login <provider>     (xai, kimi, qwen, openai)
 # Logout: spock logout <provider>
 
 [server]
@@ -87,6 +87,20 @@ base_url = "http://127.0.0.1:11434/v1"
 # text_only = true
 # With text_only = true, [vision] mode = "describe" captions screenshots via a
 # small VL sidecar (llama-server + mmproj) and inlines the caption as text.
+# The flag is the ONLY switch — no model-id matcher. `glm-5.3-*` served by a
+# healthy multimodal upstream (vLLM) carries image parts natively. z.ai
+# Completions hard-400s non-text parts ("type is invalid, allowed values:
+# ['text']") and needs text_only = true on its own backend section.
+
+# --- z.ai Completions (hard-400 on non-text parts) ---
+# Needs text_only = true on its OWN backend section — without it image
+# requests 400 loudly. The flag is backend-keyed; `glm-5.3-*` names carry
+# image parts natively on multimodal upstreams.
+# [backends.zai]
+# type = "api_key"
+# base_url = "https://api.z.ai/api/coding/paas/v4"
+# api_key_env = "ZAI_API_KEY"
+# text_only = true
 
 # --- OpenAI-compatible presets (uncomment + set key) ---
 # All stay type = "api_key". Optional:
@@ -106,6 +120,26 @@ base_url = "http://127.0.0.1:11434/v1"
 # type = "api_key"
 # base_url = "https://api.openai.com/v1"
 # api_key_env = "OPENAI_API_KEY"
+
+# ── ChatGPT / Codex subscription (OAuth — no Codex app needed) ─────
+# Real OAuth authorization-code PKCE login: `spock login openai` (or menu-bar
+# Login ▸ OpenAI) opens a browser, you sign in, Spock exchanges the code and
+# stores its own token. It then talks the stream-only Codex Responses API
+# (`POST {base}/codex/responses`) — Spock hides that wire; you never chat-
+# compose with it. `~/.codex/auth.json` is imported only as a convenience.
+# [backends.chatgpt]
+# type = "oauth"
+# provider = "openai"
+# base_url = "https://chatgpt.com/backend-api"
+#
+# Alternative — an OpenAI API key via the official Responses gateway:
+# [backends.chatgpt]
+# type = "responses"
+# provider = "openai"
+# base_url = "https://api.openai.com/v1"
+# path = "responses"
+# api_key_env = "OPENAI_API_KEY"
+
 
 # [backends.deepseek]
 # type = "api_key"

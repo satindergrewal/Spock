@@ -148,9 +148,9 @@ impl Default for WebSearchSection {
 }
 
 /// How text-only backends handle image content. The switch is the backend's
-/// `text_only` flag (or the built-in glm-5.3 model matcher); this section only
-/// says *how*: strip to a note, or caption via a VL sidecar and inline the
-/// caption as text. Any sidecar failure degrades to strip.
+/// `text_only` flag; this section only says *how*: strip to a note, or caption
+/// via a VL sidecar and inline the caption as text. Any sidecar failure
+/// degrades to strip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisionSection {
     /// "strip" (default) or "describe". describe additionally needs
@@ -334,6 +334,44 @@ pub enum BackendConfig {
         #[serde(default)]
         api_key_env: Option<String>,
     },
+    /// Codex / ChatGPT subscription Responses API (`POST {base}/{path}`).
+    /// Streaming-only upstream — Spock transliterates the completions-shaped
+    /// body into a Responses request and the Responses SSE back into a
+    /// completions-shaped stream, so the rest of Spock (translate.rs,
+    /// server_tools, kv) is untouched. Auth is the `provider` OAuth token
+    /// (default `openai`, imported from ~/.codex) or, when `api_key` is set,
+    /// that bearer instead (official OpenAI API gateway).
+    Responses {
+        /// OAuth provider whose stored token is the bearer. Default `openai`.
+        #[serde(default = "default_responses_provider")]
+        provider: String,
+        /// Upstream origin, e.g. `https://chatgpt.com/backend-api` (subscription)
+        /// or `https://api.openai.com/v1` (API-key gateway). No trailing `/`.
+        #[serde(default = "default_responses_base")]
+        base_url: String,
+        /// Path appended to base_url. Default `codex/responses` (subscription).
+        /// API-key gateways use `responses` with base ending in `/v1`.
+        #[serde(default = "default_responses_path")]
+        path: String,
+        #[serde(default)]
+        api_key: Option<String>,
+        #[serde(default)]
+        api_key_env: Option<String>,
+        #[serde(default)]
+        extra_headers: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        text_only: bool,
+    },
+}
+
+fn default_responses_provider() -> String {
+    "openai".into()
+}
+fn default_responses_base() -> String {
+    "https://chatgpt.com/backend-api".into()
+}
+fn default_responses_path() -> String {
+    "codex/responses".into()
 }
 
 // Custom deserialize to accept legacy type = "xai" | "openai".
@@ -348,6 +386,8 @@ impl<'de> Deserialize<'de> for BackendConfig {
             kind: String,
             #[serde(default)]
             provider: Option<String>,
+            #[serde(default)]
+            path: Option<String>,
             #[serde(default)]
             base_url: Option<String>,
             #[serde(default)]
@@ -440,8 +480,33 @@ impl<'de> Deserialize<'de> for BackendConfig {
                     api_key_env: r.api_key_env,
                 })
             }
+            // Codex / ChatGPT subscription Responses API (alias `codex`).
+            "responses" | "codex" => {
+                let provider = r
+                    .provider
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(default_responses_provider);
+                Ok(BackendConfig::Responses {
+                    provider,
+                    base_url: r
+                        .base_url
+                        .map(|s| s.trim().trim_end_matches('/').to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(default_responses_base),
+                    path: r
+                        .path
+                        .map(|s| s.trim().trim_start_matches('/').to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(default_responses_path),
+                    api_key: r.api_key,
+                    api_key_env: r.api_key_env,
+                    extra_headers: r.extra_headers,
+                    text_only: r.text_only,
+                })
+            }
             other => Err(serde::de::Error::custom(format!(
-                "unknown backend type '{other}' (use oauth, api_key, anthropic)"
+                "unknown backend type '{other}' (use oauth, api_key, anthropic, responses)"
             ))),
         }
     }
@@ -453,6 +518,7 @@ impl BackendConfig {
             BackendConfig::Oauth { .. } => "oauth",
             BackendConfig::ApiKey { .. } => "api_key",
             BackendConfig::Anthropic { .. } => "anthropic",
+            BackendConfig::Responses { .. } => "responses",
         }
     }
 
@@ -460,6 +526,7 @@ impl BackendConfig {
     pub fn oauth_provider(&self) -> Option<&str> {
         match self {
             BackendConfig::Oauth { provider, .. } => Some(provider.as_str()),
+            BackendConfig::Responses { provider, .. } => Some(provider.as_str()),
             _ => None,
         }
     }
@@ -469,6 +536,15 @@ impl BackendConfig {
             BackendConfig::Oauth { base_url, .. } => base_url,
             BackendConfig::ApiKey { base_url, .. } => base_url,
             BackendConfig::Anthropic { base_url, .. } => base_url,
+            BackendConfig::Responses { base_url, .. } => base_url,
+        }
+    }
+
+    /// Upstream path for the Responses backend (e.g. `codex/responses`).
+    pub fn responses_path(&self) -> &str {
+        match self {
+            BackendConfig::Responses { path, .. } => path,
+            _ => "",
         }
     }
 
@@ -479,12 +555,16 @@ impl BackendConfig {
                 .unwrap_or(CompletionsQuirk::Generic),
             BackendConfig::ApiKey { .. } => CompletionsQuirk::Generic,
             BackendConfig::Anthropic { .. } => CompletionsQuirk::Generic,
+            // The completions-shaped transliteration is generic; no special
+            // quirk needed — the Responses wire is handled by the backend.
+            BackendConfig::Responses { .. } => CompletionsQuirk::Generic,
         }
     }
 
     pub fn extra_headers(&self) -> &BTreeMap<String, String> {
         match self {
             BackendConfig::ApiKey { extra_headers, .. } => extra_headers,
+            BackendConfig::Responses { extra_headers, .. } => extra_headers,
             BackendConfig::Oauth { .. } | BackendConfig::Anthropic { .. } => {
                 static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> =
                     std::sync::OnceLock::new();
@@ -565,6 +645,31 @@ impl BackendConfig {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
             }
+            BackendConfig::Responses {
+                api_key,
+                api_key_env,
+                ..
+            } => {
+                if let Some(k) = api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    return Some(k.to_string());
+                }
+                if let Some(env_name) = api_key_env
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Ok(v) = std::env::var(env_name) {
+                        let v = v.trim().to_string();
+                        if !v.is_empty() {
+                            return Some(v);
+                        }
+                    }
+                }
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }
         }
     }
 
@@ -602,6 +707,13 @@ impl BackendConfig {
         )
     }
 
+    /// Codex / ChatGPT subscription Responses wire. The backend transliterates
+    /// completions-shaped bodies to Responses and back at the boundary.
+    #[allow(dead_code)]
+    pub fn is_responses(&self) -> bool {
+        matches!(self, BackendConfig::Responses { .. })
+    }
+
     /// llama-server native session routes (ds4-ports). Off by default.
     pub fn kv_sessions(&self) -> bool {
         matches!(
@@ -623,6 +735,9 @@ impl BackendConfig {
                 text_only: true,
                 ..
             } | BackendConfig::ApiKey {
+                text_only: true,
+                ..
+            } | BackendConfig::Responses {
                 text_only: true,
                 ..
             }

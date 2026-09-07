@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenSet {
+    #[serde(default)]
     pub access_token: String,
     #[serde(default)]
     pub refresh_token: Option<String>,
@@ -97,10 +98,53 @@ fn load_tokens_file(path: &Path) -> Option<TokenSet> {
             set.expires_at = Some(normalize_expires_at(ed));
         }
     }
+    // Codex ~/.codex/auth.json nests a subscription pair under `tokens`:
+    // { access_token, id_token, refresh_token, account_id }. Flatten the
+    // access/refresh tokens and stash the account id in `extra` (Spock uses it
+    // for the codex `ChatGPT-Account-Id` header). The access_token is a JWT —
+    // derive `expires_at` from its `exp` claim so the refresh path reacts to a
+    // stale token instead of shipping it and getting a 401.
+    if set.access_token.is_empty() {
+        if let Some(toks) = set.extra.get("tokens").and_then(|v| v.as_object()) {
+            if let Some(a) = toks.get("access_token").and_then(|v| v.as_str()) {
+                if !a.is_empty() {
+                    set.access_token = a.to_string();
+                }
+            }
+            if set.refresh_token.is_none() {
+                if let Some(r) = toks.get("refresh_token").and_then(|v| v.as_str()) {
+                    set.refresh_token = Some(r.to_string());
+                }
+            }
+            if let Some(acct) = toks.get("account_id").and_then(|v| v.as_str()) {
+                set.extra.insert("account_id".into(), Value::String(acct.to_string()));
+            }
+        }
+    }
+    if set.expires_at.is_none() && !set.access_token.is_empty() {
+        if let Some(exp) = jwt_exp_secs(&set.access_token) {
+            set.expires_at = Some(exp as f64);
+        }
+    }
     if set.access_token.is_empty() {
         return None;
     }
     Some(set)
+}
+
+/// Decode a JWT's `exp` claim (seconds) without pulling in a JWT crate.
+/// Handles the URL-safe unpadded base64 the consumer tokens use; returns
+/// None on any parse failure so callers fall back to "valid".
+fn jwt_exp_secs(token: &str) -> Option<i64> {
+    use base64::Engine;
+    use base64::engine::{general_purpose::URL_SAFE, general_purpose::URL_SAFE_NO_PAD};
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()
+        .or_else(|| URL_SAFE.decode(payload).ok())?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("exp").and_then(|e| e.as_i64())
 }
 
 /// OpenAI-compat base URL from a token's `resource_url` (Qwen), if any.

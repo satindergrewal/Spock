@@ -219,6 +219,26 @@ pub fn config_to_doc(cfg: &Config) -> SettingsDoc {
                 extra_headers_text: String::new(),
                 text_only: false,
             },
+            BackendConfig::Responses {
+                provider,
+                base_url,
+                path: _,
+                api_key,
+                api_key_env,
+                extra_headers,
+                text_only,
+            } => BackendDoc {
+                name: name.clone(),
+                // The codex wire is OAuth-driven (provider openai) — present it
+                // as an OAuth backend in the UI, never as a separate kind.
+                kind: "oauth".into(),
+                provider: provider.clone(),
+                base_url: base_url.clone(),
+                api_key: api_key.clone().unwrap_or_default(),
+                api_key_env: api_key_env.clone().unwrap_or_default(),
+                extra_headers_text: headers_to_text(extra_headers),
+                text_only: *text_only,
+            },
         })
         .collect();
 
@@ -372,6 +392,28 @@ pub fn doc_to_config(doc: &SettingsDoc) -> crate::error::Result<Config> {
                 api_key: opt_key(&b.api_key),
                 api_key_env: opt_key(&b.api_key_env),
             },
+            "responses" | "codex" => {
+                // Path is TOML-only (the Settings doc has no per-backend path
+                // field). Provider defaults to the subscription OAuth provider.
+                let provider = b.provider.trim().to_string();
+                BackendConfig::Responses {
+                    provider: if provider.is_empty() {
+                        "openai".into()
+                    } else {
+                        provider
+                    },
+                    base_url: if b.base_url.trim().is_empty() {
+                        "https://chatgpt.com/backend-api".into()
+                    } else {
+                        b.base_url.trim().to_string()
+                    },
+                    path: "codex/responses".into(),
+                    api_key: opt_key(&b.api_key),
+                    api_key_env: opt_key(&b.api_key_env),
+                    extra_headers: text_to_headers(&b.extra_headers_text),
+                    text_only: b.text_only,
+                }
+            }
             other => {
                 return Err(crate::error::Error::Msg(format!(
                     "unknown backend type '{other}' for '{name}'"

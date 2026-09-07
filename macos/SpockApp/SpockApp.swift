@@ -159,7 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let logoutRoot = NSMenuItem(title: "Logout", action: nil, keyEquivalent: "")
         let logoutMenu = NSMenu(title: "Logout")
         let providers = model.oauthProviders.isEmpty
-            ? [("xai", "xAI (Grok)"), ("kimi", "Kimi Code")]
+            ? [("xai", "xAI (Grok)"), ("kimi", "Kimi Code"), ("qwen", "Qwen (chat.qwen.ai)"), ("openai", "OpenAI (ChatGPT/Codex)")]
             : model.oauthProviders.map { ($0.id, $0.label) }
         for (id, label) in providers {
             let src = model.oauthStatus[id]?.source ?? "none"
