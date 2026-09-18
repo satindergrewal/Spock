@@ -247,13 +247,12 @@ impl BackendHandle {
                             None,
                             crate::oauth::AccessMode::Proxy,
                         )?;
-                        let acct = crate::oauth::load_tokens(provider)
-                            .and_then(|toks| {
-                                toks.extra
-                                    .get("account_id")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            });
+                        let acct = crate::oauth::load_tokens(provider).and_then(|toks| {
+                            toks.extra
+                                .get("account_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        });
                         (t, acct)
                     }
                 };

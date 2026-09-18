@@ -71,8 +71,8 @@ fn installation_id() -> String {
 /// parse failure — the header is optional and codex ignores an absent one for
 /// API-key gateways.
 fn chat_gpt_account_id(token: Option<&str>) -> Option<String> {
-    use base64::Engine;
     use base64::engine::{general_purpose::URL_SAFE, general_purpose::URL_SAFE_NO_PAD};
+    use base64::Engine;
     let token = token?;
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD
@@ -181,9 +181,9 @@ fn upstream_error(code: u16, text: &str) -> Error {
     // Surface the upstream error verbatim (codex bodies are `{error:{...}}`
     // or plain text). A Cloudflare "Just a moment…" HTML means the endpoint
     // served a challenge — say so rather than failing cryptically.
-    let v: Value = serde_json::from_str(text).unwrap_or_else(|_| {
-        json!({"error": {"message": text.chars().take(500).collect::<String>()}})
-    });
+    let v: Value = serde_json::from_str(text).unwrap_or_else(
+        |_| json!({"error": {"message": text.chars().take(500).collect::<String>()}}),
+    );
     let mut msg = v
         .get("error")
         .and_then(|e| e.get("message"))
@@ -233,7 +233,9 @@ enum CodexEvent {
         cached_tokens: Option<u64>,
         reasoning_tokens: Option<u64>,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
     Ignore,
 }
 
@@ -275,7 +277,8 @@ impl<R: Read> ResponsesDecoder<R> {
                 .unwrap_or("unknown")
                 .to_string();
             let ev = match typ.as_str() {
-                "response.reasoning_summary_text.delta" | "response.reasoning_summary_text.done" => {
+                "response.reasoning_summary_text.delta"
+                | "response.reasoning_summary_text.done" => {
                     // `.delta` carries the fragment; `.done` carries the whole
                     // text. Only forward deltas (the accumulator emits a full
                     // block either way and .done is redundant).
@@ -289,17 +292,18 @@ impl<R: Read> ResponsesDecoder<R> {
                         CodexEvent::Ignore
                     }
                 }
-                "response.output_text.delta" => {
-                    match v.get("delta").and_then(|x| x.as_str()) {
-                        Some(d) if !d.is_empty() => CodexEvent::TextDelta(d.to_string()),
-                        _ => CodexEvent::Ignore,
-                    }
-                }
+                "response.output_text.delta" => match v.get("delta").and_then(|x| x.as_str()) {
+                    Some(d) if !d.is_empty() => CodexEvent::TextDelta(d.to_string()),
+                    _ => CodexEvent::Ignore,
+                },
                 "response.output_item.added" => {
                     let item = v.get("item").cloned().unwrap_or(json!({}));
                     match item.get("type").and_then(|t| t.as_str()) {
                         Some("function_call") => CodexEvent::FunctionCallStart {
-                            item_id: item.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()),
+                            item_id: item
+                                .get("id")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string()),
                             call_id: item
                                 .get("call_id")
                                 .and_then(|x| x.as_str())
@@ -317,21 +321,55 @@ impl<R: Read> ResponsesDecoder<R> {
                 "response.function_call_arguments.delta" => CodexEvent::FunctionCallArgsDelta {
                     // The live wire keys delta/done events on the *item* id
                     // (`item_id`), not `call_id` — resolve via the item→call map.
-                    item_id: Some(v.get("item_id").and_then(|x| x.as_str()).unwrap_or("").to_string()),
-                    call_id: v.get("item_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    delta: v.get("delta").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    item_id: Some(
+                        v.get("item_id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ),
+                    call_id: v
+                        .get("item_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    delta: v
+                        .get("delta")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                 },
                 "response.function_call_arguments.done" => CodexEvent::FunctionCallArgsDone {
-                    item_id: Some(v.get("item_id").and_then(|x| x.as_str()).unwrap_or("").to_string()),
-                    call_id: v.get("item_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    arguments: v.get("arguments").and_then(|x| x.as_str()).unwrap_or("{}").to_string(),
+                    item_id: Some(
+                        v.get("item_id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ),
+                    call_id: v
+                        .get("item_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    name: v
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    arguments: v
+                        .get("arguments")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("{}")
+                        .to_string(),
                 },
                 "response.output_item.done" => {
                     let item = v.get("item").cloned().unwrap_or(json!({}));
                     if item.get("type").and_then(|t| t.as_str()) == Some("image_generation_call") {
                         CodexEvent::ImageGenDone {
-                            id: item.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                            id: item
+                                .get("id")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                             result: item
                                 .get("result")
                                 .and_then(|x| x.as_str())
@@ -375,7 +413,11 @@ impl<R: Read> ResponsesDecoder<R> {
                         message: err
                             .get("message")
                             .and_then(|x| x.as_str())
-                            .unwrap_or_else(|| err.get("code").and_then(|x| x.as_str()).unwrap_or("codex error"))
+                            .unwrap_or_else(|| {
+                                err.get("code")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("codex error")
+                            })
                             .to_string(),
                     }
                 }
@@ -608,7 +650,11 @@ impl<R: Read> ResponsesToCompletions<R> {
                     r.push(json!({"choices": [{"delta": {"content": "[Error] Codex returned an empty response. Please retry."}}]}));
                 }
                 r.push(json!({"choices": [{"delta": {}}], "usage": usage}));
-                let finish = if r.has_tool_calls { "tool_calls" } else { "stop" };
+                let finish = if r.has_tool_calls {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
                 r.push(json!({"choices": [{"delta": {}, "finish_reason": finish}]}));
                 r.finished = true;
             }
@@ -633,7 +679,11 @@ impl<R: Read> ResponsesToCompletions<R> {
             self.handle(ev);
         }
         if self.eof && self.out.is_empty() && !self.finished {
-            let finish = if self.has_tool_calls { "tool_calls" } else { "stop" };
+            let finish = if self.has_tool_calls {
+                "tool_calls"
+            } else {
+                "stop"
+            };
             self.push(json!({"choices": [{"delta": {}, "finish_reason": finish}]}));
             self.finished = true;
         }
@@ -710,7 +760,11 @@ fn collect_completions(dec: &mut ResponsesDecoder<impl Read>) -> Value {
             } => {
                 let index = resolve_index(&item_to_call, &call_index, &item_id, &call_id);
                 if let Some(i) = index {
-                    if let Some((_, cl)) = tool_calls.iter_mut().enumerate().find(|(j, _)| *j as i64 == i) {
+                    if let Some((_, cl)) = tool_calls
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(j, _)| *j as i64 == i)
+                    {
                         append_args(cl, &delta);
                     }
                 }
@@ -724,10 +778,19 @@ fn collect_completions(dec: &mut ResponsesDecoder<impl Read>) -> Value {
                 let index = resolve_index(&item_to_call, &call_index, &item_id, &call_id);
                 match index {
                     Some(i) => {
-                        if let Some((_, cl)) = tool_calls.iter_mut().enumerate().find(|(j, _)| *j as i64 == i) {
+                        if let Some((_, cl)) = tool_calls
+                            .iter_mut()
+                            .enumerate()
+                            .find(|(j, _)| *j as i64 == i)
+                        {
                             append_args(cl, &arguments);
                             if let Some(f) = cl.get_mut("function") {
-                                if f.get("name").and_then(|x| x.as_str()).unwrap_or("").is_empty() && !name.is_empty() {
+                                if f.get("name")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .is_empty()
+                                    && !name.is_empty()
+                                {
                                     f["name"] = json!(name);
                                 }
                             }
@@ -745,14 +808,23 @@ fn collect_completions(dec: &mut ResponsesDecoder<impl Read>) -> Value {
                     }
                 }
             }
-            CodexEvent::Completed { input_tokens: it, output_tokens: ot, cached_tokens: ct, reasoning_tokens: rt } => {
+            CodexEvent::Completed {
+                input_tokens: it,
+                output_tokens: ot,
+                cached_tokens: ct,
+                reasoning_tokens: rt,
+            } => {
                 input_tokens = it.unwrap_or(0);
                 output_tokens = ot.unwrap_or(0);
                 cached_tokens = ct.unwrap_or(0);
                 reasoning_tokens = rt.unwrap_or(0);
                 saw_completed = true;
             }
-            CodexEvent::ImageGenDone { id, result, revised_prompt } => {
+            CodexEvent::ImageGenDone {
+                id,
+                result,
+                revised_prompt,
+            } => {
                 let mut input = json!({"result": result});
                 if let Some(rp) = revised_prompt {
                     input["revised_prompt"] = json!(rp);
@@ -878,16 +950,28 @@ mod tests {
         assert_eq!(input[2]["type"], json!("function_call_output"));
         assert_eq!(input[2]["call_id"], json!("call_1"));
         assert_eq!(input[2]["output"], json!("files"));
-        assert_eq!(req["reasoning"], json!({"effort": "high", "summary": "auto"}));
+        assert_eq!(
+            req["reasoning"],
+            json!({"effort": "high", "summary": "auto"})
+        );
         assert!(req["tools"].as_array().is_some());
     }
 
     #[test]
     fn reasoning_and_text_stream_become_anthropic_ready_events() {
         let feed = sse(&[
-            ("response.reasoning_summary_text.delta", json!({"type": "response.reasoning_summary_text.delta", "delta": " think "})),
-            ("response.output_text.delta", json!({"type": "response.output_text.delta", "delta": "hello"})),
-            ("response.completed", json!({"type": "response.completed", "response": {"usage": {"input_tokens": 100, "output_tokens": 7, "input_tokens_details": {"cached_tokens": 40}, "output_tokens_details": {"reasoning_tokens": 3}}}})),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({"type": "response.reasoning_summary_text.delta", "delta": " think "}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "delta": "hello"}),
+            ),
+            (
+                "response.completed",
+                json!({"type": "response.completed", "response": {"usage": {"input_tokens": 100, "output_tokens": 7, "input_tokens_details": {"cached_tokens": 40}, "output_tokens_details": {"reasoning_tokens": 3}}}}),
+            ),
         ]);
         let mut conv = ResponsesToCompletions::new(std::io::Cursor::new(feed));
         let events: Vec<_> = crate::sse::UpstreamEvents::new(&mut conv).collect();
@@ -927,10 +1011,22 @@ mod tests {
     #[test]
     fn function_call_transliterates_to_completions_deltas() {
         let feed = sse(&[
-            ("response.output_item.added", json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "item_1", "call_id": "call_1", "name": "Bash"}})),
-            ("response.function_call_arguments.delta", json!({"type": "response.function_call_arguments.delta", "item_id": "item_1", "delta": "{\"cmd\":\"ls "})),
-            ("response.function_call_arguments.done", json!({"type": "response.function_call_arguments.done", "item_id": "item_1", "arguments": "{\"cmd\":\"ls -la\"}"})),
-            ("response.completed", json!({"type": "response.completed", "response": {"usage": {"input_tokens": 10, "output_tokens": 3, "cached_tokens": 0}}})),
+            (
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "item_1", "call_id": "call_1", "name": "Bash"}}),
+            ),
+            (
+                "response.function_call_arguments.delta",
+                json!({"type": "response.function_call_arguments.delta", "item_id": "item_1", "delta": "{\"cmd\":\"ls "}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"type": "response.function_call_arguments.done", "item_id": "item_1", "arguments": "{\"cmd\":\"ls -la\"}"}),
+            ),
+            (
+                "response.completed",
+                json!({"type": "response.completed", "response": {"usage": {"input_tokens": 10, "output_tokens": 3, "cached_tokens": 0}}}),
+            ),
         ]);
         let mut conv = ResponsesToCompletions::new(std::io::Cursor::new(feed));
         let events: Vec<_> = crate::sse::UpstreamEvents::new(&mut conv).collect();
@@ -939,7 +1035,9 @@ mod tests {
         for e in events {
             let ev = e.unwrap();
             match ev {
-                crate::sse::UpstreamEvent::ToolCallFrag { index, id, name, .. } => {
+                crate::sse::UpstreamEvent::ToolCallFrag {
+                    index, id, name, ..
+                } => {
                     assert_eq!(index, 0);
                     if !name.is_empty() {
                         assert_eq!(name, "Bash");
@@ -961,11 +1059,26 @@ mod tests {
     #[test]
     fn collect_non_stream_builds_completions_json() {
         let feed = sse(&[
-            ("response.reasoning_summary_text.delta", json!({"type": "response.reasoning_summary_text.delta", "delta": " plan "})),
-            ("response.output_text.delta", json!({"type": "response.output_text.delta", "delta": "hi"})),
-            ("response.output_item.added", json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "item_1", "call_id": "call_1", "name": "Bash"}})),
-            ("response.function_call_arguments.done", json!({"type": "response.function_call_arguments.done", "item_id": "item_1", "arguments": "{\"cmd\":\"ls\"}"})),
-            ("response.completed", json!({"type": "response.completed", "response": {"usage": {"input_tokens": 50, "output_tokens": 9, "input_tokens_details": {"cached_tokens": 20}}}})),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({"type": "response.reasoning_summary_text.delta", "delta": " plan "}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "delta": "hi"}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "item_1", "call_id": "call_1", "name": "Bash"}}),
+            ),
+            (
+                "response.function_call_arguments.done",
+                json!({"type": "response.function_call_arguments.done", "item_id": "item_1", "arguments": "{\"cmd\":\"ls\"}"}),
+            ),
+            (
+                "response.completed",
+                json!({"type": "response.completed", "response": {"usage": {"input_tokens": 50, "output_tokens": 9, "input_tokens_details": {"cached_tokens": 20}}}}),
+            ),
         ]);
         let mut dec = ResponsesDecoder::new(std::io::Cursor::new(feed));
         let out = collect_completions(&mut dec);
@@ -980,7 +1093,10 @@ mod tests {
             .contains("\"cmd\":\"ls\""));
         assert_eq!(out["choices"][0]["finish_reason"], json!("tool_calls"));
         assert_eq!(out["usage"]["prompt_tokens"], json!(30));
-        assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], json!(20));
+        assert_eq!(
+            out["usage"]["prompt_tokens_details"]["cached_tokens"],
+            json!(20)
+        );
     }
 }
 
@@ -1040,7 +1156,6 @@ fn normalize_tool_choice(tc: &Value) -> Value {
     }
     tc.clone()
 }
-
 
 /// Build an OpenAI Responses request from a chat-completions-shaped body.
 /// Only the generation-relevant fields are forwarded — `max_tokens`,
@@ -1221,7 +1336,11 @@ fn message_content_item(m: &Value, role: &str, text: String) -> Value {
         }
     }
     if has_image {
-        if !text.is_empty() && !parts.iter().any(|p| p.get("type") == Some(&Value::String("input_text".into()))) {
+        if !text.is_empty()
+            && !parts
+                .iter()
+                .any(|p| p.get("type") == Some(&Value::String("input_text".into())))
+        {
             parts.insert(0, json!({"type": "input_text", "text": text}));
         }
         json!({"role": role, "content": parts})

@@ -257,7 +257,10 @@ pub fn device_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
             } else {
                 ""
             };
-            Error::Auth(format!("missing device_code from {} device auth{hint}", provider.id))
+            Error::Auth(format!(
+                "missing device_code from {} device auth{hint}",
+                provider.id
+            ))
         })?
         .to_string();
     let user_code = dc["user_code"].as_str().unwrap_or("?").to_string();
@@ -369,7 +372,9 @@ fn query_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => {
                 use std::fmt::Write as _;
                 let _ = write!(out, "%{b:02X}");
@@ -445,7 +450,12 @@ pub fn pkce_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
         ("response_type", "code"),
         ("client_id", provider.client_id),
         ("redirect_uri", redirect_uri.as_str()),
-        ("scope", provider.scope.unwrap_or("openid profile email offline_access")),
+        (
+            "scope",
+            provider
+                .scope
+                .unwrap_or("openid profile email offline_access"),
+        ),
         ("code_challenge", code_challenge.as_str()),
         ("code_challenge_method", "S256"),
         ("id_token_add_organizations", "true"),
@@ -467,7 +477,10 @@ pub fn pkce_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
     })?;
     listener.set_nonblocking(true).ok();
 
-    eprintln!("\n  {} — a browser window should open for sign-in.\n", provider.label);
+    eprintln!(
+        "\n  {} — a browser window should open for sign-in.\n",
+        provider.label
+    );
     if open {
         open_browser(&url);
     } else {
@@ -506,7 +519,9 @@ pub fn pkce_login(provider: &ProviderDef, open: bool) -> Result<TokenSet> {
         .to_string();
     if let Some(s) = query_get(&target, "state") {
         if s != state {
-            return Err(Error::Auth("OAuth callback state mismatch (stale page?)".into()));
+            return Err(Error::Auth(
+                "OAuth callback state mismatch (stale page?)".into(),
+            ));
         }
     }
 

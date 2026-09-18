@@ -117,7 +117,8 @@ fn load_tokens_file(path: &Path) -> Option<TokenSet> {
                 }
             }
             if let Some(acct) = toks.get("account_id").and_then(|v| v.as_str()) {
-                set.extra.insert("account_id".into(), Value::String(acct.to_string()));
+                set.extra
+                    .insert("account_id".into(), Value::String(acct.to_string()));
             }
         }
     }
@@ -136,8 +137,8 @@ fn load_tokens_file(path: &Path) -> Option<TokenSet> {
 /// Handles the URL-safe unpadded base64 the consumer tokens use; returns
 /// None on any parse failure so callers fall back to "valid".
 fn jwt_exp_secs(token: &str) -> Option<i64> {
-    use base64::Engine;
     use base64::engine::{general_purpose::URL_SAFE, general_purpose::URL_SAFE_NO_PAD};
+    use base64::Engine;
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD
         .decode(payload)

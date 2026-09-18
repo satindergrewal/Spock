@@ -244,7 +244,8 @@ pub(crate) fn write_sse_headers(stream: &mut TcpStream) -> Result<()> {
 /// Streaming SSE headers (legacy GET): no `Connection: close` — that stream
 /// is long-lived with keepalives, unlike one-shot JSON-RPC SSE replies.
 pub(crate) fn write_sse_stream_headers(stream: &mut TcpStream) -> Result<()> {
-    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n";
+    let header =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n";
     stream.write_all(header.as_bytes())?;
     stream.flush()?;
     Ok(())
@@ -668,9 +669,8 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
 /// Responses object. Anything else is 400 — this is not a general Responses
 /// proxy and must not fall through to chat/completions.
 fn handle_responses(sock: &mut TcpStream, state: &AppState, body: Value) -> Result<()> {
-    let web_cfg = crate::server_tools::WebSearchConfig::from_section(
-        &state.snapshot_config()?.web_search,
-    );
+    let web_cfg =
+        crate::server_tools::WebSearchConfig::from_section(&state.snapshot_config()?.web_search);
     match crate::server_tools::responses_web_search(&web_cfg, &body) {
         Ok(out) => {
             let q = crate::server_tools::responses_query(&body).unwrap_or("");
@@ -817,9 +817,8 @@ fn handle_messages(
             max_tokens: c.advisor.max_tokens,
         }
     };
-    let web_cfg = crate::server_tools::WebSearchConfig::from_section(
-        &state.snapshot_config()?.web_search,
-    );
+    let web_cfg =
+        crate::server_tools::WebSearchConfig::from_section(&state.snapshot_config()?.web_search);
     let use_server_tools = (advisor_cfg.enabled && crate::server_tools::request_has_advisor(&a))
         || (web_cfg.enabled && crate::server_tools::request_has_web_search(&a));
 
@@ -2025,7 +2024,10 @@ profile = "mcp"
         let init_frame = read_frame(init);
         let init_json = json_body(&init_frame).expect("initialize json");
         assert_eq!(init_json["result"]["protocolVersion"], json!("2025-03-26"));
-        assert_eq!(init_json["result"]["capabilities"]["tools"]["listChanged"], json!(false));
+        assert_eq!(
+            init_json["result"]["capabilities"]["tools"]["listChanged"],
+            json!(false)
+        );
         assert_eq!(init_json["result"]["serverInfo"]["name"], json!("spock"));
 
         let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
@@ -2052,8 +2054,9 @@ profile = "mcp"
         assert!(gate_text.contains("HTTP/1.1 405"), "{gate_text}");
         assert!(gate_text.contains("Allow: POST"), "{gate_text}");
 
-        let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
-            .expect("body");
+        let body =
+            serde_json::to_vec(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .expect("body");
         let head = format!(
             "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()

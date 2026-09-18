@@ -7,7 +7,9 @@
 
 use crate::config::VERSION;
 use crate::error::{Error, Result};
-use crate::server::{emit_sse, write_json, write_sse_headers, write_sse_stream_headers, write_status_only};
+use crate::server::{
+    emit_sse, write_json, write_sse_headers, write_sse_stream_headers, write_status_only,
+};
 use crate::server_tools::{run_web_search, WebSearchConfig};
 use crate::state::AppState;
 use serde_json::{json, Value};
@@ -111,7 +113,11 @@ fn streamable_post(
     let parsed = match parse_body(body) {
         Some(v) => v,
         None => {
-            let env = rpc_error(-32700, "parse error: request body is not JSON", &Value::Null);
+            let env = rpc_error(
+                -32700,
+                "parse error: request body is not JSON",
+                &Value::Null,
+            );
             return post_out(stream, choice, 400, &env);
         }
     };
@@ -172,7 +178,10 @@ fn accept_wants(accept: &str) -> AcceptChoice {
 fn rpc_out(body: &Value, exec: &mut dyn FnMut(&Value) -> Value) -> (u16, Value) {
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let Some(method) = body.get("method").and_then(|m| m.as_str()) else {
-        return (200, rpc_error(-32600, "invalid request: method missing", &id));
+        return (
+            200,
+            rpc_error(-32600, "invalid request: method missing", &id),
+        );
     };
     if body.get("id").is_none() || method.starts_with("notifications/") {
         return (204, Value::Null);
@@ -180,7 +189,10 @@ fn rpc_out(body: &Value, exec: &mut dyn FnMut(&Value) -> Value) -> (u16, Value) 
     match method {
         "initialize" => (
             200,
-            rpc_ok(&initialize_result(body.get("params").unwrap_or(&Value::Null)), &id),
+            rpc_ok(
+                &initialize_result(body.get("params").unwrap_or(&Value::Null)),
+                &id,
+            ),
         ),
         "ping" => (200, rpc_ok(&json!({}), &id)),
         "tools/list" => (200, rpc_ok(&tools_list_result(), &id)),
@@ -203,20 +215,32 @@ fn tool_call_out(body: &Value, exec: &mut dyn FnMut(&Value) -> Value, id: &Value
     if name != "web_search" {
         return (
             200,
-            rpc_error(-32602, &format!("invalid params: unknown tool '{name}'"), id),
+            rpc_error(
+                -32602,
+                &format!("invalid params: unknown tool '{name}'"),
+                id,
+            ),
         );
     }
     let args = params.get("arguments").unwrap_or(&Value::Null);
     if !args.is_object() {
         return (
             200,
-            rpc_error(-32602, "invalid params: web_search arguments must be an object", id),
+            rpc_error(
+                -32602,
+                "invalid params: web_search arguments must be an object",
+                id,
+            ),
         );
     }
     if args.pointer("/query").and_then(|q| q.as_str()).is_none() {
         return (
             200,
-            rpc_error(-32602, "invalid params: web_search query must be a string", id),
+            rpc_error(
+                -32602,
+                "invalid params: web_search query must be a string",
+                id,
+            ),
         );
     }
     (200, rpc_ok(&exec(args), id))
@@ -273,11 +297,17 @@ fn live_web_exec(state: &AppState, args: &Value) -> Value {
     let cfg = match state.snapshot_config() {
         Ok(c) => WebSearchConfig::from_section(&c.web_search),
         Err(e) => {
-            return call_result_value(format!("Web search unavailable — config snapshot: {e}"), true)
+            return call_result_value(
+                format!("Web search unavailable — config snapshot: {e}"),
+                true,
+            )
         }
     };
     if !cfg.enabled {
-        return call_result_value("Web search disabled: enable [web_search] in Spock config".to_string(), true);
+        return call_result_value(
+            "Web search disabled: enable [web_search] in Spock config".to_string(),
+            true,
+        );
     }
     let query = args
         .pointer("/query")
@@ -397,7 +427,10 @@ fn legacy_post(
     };
     let Some(sink) = sink else {
         let msg = if sid.is_some() {
-            format!("unknown legacy session id: {}", sid.as_deref().unwrap_or(""))
+            format!(
+                "unknown legacy session id: {}",
+                sid.as_deref().unwrap_or("")
+            )
         } else {
             "legacy POST missing sessionId".to_string()
         };
@@ -412,7 +445,11 @@ fn legacy_post(
             (env, status == 204)
         }
         None => (
-            rpc_error(-32700, "parse error: request body is not JSON", &Value::Null),
+            rpc_error(
+                -32700,
+                "parse error: request body is not JSON",
+                &Value::Null,
+            ),
             false,
         ),
     };
@@ -422,10 +459,17 @@ fn legacy_post(
         match sink.lock() {
             Ok(mut writer) => {
                 if let Err(e) = emit_sse(&mut *writer, "message", &envelope) {
-                    eprintln!("  mcp legacy reply lost sid={} ({})", sid.as_deref().unwrap_or(""), e);
+                    eprintln!(
+                        "  mcp legacy reply lost sid={} ({})",
+                        sid.as_deref().unwrap_or(""),
+                        e
+                    );
                 }
             }
-            Err(_) => eprintln!("  mcp legacy stream lock: reply skipped for sid={}", sid.as_deref().unwrap_or("")),
+            Err(_) => eprintln!(
+                "  mcp legacy stream lock: reply skipped for sid={}",
+                sid.as_deref().unwrap_or("")
+            ),
         }
     }
     write_status_only(stream, 202, None)
@@ -475,7 +519,11 @@ mod tests {
     fn parse_bad_body_is_parse_error() {
         assert!(parse_body(br#"{"method":}"#).is_none());
         assert!(parse_body(br#"{"method": "ping", "id": 1}"#).is_some());
-        let env = rpc_error(-32700, "parse error: request body is not JSON", &Value::Null);
+        let env = rpc_error(
+            -32700,
+            "parse error: request body is not JSON",
+            &Value::Null,
+        );
         assert_eq!(env["error"]["code"], -32700);
         assert_eq!(env["id"], Value::Null);
     }
@@ -486,9 +534,14 @@ mod tests {
         assert_eq!(st, 200);
         assert_eq!(env["error"]["code"], -32600);
         assert_eq!(env["id"], 3);
-        let (_, env) = rpc_out(&json!({"id": "a", "method": "prompts/list"}), &mut |_| json!({}));
+        let (_, env) = rpc_out(&json!({"id": "a", "method": "prompts/list"}), &mut |_| {
+            json!({})
+        });
         assert_eq!(env["error"]["code"], -32601);
-        assert!(env["error"]["message"].as_str().unwrap().contains("prompts/list"));
+        assert!(env["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("prompts/list"));
     }
 
     #[test]
@@ -497,7 +550,10 @@ mod tests {
             let _ = args;
             call_result_value("never".into(), false)
         };
-        let missing_name = rpc_out(&json!({"id": 1, "method": "tools/call", "params": {}}), &mut enc);
+        let missing_name = rpc_out(
+            &json!({"id": 1, "method": "tools/call", "params": {}}),
+            &mut enc,
+        );
         assert_eq!(missing_name.1["error"]["code"], -32602);
         let other_tool = rpc_out(
             &json!({"id": 1, "method": "tools/call",
@@ -522,8 +578,17 @@ mod tests {
     #[test]
     fn tool_call_uses_injected_exec_seam_offline() {
         let mut exec = |args: &Value| {
-            let q = args.pointer("/query").and_then(|q| q.as_str()).unwrap_or("");
-            call_result_value(web_search_hits_text(&json!([{"title": "Rust", "url": "https://rust-lang.org", "snippet": "lang"}]), q), false)
+            let q = args
+                .pointer("/query")
+                .and_then(|q| q.as_str())
+                .unwrap_or("");
+            call_result_value(
+                web_search_hits_text(
+                    &json!([{"title": "Rust", "url": "https://rust-lang.org", "snippet": "lang"}]),
+                    q,
+                ),
+                false,
+            )
         };
         let (st, env) = rpc_out(
             &json!({"id": 7, "method": "tools/call",
@@ -559,10 +624,15 @@ mod tests {
 
     #[test]
     fn notification_marker_is_no_body() {
-        let (st, env) = rpc_out(&json!({"method": "notifications/initialized"}), &mut |_| json!({}));
+        let (st, env) = rpc_out(&json!({"method": "notifications/initialized"}), &mut |_| {
+            json!({})
+        });
         assert_eq!(st, 204);
         assert_eq!(env, Value::Null);
-        let (st2, env2) = rpc_out(&json!({"id": 9, "method": "notifications/initialized"}), &mut |_| json!({}));
+        let (st2, env2) = rpc_out(
+            &json!({"id": 9, "method": "notifications/initialized"}),
+            &mut |_| json!({}),
+        );
         assert_eq!(st2, 204); // notifications/* stays silent even with a stray id
         assert_eq!(env2, Value::Null);
     }
@@ -573,9 +643,15 @@ mod tests {
             query_param("/mcp/sse/messages?a=1&sessionId=sse-s9&b=2", "sessionId"),
             Some("sse-s9".into())
         );
-        assert_eq!(query_param("/mcp/sse/messages?sessionId=sse-s1", "sessionId"), Some("sse-s1".into()));
+        assert_eq!(
+            query_param("/mcp/sse/messages?sessionId=sse-s1", "sessionId"),
+            Some("sse-s1".into())
+        );
         assert_eq!(query_param("/mcp/sse/messages", "sessionId"), None);
-        assert_eq!(query_param("/mcp/sse/messages?sessionId=", "sessionId"), None);
+        assert_eq!(
+            query_param("/mcp/sse/messages?sessionId=", "sessionId"),
+            None
+        );
         let a = new_session_id();
         let b = new_session_id();
         assert!(a.starts_with("sse-s"), "{a}");
