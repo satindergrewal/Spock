@@ -50,13 +50,14 @@ pub enum VisionAction {
     Describe,
 }
 
-/// `model_flag` covers built-in matchers (glm-5.3); describe is offered only
-/// to backends explicitly flagged `text_only`.
-pub fn decide(backend_flag: bool, model_flag: bool, cfg: &VisionSection) -> VisionAction {
-    if !backend_flag && !model_flag {
+/// Describe is offered only to backends explicitly flagged `text_only`; any
+/// unflagged backend carries image parts untouched. Capability is a backend
+/// property — no model-id matcher.
+pub fn decide(backend_flag: bool, cfg: &VisionSection) -> VisionAction {
+    if !backend_flag {
         return VisionAction::Off;
     }
-    if backend_flag && cfg.describe_ready() {
+    if cfg.describe_ready() {
         VisionAction::Describe
     } else {
         VisionAction::Strip
@@ -372,18 +373,18 @@ mod tests {
     #[test]
     fn decide_matrix() {
         let mut cfg = VisionSection::default();
-        assert_eq!(decide(false, false, &cfg), VisionAction::Off);
-        assert_eq!(decide(true, false, &cfg), VisionAction::Strip);
-        assert_eq!(decide(false, true, &cfg), VisionAction::Strip);
-        // model-flag-only never describes, even with a live sidecar.
+        assert_eq!(decide(false, &cfg), VisionAction::Off);
+        assert_eq!(decide(true, &cfg), VisionAction::Strip);
+        // describe needs an explicitly flagged backend plus a live sidecar.
         cfg.mode = "describe".into();
         cfg.sidecar_base_url = Some("http://127.0.0.1:9/v1".into());
         cfg.sidecar_model = Some("vl".into());
-        assert_eq!(decide(false, true, &cfg), VisionAction::Strip);
-        assert_eq!(decide(true, false, &cfg), VisionAction::Describe);
+        assert_eq!(decide(true, &cfg), VisionAction::Describe);
         // describe without a full endpoint degrades to strip.
         cfg.sidecar_model = None;
-        assert_eq!(decide(true, false, &cfg), VisionAction::Strip);
+        assert_eq!(decide(true, &cfg), VisionAction::Strip);
+        // unflagged backends are always Off, sidecar or not.
+        assert_eq!(decide(false, &cfg), VisionAction::Off);
     }
 
     /// HTTP stub: reads each request body, cycles (status, body) responses,

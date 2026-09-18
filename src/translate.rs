@@ -145,24 +145,26 @@ fn collect_images_from_content(content: &Value) -> Vec<Value> {
     out
 }
 
-/// z.ai GLM-5.3 (and point releases) reject every non-`text` content part:
-/// `messages.content.type is invalid, allowed values: ['text']`.
-pub fn is_text_only_model(model: &str) -> bool {
-    let m = model.trim().to_ascii_lowercase();
-    m == "glm-5.3" || m.starts_with("glm-5.3-") || m.starts_with("glm-5.3:")
-}
+// Text-only image handling is keyed ONLY on the backend's `text_only = true`
+// flag (Config). No model-id matcher: `glm-5.3-*` served by a healthy
+// multimodal upstream (vLLM etc.) must carry image parts natively — the
+// deleted matcher masked exactly that, omitting a session's one supplied
+// image behind `glm-5.3-*`. z.ai Completions hard-400s non-text parts
+// ("type is invalid, allowed values: ['text']") and keeps the safety net
+// onto its own backend section: set `text_only = true`, else image requests
+// 400 loudly.
 
 pub fn image_omitted_note(n: usize) -> String {
     if n == 1 {
-        "[image omitted: this model is text-only]".into()
+        "[image omitted: this backend is text-only]".into()
     } else {
-        format!("[{n} images omitted: this model is text-only]")
+        format!("[{n} images omitted: this backend is text-only]")
     }
 }
 
 /// OpenAI tool message content: plain string when text-only; multipart array
 /// when the Anthropic tool_result carried image blocks (vision).
-fn tool_result_openai_content(content: &Value, is_error: bool, text_only: bool) -> Value {
+fn tool_result_openai_content(content: &Value, is_error: bool, backend_text_only: bool) -> Value {
     let mut text = blocks_text(content);
     if is_error && !text.is_empty() {
         text = format!("Error: {text}");
@@ -170,7 +172,7 @@ fn tool_result_openai_content(content: &Value, is_error: bool, text_only: bool) 
         text = "Error".into();
     }
     let images = collect_images_from_content(content);
-    if text_only {
+    if backend_text_only {
         if !images.is_empty() {
             let note = image_omitted_note(images.len());
             text = if text.is_empty() {
@@ -278,7 +280,8 @@ pub type BackendFamily = CompletionsQuirk;
 
 /// Public: Anthropic Messages → OpenAI `messages` array (no sampling fields).
 /// Vision-preserving — llama-server / KV path. Chat Completions uses
-/// `anthropic_to_openai`, which can strip images for text-only models.
+/// `anthropic_to_openai`, which strips images for text-only backends
+/// (keyed on the backend's `text_only = true` flag).
 pub fn openai_messages(a: &Value) -> Vec<Value> {
     convert_messages(a, false, true)
 }
@@ -301,7 +304,7 @@ pub fn tools_for_apply_template(a: &Value) -> Option<Value> {
     obj.get("tools").cloned()
 }
 
-fn convert_messages(a: &Value, text_only: bool, fold_system: bool) -> Vec<Value> {
+fn convert_messages(a: &Value, backend_text_only: bool, fold_system: bool) -> Vec<Value> {
     let mut msgs: Vec<Value> = Vec::new();
     let mut head_system = false;
 
@@ -361,7 +364,7 @@ fn convert_messages(a: &Value, text_only: bool, fold_system: bool) -> Vec<Value>
                         }
                     }
                     "image" => {
-                        if text_only {
+                        if backend_text_only {
                             texts.push(image_omitted_note(1));
                         } else if let Some(part) = image_block_to_openai(b) {
                             images.push(part);
@@ -392,7 +395,7 @@ fn convert_messages(a: &Value, text_only: bool, fold_system: bool) -> Vec<Value>
                         tool_results.push(json!({
                             "role": "tool",
                             "tool_call_id": b.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or(""),
-                            "content": tool_result_openai_content(content, is_error, text_only)
+                            "content": tool_result_openai_content(content, is_error, backend_text_only)
                         }));
                     }
                     "thinking" => {
@@ -790,17 +793,16 @@ pub fn prepare_for_openai_compat(a: &mut Value) {
     strip_anthropic_only_fields(a);
 }
 
+/// Anthropic Messages → OpenAI chat Completions request. Strips images for
+/// text-only backends (keyed on the backend's `text_only = true` flag).
 pub fn anthropic_to_openai(
     a: &Value,
     upstream_model: &str,
     family: BackendFamily,
+    backend_text_only: bool,
     default_model_for_reasoning: &str,
 ) -> Value {
-    let msgs = convert_messages(
-        a,
-        is_text_only_model(upstream_model),
-        family == CompletionsQuirk::Generic,
-    );
+    let msgs = convert_messages(a, backend_text_only, family == CompletionsQuirk::Generic);
     let max_tokens = a.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(1024);
 
     let mut req = json!({
@@ -1020,6 +1022,7 @@ mod tests {
             }),
             "grok-4.5",
             CompletionsQuirk::Xai,
+            false,
             "grok-4.5",
         );
         assert!(
@@ -1046,7 +1049,7 @@ mod tests {
                 {"name": "b", "description": "y", "input_schema": {"type":"object"}}
             ]
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, false, "grok-4.5");
         let tools = o["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "b");
@@ -1064,7 +1067,7 @@ mod tests {
             }],
             "tool_choice": {"type": "tool", "name": "web_search"}
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, false, "grok-4.5");
         assert!(o.get("tools").is_none(), "tools={:?}", o.get("tools"));
         assert!(
             o.get("tool_choice").is_none(),
@@ -1085,7 +1088,7 @@ mod tests {
             }],
             "tool_choice": {"type": "auto"}
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, false, "grok-4.5");
         assert_eq!(o["tool_choice"], json!("auto"));
         assert_eq!(o["tools"].as_array().unwrap().len(), 1);
     }
@@ -1102,7 +1105,7 @@ mod tests {
             ],
             "tool_choice": {"type":"tool","name":"advisor"}
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, false, "grok-4.5");
         assert!(o.get("tools").is_some());
         // advisor stripped; Bash remains; forced advisor name missing → tool_choice dropped
         assert!(o.get("tool_choice").is_none(), "{:?}", o.get("tool_choice"));
@@ -1116,7 +1119,13 @@ mod tests {
             "thinking": {"type":"enabled","budget_tokens":8000},
             "messages": [{"role":"user","content":"hi"}]
         });
-        let o = anthropic_to_openai(&a, "deepseek-v4", CompletionsQuirk::Generic, "deepseek-v4");
+        let o = anthropic_to_openai(
+            &a,
+            "deepseek-v4",
+            CompletionsQuirk::Generic,
+            false,
+            "deepseek-v4",
+        );
         assert_eq!(
             o.get("reasoning_effort").and_then(|v| v.as_str()),
             Some("medium")
@@ -1130,7 +1139,13 @@ mod tests {
             "thinking": {"type":"disabled"},
             "messages": [{"role":"user","content":"hi"}]
         });
-        let o = anthropic_to_openai(&a, "deepseek-v4", CompletionsQuirk::Generic, "deepseek-v4");
+        let o = anthropic_to_openai(
+            &a,
+            "deepseek-v4",
+            CompletionsQuirk::Generic,
+            false,
+            "deepseek-v4",
+        );
         assert!(o.get("reasoning_effort").is_none());
     }
 
@@ -1155,7 +1170,7 @@ mod tests {
                 }]
             }]
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, false, "grok-4.5");
         let msgs = o["messages"].as_array().unwrap();
         assert!(msgs.iter().any(|m| m.get("tool_calls").is_some()));
         assert!(msgs.iter().any(|m| m.get("role") == Some(&json!("tool"))));
@@ -1174,10 +1189,10 @@ mod tests {
             "messages": [{"role":"user","content":"hi"}],
             "stop_sequences": ["</block>"]
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, false, "grok-4.5");
         assert!(o.get("stop").is_none());
         // Family heuristic — 4.6 must not re-open the stop 400.
-        let o46 = anthropic_to_openai(&a, "grok-4.6", CompletionsQuirk::Xai, "grok-4.5");
+        let o46 = anthropic_to_openai(&a, "grok-4.6", CompletionsQuirk::Xai, false, "grok-4.5");
         assert!(o46.get("stop").is_none());
     }
 
@@ -1188,7 +1203,13 @@ mod tests {
             "messages": [{"role":"user","content":"hi"}],
             "stop_sequences": ["</block>"]
         });
-        let o = anthropic_to_openai(&a, "qwen2.5:14b", CompletionsQuirk::Generic, "grok-4.5");
+        let o = anthropic_to_openai(
+            &a,
+            "qwen2.5:14b",
+            CompletionsQuirk::Generic,
+            false,
+            "grok-4.5",
+        );
         assert!(o.get("stop").is_some());
     }
 
@@ -1393,7 +1414,7 @@ mod tests {
                 ]
             }]
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, false, "grok-4.5");
         let content = o["messages"][0]["content"].as_array().expect("multipart");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "image_url");
@@ -1427,7 +1448,7 @@ mod tests {
                 ]}
             ]
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, false, "grok-4.5");
         let msgs = o["messages"].as_array().unwrap();
         // system none; user; assistant+tool_calls; tool
         let tool = msgs
@@ -1466,7 +1487,7 @@ mod tests {
                 ]}
             ]
         });
-        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, "grok-4.5");
+        let o = anthropic_to_openai(&a, "grok-4.5", CompletionsQuirk::Xai, false, "grok-4.5");
         let tool = o["messages"]
             .as_array()
             .unwrap()
@@ -1500,7 +1521,7 @@ mod tests {
                 ]
             }]
         });
-        let o = anthropic_to_openai(&a, "grok-4.6", CompletionsQuirk::Xai, "grok-4.6");
+        let o = anthropic_to_openai(&a, "grok-4.6", CompletionsQuirk::Xai, false, "grok-4.6");
         let content = o["messages"][0]["content"]
             .as_str()
             .expect("string content");
@@ -1527,7 +1548,7 @@ mod tests {
                 ]
             }]
         });
-        let o = anthropic_to_openai(&a, "grok-4.6", CompletionsQuirk::Xai, "grok-4.6");
+        let o = anthropic_to_openai(&a, "grok-4.6", CompletionsQuirk::Xai, false, "grok-4.6");
         let content = o["messages"][0]["content"].as_str().unwrap();
         assert!(content.contains("[web_search]"), "{content}");
         assert!(content.contains("https://rust-lang.org/"), "{content}");
@@ -1547,7 +1568,7 @@ mod tests {
                 }]
             }]
         });
-        let o = anthropic_to_openai(&a, "m", CompletionsQuirk::Generic, "m");
+        let o = anthropic_to_openai(&a, "m", CompletionsQuirk::Generic, false, "m");
         let content = o["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["image_url"]["url"], "https://example.com/a.png");
     }
@@ -1583,36 +1604,69 @@ mod tests {
     }
 
     #[test]
-    fn glm53_flattens_images_to_text() {
+    fn glm53_keeps_vision_parts() {
+        // Regression: the exact multimodal upstream id that knees every
+        // model-id matcher. backend_text_only = false — parts must survive.
         let o = anthropic_to_openai(
             &glm53_image_body(),
-            "glm-5.3",
+            "GLM-5.3-Flash-EXL3-3.5bpw",
             CompletionsQuirk::Generic,
-            "glm-5.3",
+            false,
+            "m",
         );
         let blob = serde_json::to_string(&o).unwrap();
-        assert!(!blob.contains("image_url"), "{blob}");
+        assert!(blob.contains("image_url"), "{blob}");
+        assert!(blob.contains("iVBORw0KGgo="), "{blob}");
         let msgs = o["messages"].as_array().unwrap();
         let user = msgs.iter().find(|m| m["role"] == "user").unwrap();
-        let user_text = user["content"].as_str().expect("user content string");
-        assert!(user_text.contains("what color?"), "{user_text}");
-        assert!(user_text.contains("text-only"), "{user_text}");
+        let user_content = user["content"].as_array().expect("user vision parts");
+        assert_eq!(user_content[0]["text"], "what color?");
+        assert_eq!(user_content[1]["type"], "image_url");
         let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
-        let tool_text = tool["content"].as_str().expect("tool content string");
-        assert!(tool_text.contains("file1.png"), "{tool_text}");
-        assert!(tool_text.contains("text-only"), "{tool_text}");
+        let tool_content = tool["content"].as_array().expect("tool vision parts");
+        assert_eq!(tool_content[0]["text"], "file1.png");
+        let tool_blob = serde_json::to_string(tool).unwrap();
+        assert!(!tool_blob.contains("text-only"), "{tool_blob}");
     }
 
     #[test]
-    fn glm53_point_release_also_text_only() {
+    fn glm53_point_release_keeps_vision_parts() {
+        // glm-5.3-* is not text-only by name — capability is per-backend.
         let o = anthropic_to_openai(
             &glm53_image_body(),
             "GLM-5.3-preview",
             CompletionsQuirk::Generic,
+            false,
+            "m",
+        );
+        let blob = serde_json::to_string(&o).unwrap();
+        assert!(blob.contains("image_url"), "{blob}");
+    }
+
+    #[test]
+    fn backend_text_only_still_strips() {
+        // The translate contract for the true flag: the same healthy
+        // multimodal upstream id strips ONLY when the backend itself is
+        // text_only — the serve e2e is not a substitute for this unit test.
+        let o = anthropic_to_openai(
+            &glm53_image_body(),
+            "GLM-5.3-Flash-EXL3-3.5bpw",
+            CompletionsQuirk::Generic,
+            true,
             "m",
         );
         let blob = serde_json::to_string(&o).unwrap();
         assert!(!blob.contains("image_url"), "{blob}");
+        assert!(!blob.contains("iVBORw0KGgo="), "{blob}");
+        assert!(blob.contains("image omitted"), "{blob}");
+        let msgs = o["messages"].as_array().unwrap();
+        let user = msgs.iter().find(|m| m["role"] == "user").unwrap();
+        let user_text = user["content"].as_str().expect("user content string");
+        assert!(user_text.contains("what color?"), "{user_text}");
+        let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        let tool_text = tool["content"].as_str().expect("tool content string");
+        assert!(tool_text.contains("file1.png"), "{tool_text}");
+        assert!(tool_text.contains("image omitted"), "{tool_text}");
     }
 
     #[test]
@@ -1621,6 +1675,7 @@ mod tests {
             &glm53_image_body(),
             "glm-5.2",
             CompletionsQuirk::Generic,
+            false,
             "m",
         );
         let blob = serde_json::to_string(&o).unwrap();
@@ -1647,6 +1702,7 @@ mod tests {
             &mid_system_body(),
             "qwen3.8-27b",
             CompletionsQuirk::Generic,
+            false,
             "m",
         );
         let msgs = o["messages"].as_array().unwrap();
@@ -1672,7 +1728,7 @@ mod tests {
                 {"role": "user", "content": "hi"}
             ]
         });
-        let o = anthropic_to_openai(&a, "qwen3.8-27b", CompletionsQuirk::Generic, "m");
+        let o = anthropic_to_openai(&a, "qwen3.8-27b", CompletionsQuirk::Generic, false, "m");
         let msgs = o["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "lead");
@@ -1685,6 +1741,7 @@ mod tests {
             &mid_system_body(),
             "grok-4.5",
             CompletionsQuirk::Xai,
+            false,
             "grok-4.5",
         );
         let msgs = o["messages"].as_array().unwrap();
@@ -1705,7 +1762,7 @@ mod tests {
                 ]}
             ]
         });
-        let o = anthropic_to_openai(&a, "qwen3.8-27b", CompletionsQuirk::Generic, "m");
+        let o = anthropic_to_openai(&a, "qwen3.8-27b", CompletionsQuirk::Generic, false, "m");
         let msgs = o["messages"].as_array().unwrap();
         assert_eq!(msgs[2]["role"], "user");
         let folded = msgs[2]["content"].as_str().unwrap();

@@ -678,17 +678,12 @@ fn apply_vision_policy(
     upstream_model: &str,
     anthropic_shape: bool,
 ) -> Result<()> {
-    let model_flag = crate::translate::is_text_only_model(upstream_model);
-    if !backend_flag && !model_flag {
+    if !backend_flag {
         return Ok(());
     }
     let vision = state.with_config(|c| c.vision.clone())?;
-    let action = crate::vision::decide(backend_flag, model_flag, &vision);
-    let note = if backend_flag {
-        "[image omitted: this backend is text-only]".to_string()
-    } else {
-        crate::translate::image_omitted_note(1)
-    };
+    let action = crate::vision::decide(backend_flag, &vision);
+    let note = "[image omitted: this backend is text-only]".to_string();
     let handled = if anthropic_shape {
         crate::vision::apply_anthropic(body, action, &note, &vision, &state.vision_cache)
     } else {
@@ -775,7 +770,13 @@ fn handle_messages(
         return handle_kv_sessions(sock, state, &a, headers, &resolved, &be, false);
     }
 
-    let oai = anthropic_to_openai(&a, &resolved.upstream_model, be.quirk, &env.grok_model);
+    let oai = anthropic_to_openai(
+        &a,
+        &resolved.upstream_model,
+        be.quirk,
+        be.config.text_only(),
+        &env.grok_model,
+    );
     let include_thinking = wants_thinking(&a);
     let do_stream = a.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
