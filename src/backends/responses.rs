@@ -13,6 +13,8 @@
 //! loops consume the completions-shaped result unchanged — nothing else in
 //! Spock needs to know about Responses.
 
+#![allow(clippy::items_after_test_module)] // production fn tail sits after the test module — ordering-only lint, no behaviour.
+
 use crate::backends::UpstreamBody;
 use crate::error::{Error, Result};
 use serde_json::{json, Value};
@@ -728,11 +730,8 @@ fn collect_completions(dec: &mut ResponsesDecoder<impl Read>) -> Value {
     let mut reasoning_tokens = 0u64;
     let mut saw_completed = false;
 
-    loop {
-        let ev = match dec.next_event() {
-            Ok(Some(e)) => e,
-            _ => break,
-        };
+    while let Ok(Some(e)) = dec.next_event() {
+        let ev = e;
         match ev {
             CodexEvent::ReasoningDelta(d) => reasoning.push_str(&d),
             CodexEvent::TextDelta(d) => text.push_str(&d),

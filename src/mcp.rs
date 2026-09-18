@@ -259,10 +259,7 @@ fn initialize_result(params: &Value) -> Value {
         .pointer("/protocolVersion")
         .and_then(|p| p.as_str())
         .unwrap_or("");
-    let proto = if SUPPORTED_PROTOCOL_VERSIONS
-        .iter()
-        .any(|candidate| *candidate == requested)
-    {
+    let proto = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
         requested.to_string()
     } else {
         LATEST_PROTOCOL_VERSION.to_string()
@@ -372,9 +369,9 @@ fn legacy_open(stream: &mut TcpStream) -> Result<()> {
         let mut writer = shared
             .lock()
             .map_err(|_| Error::Msg("mcp legacy stream lock".into()))?;
-        write_sse_stream_headers(&mut *writer)?;
+        write_sse_stream_headers(&mut writer)?;
         emit_sse(
-            &mut *writer,
+            &mut writer,
             "endpoint",
             &json!(format!("/mcp/sse/messages?sessionId={sid}")),
         )?;
@@ -458,7 +455,7 @@ fn legacy_post(
         // the stream may already be gone, and listeners stay loud (not silent).
         match sink.lock() {
             Ok(mut writer) => {
-                if let Err(e) = emit_sse(&mut *writer, "message", &envelope) {
+                if let Err(e) = emit_sse(&mut writer, "message", &envelope) {
                     eprintln!(
                         "  mcp legacy reply lost sid={} ({})",
                         sid.as_deref().unwrap_or(""),
