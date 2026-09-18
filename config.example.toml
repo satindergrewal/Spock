@@ -262,6 +262,7 @@ fable = "ollama:qwen2.5:14b"
 # provider = "duckduckgo"   # or brave / serper when keys set
 # # api_key_env = "BRAVE_API_KEY"
 # # Also serves grok-build: POST /v1/responses + hosted web_search tool.
+# # And MCP clients (ZCode etc): /mcp streamable HTTP + legacy /mcp/sse.
 #
 # --- Vision policy for text_only backends ---
 # The switch is the backend's text_only = true flag; this section is the how.

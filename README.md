@@ -25,6 +25,7 @@ Spock is protocol-compatible with Claude Code’s Anthropic Messages client. Ver
 
 | Spock | Claude Code CLI | Claude Code IDE extension | Host (example) | Status | Notes |
 |---|---|---|---|---|---|
+| **0.4.0** | **2.1.233** | **2.1.233** | VSCodium / VS Code | **OK** | `/mcp` web-search MCP server (streamable + legacy SSE); Anthropic/OpenAI lanes untouched — 166 suite + shim canary, 0.3.0 compat row stands (2026-09-18) |
 | **0.3.0** | **2.1.233** | **2.1.233** | VSCodium / VS Code | **OK** | Vision policy + KV sessions + catalog UI (2026-08-24) |
 | **0.2.0** | **2.1.207** | **2.1.207** (`cc_version=2.1.207.6dd`) | VSCodium **1.128.0** (also VS Code) | **OK** | Microcompact + mid-SSE errors + log-file + webview text server tools (2026-07-13) |
 | **0.2.0** | **2.1.206** | **2.1.206** (`cc_version=2.1.206.87c`) | VSCodium **1.128.0** (also VS Code) | **OK** | Server-tool emulation + presets + Auto Mode reasoning_effort fix (2026-07-13) |
@@ -393,6 +394,16 @@ Use a Claude Code version from the [compatible table](#compatible-claude-code-ve
 
 Starts `spock serve` if needed, sets compact window env, launches `claude`. Override model with `GROK_MODEL_ID` / `ANTHROPIC_MODEL` if you want.
 
+### Web search for MCP clients (local)
+
+Any MCP-capable client can use Spock's web-search engine through the same running proxy — the model sees a namespaced `mcp__<server>__web_search` tool; calls execute server-side against `[web_search]` (Brave / Serper / SearXNG / DuckDuckGo). Claude Code's own WebSearch emulation and grok-build's `/v1/responses` shim stay separate, unchanged.
+
+```json
+{ "mcp": { "servers": { "spock-websearch": { "type": "http", "url": "http://127.0.0.1:8048/mcp" } } } }
+```
+
+Legacy SSE clients use `"type": "sse"` with `"url": "http://127.0.0.1:8048/mcp/sse"`. Manage desktop-client MCP through its **Settings → MCP** page. Requires `[web_search] enabled = true`; when disabled the tool stays listed and calls refuse loudly. Loopback only, no auth header.
+
 ### Context window (~500k for Grok)
 
 - Pair a `[1m]`-flavoured client id with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000` so compact math matches Grok’s ~500k window.  
@@ -447,6 +458,14 @@ spock help
 | `GET /v1/models/{id}` | Never 404s for aliases |
 | `GET /v1/language-models*` | xAI extended list when available |
 | `GET /health` | Status, profile, backends, version |
+
+### MCP (same listener, loopback only; `[web_search]` gate)
+
+| Endpoint | Protocol / Notes |
+|---|---|
+| `POST /mcp` | MCP Streamable HTTP (`2025-06-18`) — JSON-RPC reply as JSON or SSE `message` frame per `Accept`; `GET /mcp` → 405 |
+| `GET /mcp/sse` | Legacy `2024-11-05` SSE stream — first `endpoint` event names the POST URL + sessionId, keepalives follow |
+| `POST /mcp/sse/messages?sessionId=…` | Legacy POST — JSON-RPC reply arrives on the matching GET stream; this POST's HTTP body is 202 |
 
 ### Local admin (loopback only — used by Spock.app)
 

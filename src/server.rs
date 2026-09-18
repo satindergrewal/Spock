@@ -25,7 +25,7 @@ pub fn serve(state: AppState, shutdown: Arc<AtomicBool>) -> Result<()> {
     let profile = state.with_config(|c| c.server.profile.clone())?;
     eprintln!("Spock proxy on http://{addr}");
     eprintln!("  profile: {profile}");
-    eprintln!("  POST /v1/messages | /v1/chat/completions | /v1/responses | Ctrl-C to stop\n");
+    eprintln!("  POST /v1/messages | /v1/chat/completions | /v1/responses | /mcp (MCP web search) + /mcp/sse legacy | Ctrl-C to stop\n");
 
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -151,6 +151,12 @@ fn handle_client(mut stream: TcpStream, state: AppState) -> Result<()> {
             let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
             handle_responses(&mut stream, &state, body)?;
         }
+        // MCP web-search server — same listener: streamable HTTP POST + legacy
+        // SSE GET/POST. One guarded arm; the dispatcher owns JSON-RPC-shaped
+        // refusals for any `/mcp/*` path (never falls to the Anthropic default).
+        (m, p) if p == "/mcp" || p.starts_with("/mcp/") => {
+            crate::mcp::handle_mcp(&mut stream, &state, m, &req.path, &req.body, &req.headers)?;
+        }
         _ => {
             let (st, err) = anthropic_error(404, "not_found_error", &format!("not found: {path}"));
             write_json(&mut stream, st, &err)?;
@@ -197,7 +203,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request> {
     })
 }
 
-fn write_json(stream: &mut TcpStream, status: u16, body: &Value) -> Result<()> {
+pub(crate) fn write_json(stream: &mut TcpStream, status: u16, body: &Value) -> Result<()> {
     let data = serde_json::to_vec(body)?;
     let reason = reason_phrase(status);
     let header = format!(
@@ -210,14 +216,41 @@ fn write_json(stream: &mut TcpStream, status: u16, body: &Value) -> Result<()> {
     Ok(())
 }
 
-fn write_sse_headers(stream: &mut TcpStream) -> Result<()> {
+/// Bodyless status-only response — MCP `204`/`202` gates and `405`/`406`
+/// method/accept refusals. `extra` adds one header (e.g. `Allow: POST`).
+pub(crate) fn write_status_only(
+    stream: &mut TcpStream,
+    status: u16,
+    extra: Option<(&str, &str)>,
+) -> Result<()> {
+    let reason = reason_phrase(status);
+    let mut header = format!("HTTP/1.1 {status} {reason}\r\n");
+    if let Some((key, val)) = extra {
+        header.push_str(&format!("{key}: {val}\r\n"));
+    }
+    header.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(header.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+pub(crate) fn write_sse_headers(stream: &mut TcpStream) -> Result<()> {
     let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     stream.write_all(header.as_bytes())?;
     stream.flush()?;
     Ok(())
 }
 
-fn emit_sse(stream: &mut TcpStream, event: &str, data: &Value) -> Result<()> {
+/// Streaming SSE headers (legacy GET): no `Connection: close` — that stream
+/// is long-lived with keepalives, unlike one-shot JSON-RPC SSE replies.
+pub(crate) fn write_sse_stream_headers(stream: &mut TcpStream) -> Result<()> {
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n";
+    stream.write_all(header.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+pub(crate) fn emit_sse(stream: &mut TcpStream, event: &str, data: &Value) -> Result<()> {
     let payload = serde_json::to_string(data)?;
     write!(stream, "event: {event}\ndata: {payload}\n\n")?;
     stream.flush()?;
@@ -227,9 +260,13 @@ fn emit_sse(stream: &mut TcpStream, event: &str, data: &Value) -> Result<()> {
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
         500 => "Internal Server Error",
         _ => "Error",
     }
@@ -631,17 +668,9 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
 /// Responses object. Anything else is 400 — this is not a general Responses
 /// proxy and must not fall through to chat/completions.
 fn handle_responses(sock: &mut TcpStream, state: &AppState, body: Value) -> Result<()> {
-    let web_cfg = {
-        let c = state.snapshot_config()?;
-        crate::server_tools::WebSearchConfig {
-            enabled: c.web_search.enabled,
-            provider: c.web_search.provider.clone(),
-            base_url: c.web_search.base_url.clone(),
-            api_key: c.web_search.api_key.clone(),
-            api_key_env: c.web_search.api_key_env.clone(),
-            max_results: c.web_search.max_results,
-        }
-    };
+    let web_cfg = crate::server_tools::WebSearchConfig::from_section(
+        &state.snapshot_config()?.web_search,
+    );
     match crate::server_tools::responses_web_search(&web_cfg, &body) {
         Ok(out) => {
             let q = crate::server_tools::responses_query(&body).unwrap_or("");
@@ -788,17 +817,9 @@ fn handle_messages(
             max_tokens: c.advisor.max_tokens,
         }
     };
-    let web_cfg = {
-        let c = state.snapshot_config()?;
-        crate::server_tools::WebSearchConfig {
-            enabled: c.web_search.enabled,
-            provider: c.web_search.provider.clone(),
-            base_url: c.web_search.base_url.clone(),
-            api_key: c.web_search.api_key.clone(),
-            api_key_env: c.web_search.api_key_env.clone(),
-            max_results: c.web_search.max_results,
-        }
-    };
+    let web_cfg = crate::server_tools::WebSearchConfig::from_section(
+        &state.snapshot_config()?.web_search,
+    );
     let use_server_tools = (advisor_cfg.enabled && crate::server_tools::request_has_advisor(&a))
         || (web_cfg.enabled && crate::server_tools::request_has_web_search(&a));
 
@@ -1893,5 +1914,157 @@ default = "t:m"
             s.contains("this backend is text-only"),
             "strip note must reach upstream: {s}"
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_route_e2e {
+    use crate::config::Config;
+    use crate::state::AppState;
+    use serde_json::{json, Value};
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn free_port() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    }
+
+    fn connect_until(port: u16) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("server up by deadline")
+    }
+
+    /// One HTTP frame (header line + headers + content-length body); mirrors
+    /// the request reader without direction-specific naming.
+    fn read_frame(mut s: TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let header_end = loop {
+            match s.read(&mut tmp) {
+                Ok(0) => return buf,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                }
+                Err(_) => return buf,
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let len = headers
+            .lines()
+            .find_map(|l| {
+                let l = l.to_ascii_lowercase();
+                l.strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + len {
+            match s.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
+    fn json_body(frame: &[u8]) -> Option<Value> {
+        let pos = frame.windows(4).position(|w| w == b"\r\n\r\n")?;
+        serde_json::from_slice(&frame[pos + 4..]).ok()
+    }
+
+    /// MCP door end-to-end on the real listener: streamable initialize echoes
+    /// a supported protocol version, tools/list advertises `web_search`, GET
+    /// answers 405, and a notification is bodyless 204. MCP-only config — no
+    /// backend call, so this stays network-free.
+    #[test]
+    fn mcp_route_serves_streamable_and_gates() {
+        let sport = free_port();
+        let toml = format!(
+            r#"
+[server]
+bind = "127.0.0.1"
+port = {sport}
+profile = "mcp"
+"#
+        );
+        let cfg: Config = toml::from_str(&toml).expect("config parses");
+        let state = AppState::new(cfg);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let sh2 = shutdown.clone();
+        std::thread::spawn(move || {
+            let _ = crate::server::serve(state, sh2);
+        });
+
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26"}
+        }))
+        .expect("body");
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut init = connect_until(sport);
+        init.write_all(head.as_bytes()).expect("write head");
+        init.write_all(&body).expect("write body");
+        let init_frame = read_frame(init);
+        let init_json = json_body(&init_frame).expect("initialize json");
+        assert_eq!(init_json["result"]["protocolVersion"], json!("2025-03-26"));
+        assert_eq!(init_json["result"]["capabilities"]["tools"]["listChanged"], json!(false));
+        assert_eq!(init_json["result"]["serverInfo"]["name"], json!("spock"));
+
+        let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+            .expect("body");
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut listing = connect_until(sport);
+        listing.write_all(head.as_bytes()).expect("write head");
+        listing.write_all(&body).expect("write body");
+        let list_json = json_body(&read_frame(listing)).expect("tools list json");
+        assert_eq!(list_json["result"]["tools"][0]["name"], json!("web_search"));
+        assert_eq!(
+            list_json["result"]["tools"][0]["inputSchema"]["required"],
+            json!(["query"])
+        );
+
+        let mut gate = connect_until(sport);
+        gate.write_all(b"GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .expect("write get");
+        let gate_frame = read_frame(gate);
+        let gate_text = String::from_utf8_lossy(&gate_frame).to_string();
+        assert!(gate_text.contains("HTTP/1.1 405"), "{gate_text}");
+        assert!(gate_text.contains("Allow: POST"), "{gate_text}");
+
+        let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("body");
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut note = connect_until(sport);
+        note.write_all(head.as_bytes()).expect("write head");
+        note.write_all(&body).expect("write body");
+        let note_text = String::from_utf8_lossy(&read_frame(note)).to_string();
+        assert!(note_text.contains("HTTP/1.1 204"), "{note_text}");
+        assert!(note_text.contains("Content-Length: 0"), "{note_text}");
+
+        shutdown.store(true, Ordering::SeqCst);
     }
 }

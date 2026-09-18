@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod error;
 mod kv_sessions;
+mod mcp;
 mod models;
 mod oauth;
 mod route;
@@ -336,6 +337,14 @@ fn cmd_status() -> Result<()> {
             "enabled"
         } else {
             "disabled"
+        }
+    );
+    println!(
+        "  mcp:       /mcp + /mcp/sse{}",
+        if cfg.web_search.enabled {
+            " (web_search enabled)"
+        } else {
+            " (web_search disabled — calls refuse loudly)"
         }
     );
     println!("  oauth:");

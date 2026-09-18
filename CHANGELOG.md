@@ -4,7 +4,10 @@ All notable changes to Spock are documented here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-18
+
 ### Added
+- **`/mcp` web-search MCP server** — the same listener as the Anthropic/OpenAI proxy now speaks MCP so external clients (ZCode `type:"http"` or legacy `type:"sse"`) can call Spock's `[web_search]` engine as `web_search`. Streamable HTTP (`2025-06-18`; JSON/SSE Accept negotiation, `GET /mcp` → 405) + legacy SSE (`2024-11-05`) at `/mcp/sse` and session-routed `/mcp/sse/messages`. Claude Code `/v1/messages` emulation and the grok-build `/v1/responses` shim stay orthogonal; loopback only, no auth; tool calls inherit `[web_search]` (disabled refuses loudly, provider failures as `isError`); one shared `from_section` conversion replaced the duplicated inline builders. Bug-hardened same pass: legacy malformed POST keeps the real `-32700` envelope (never re-wrapped as invalid request); a dead GET stream cannot block the matching POST's `202`; legacy stream headers omit `Connection: close`; notification-prefixed methods stay silent even with a stray `id`.
 - **ChatGPT / Codex subscription backend** (`type = "responses"`) — use a ChatGPT subscription, not separate billing. New `openaai` OAuth provider imports the token from `~/.codex/auth.json` (Codex CLI/Desktop) and refreshes via `auth.openai.com/oauth/token` (device-code re-login is secondary — that endpoint sits behind a Cloudflare challenge). The `responses` backend transliterates completions-shaped bodies to the Codex Responses API (`POST {base}/codex/responses`, stream-only, `store:false`) and back — `translate.rs`, `server_tools`, and KV sessions are untouched. Subscription-gated models (`gpt-5.5`, `gpt-5.4`, …) route normally; an explicit `api_key`/`api_key_env` switches to the official OpenAI Responses gateway (`{base}/responses`).
 
 ### Changed

@@ -68,6 +68,19 @@ impl AdvisorConfig {
 }
 
 impl WebSearchConfig {
+    /// Production conversion shared by `/v1/messages`, `/v1/responses`, and `/mcp`
+    /// — replaces the two inline field-for-field clones in server.rs handlers.
+    pub fn from_section(s: &crate::config::WebSearchSection) -> Self {
+        Self {
+            enabled: s.enabled,
+            provider: s.provider.clone(),
+            base_url: s.base_url.clone(),
+            api_key: s.api_key.clone(),
+            api_key_env: s.api_key_env.clone(),
+            max_results: s.max_results,
+        }
+    }
+
     pub fn from_toml_table(t: &toml::Value) -> Self {
         Self {
             enabled: t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
