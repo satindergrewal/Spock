@@ -4,6 +4,9 @@ use crate::backends::{get_backend, UpstreamBody};
 use crate::config::{EnvOverrides, DEFAULT_GROK_MODEL};
 use crate::error::{anthropic_error, Error, Result};
 use crate::models::{alias_models, catalog_list_cards, model_card, model_card_full, stop_reason};
+use crate::responses_client::{
+    completions_json_to_responses, responses_to_completions, ChatSseToResponses,
+};
 use crate::route;
 use crate::state::AppState;
 use crate::translate::{
@@ -25,7 +28,7 @@ pub fn serve(state: AppState, shutdown: Arc<AtomicBool>) -> Result<()> {
     let profile = state.with_config(|c| c.server.profile.clone())?;
     eprintln!("Spock proxy on http://{addr}");
     eprintln!("  profile: {profile}");
-    eprintln!("  POST /v1/messages | /v1/chat/completions | /v1/responses | /mcp (MCP web search) + /mcp/sse legacy | Ctrl-C to stop\n");
+    eprintln!("  POST /v1/messages | /v1/chat/completions | /v1/responses (Codex Responses wire: inference + grok-build search) | /mcp (MCP web search) + /mcp/sse legacy | Ctrl-C to stop\n");
 
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -664,36 +667,121 @@ fn handle_models(stream: &mut TcpStream, state: &AppState, path: &str) -> Result
     )
 }
 
-/// grok-build `web_search` POSTs OpenAI Responses (`{base}/responses` + hosted
-/// `web_search` tool). Search-only: run `[web_search]`, return a completed
-/// Responses object. Anything else is 400 — this is not a general Responses
-/// proxy and must not fall through to chat/completions.
+/// `/v1/responses` serves two gates on the same listener:
+/// 1. grok-build's hosted `web_search` **direct search** turn (query string as the
+///    whole input, search tools only): run `[web_search]` and return the completed
+///    search object — the unchanged shim; no tool / disabled / empty query still 400.
+/// 2. Codex Desktop/CLI custom providers (`wire_api="responses"`; Chat Completions is
+///    gone) post real generation bodies (input item array): rebuild through the routed
+///    chat-completions backend and answer in Responses JSON / SSE the Codex client
+///    parses. The old search-only refusal is removed for these — a generation request
+///    no longer falls through to the raw chat ingress verbatim, it translates.
 fn handle_responses(sock: &mut TcpStream, state: &AppState, body: Value) -> Result<()> {
-    let web_cfg =
-        crate::server_tools::WebSearchConfig::from_section(&state.snapshot_config()?.web_search);
-    match crate::server_tools::responses_web_search(&web_cfg, &body) {
-        Ok(out) => {
-            let q = crate::server_tools::responses_query(&body).unwrap_or("");
-            eprintln!(
-                "  responses web_search q={q:?} provider={}",
-                web_cfg.provider
+    if crate::server_tools::responses_direct_search(&body) {
+        let web_cfg = crate::server_tools::WebSearchConfig::from_section(
+            &state.snapshot_config()?.web_search,
+        );
+        match crate::server_tools::responses_web_search(&web_cfg, &body) {
+            Ok(out) => {
+                let q = crate::server_tools::responses_query(&body).unwrap_or("");
+                eprintln!(
+                    "  responses web_search q={q:?} provider={}",
+                    web_cfg.provider
+                );
+                write_json(sock, 200, &out)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                eprintln!("  responses error: {msg}");
+                let (st, ty) = if msg.contains("disabled")
+                    || msg.contains("search-only")
+                    || msg.contains("empty input")
+                {
+                    (400, "invalid_request_error")
+                } else {
+                    (502, "api_error")
+                };
+                let (http, err) = anthropic_error(st, ty, &msg);
+                write_json(sock, http, &err)
+            }
+        }
+    } else {
+        handle_responses_inference(sock, state, body)
+    }
+}
+
+/// Real Responses generation → routed chat-completions backend → Responses reply.
+/// Upstream connection opens before SSE headers so a total failure is a real HTTP
+/// error (not an error frame after 200). Stream clients get the live transliterated
+/// SSE (`response.created` … `response.completed`); non-stream clients get an
+/// Responses object. Route/take-backend refusals answer the Responses/OpenAI error
+/// shape (`{error:{…}}`), not Anthropic's.
+fn handle_responses_inference(sock: &mut TcpStream, state: &AppState, body: Value) -> Result<()> {
+    let client_model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(DEFAULT_GROK_MODEL)
+        .to_string();
+    let resolved = match state.with_config(|c| route::resolve(c, &client_model))? {
+        Ok(r) => r,
+        Err(e) => return write_responses_err(sock, 400, &e.to_string()),
+    };
+    // Responses request → chat-completions body (instructions→system, input items→
+    // messages, flat tools→nested function tools; custom names kept for item types).
+    let (mut oai, custom_tools, tool_namespaces) = responses_to_completions(&body);
+    if let Some(obj) = oai.as_object_mut() {
+        obj.insert("model".into(), json!(resolved.upstream_model));
+    }
+
+    let be = match take_backend(state, &resolved.backend) {
+        Ok(b) => b,
+        Err(e) => return write_responses_err(sock, 400, &e.to_string()),
+    };
+    apply_vision_policy(
+        state,
+        &mut oai,
+        be.config.text_only(),
+        &resolved.upstream_model,
+        false,
+    )?;
+    sanitize_openai_ingress(&mut oai, &be, &resolved.upstream_model);
+
+    let stream_flag = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let input_estimate = crate::translate::count_tokens_estimate(&oai);
+    eprintln!(
+        "  route {} → {}:{} ({}) [responses{}]",
+        client_model,
+        resolved.backend,
+        resolved.upstream_model,
+        match be.quirk {
+            CompletionsQuirk::Xai => "xai",
+            CompletionsQuirk::Kimi => "kimi",
+            CompletionsQuirk::Generic => "generic",
+        },
+        if stream_flag { "+stream" } else { "" }
+    );
+    match be.chat(&oai, stream_flag, &state.oauth) {
+        Ok(UpstreamBody::Json(o)) => {
+            let resp = completions_json_to_responses(
+                &o,
+                &client_model,
+                input_estimate,
+                &custom_tools,
+                &tool_namespaces,
             );
-            write_json(sock, 200, &out)
+            write_json(sock, 200, &resp)
         }
-        Err(e) => {
-            let msg = e.to_string();
-            eprintln!("  responses error: {msg}");
-            let (st, ty) = if msg.contains("disabled")
-                || msg.contains("search-only")
-                || msg.contains("empty input")
-            {
-                (400, "invalid_request_error")
-            } else {
-                (502, "api_error")
-            };
-            let (http, err) = anthropic_error(st, ty, &msg);
-            write_json(sock, http, &err)
+        Ok(UpstreamBody::Stream(reader)) => {
+            write_sse_headers(sock)?;
+            let adapter =
+                ChatSseToResponses::new(reader, custom_tools, client_model, input_estimate)
+                    .with_namespaces(tool_namespaces);
+            pump_upstream_sse(sock, state, Box::new(adapter), "responses")
         }
+        Err(e) => write_responses_upstream_err(sock, state, e),
     }
 }
 
@@ -1292,6 +1380,27 @@ fn stream_anthropic(
     )
 }
 
+/// Vendor quirks shared by both OpenAI-shaped ingresses (raw chat + Responses
+/// client lane): xAI reasoning routes drop `stop` / presence / frequency; generic
+/// and Kimi routes drop `reasoning_effort:"none"` (some OpenAI-compat servers 400).
+fn sanitize_openai_ingress(
+    body: &mut Value,
+    be: &crate::backends::BackendHandle,
+    upstream_model: &str,
+) {
+    if be.quirk == CompletionsQuirk::Xai {
+        let env = EnvOverrides::from_env();
+        let reasoning = crate::models::is_reasoning_model(upstream_model, &env.grok_model);
+        crate::models::sanitize_upstream(body, reasoning);
+    } else if matches!(be.quirk, CompletionsQuirk::Kimi | CompletionsQuirk::Generic) {
+        if let Some(obj) = body.as_object_mut() {
+            if obj.get("reasoning_effort").and_then(|v| v.as_str()) == Some("none") {
+                obj.remove("reasoning_effort");
+            }
+        }
+    }
+}
+
 fn handle_openai(
     sock: &mut TcpStream,
     state: &AppState,
@@ -1369,19 +1478,7 @@ fn handle_openai(
         return handle_kv_sessions(sock, state, &fake, headers, &resolved, &be, true);
     }
 
-    if be.quirk == CompletionsQuirk::Xai {
-        let env = EnvOverrides::from_env();
-        let reasoning =
-            crate::models::is_reasoning_model(&resolved.upstream_model, &env.grok_model);
-        crate::models::sanitize_upstream(&mut body, reasoning);
-    } else if matches!(be.quirk, CompletionsQuirk::Kimi | CompletionsQuirk::Generic) {
-        // Never forward reasoning_effort "none" (some OpenAI-compat servers 400).
-        if let Some(obj) = body.as_object_mut() {
-            if obj.get("reasoning_effort").and_then(|v| v.as_str()) == Some("none") {
-                obj.remove("reasoning_effort");
-            }
-        }
-    }
+    sanitize_openai_ingress(&mut body, &be, &resolved.upstream_model);
 
     let stream_flag = body
         .get("stream")
@@ -1440,6 +1537,64 @@ fn pump_upstream_sse(
         }
     }
     Ok(())
+}
+
+/// Responses/Codex wire error object (`{error:{message,code,type}}`) for admin or
+/// route refusals — not Anthropic `{type:…,message:` which Codex reads differently.
+fn write_responses_err(stream: &mut TcpStream, status: u16, msg: &str) -> Result<()> {
+    let ty = if status == 400 {
+        "invalid_request_error"
+    } else {
+        "api_error"
+    };
+    write_json(
+        stream,
+        status,
+        &json!({"error": {"message": msg, "code": ty, "type": ty}}),
+    )
+}
+
+/// Same Responses error body for an upstream failure, recorded like the Claude
+/// lanes so the Settings banner / `spock status` last_err sees it.
+fn write_responses_upstream_err(stream: &mut TcpStream, state: &AppState, e: Error) -> Result<()> {
+    match e {
+        Error::Http(400, body) => {
+            let raw = extract_err_msg(&body);
+            let looks_kv = raw.contains("session")
+                || raw.contains("kv_sessions")
+                || raw.contains("/fork")
+                || raw.contains("close_session");
+            if looks_kv {
+                let msg = format!("Spock kv_sessions 400: {raw}");
+                state.record_upstream_error(400, &msg);
+                write_responses_err(stream, 400, &msg)
+            } else {
+                let (out_status, _err_type, msg) = classify_upstream_http(400, &raw);
+                state.record_upstream_error(out_status, &msg);
+                write_responses_err(stream, out_status, &msg)
+            }
+        }
+        Error::Http(code, body) => {
+            let raw = extract_err_msg(&body);
+            let (out_status, _err_type, msg) = classify_upstream_http(code, &raw);
+            state.record_upstream_error(out_status, &msg);
+            write_responses_err(stream, out_status, &msg)
+        }
+        other => {
+            let raw = other.to_string();
+            let status = if raw.contains("named master")
+                || raw.contains("cache_control")
+                || raw.contains("session_id")
+            {
+                400
+            } else {
+                502
+            };
+            let msg = format!("spock backend error: {raw}");
+            state.record_upstream_error(status, &msg);
+            write_responses_err(stream, status, &msg)
+        }
+    }
 }
 
 fn write_upstream_err(stream: &mut TcpStream, state: &AppState, e: Error) -> Result<()> {

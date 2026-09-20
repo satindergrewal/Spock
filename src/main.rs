@@ -6,6 +6,7 @@ mod kv_sessions;
 mod mcp;
 mod models;
 mod oauth;
+mod responses_client;
 mod route;
 mod server;
 mod server_tools;

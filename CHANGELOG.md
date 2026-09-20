@@ -4,6 +4,14 @@ All notable changes to Spock are documented here.
 
 ## [Unreleased]
 
+### Added
+- **General `/v1/responses` inference proxy** — Responses-only clients (Codex Desktop/CLI custom model provider; `wire_api = "responses"`, Chat Completions is gone in current codex-rs) post real generation bodies to `{base}/responses`, which Spock now rebuilds through the routed chat-completions backend: Responses request → chat body (instructions→system, input items→messages, flat tools→nested function tools, custom names kept); upstream result → Responses JSON (`stream:false`) or **Responses SSE Codex parses** (`stream:true`: `response.created`, reasoning summary/text deltas, `output_item.added`/`.done` tool items, compliant nested `response.completed` usage, `response.failed` on mid-stream errors). Route/take-backend refusals and upstream failures answer the OpenAI `{error:{…}}` shape, not Anthropic's; the upstream opens before SSE headers so a total failure stays a real HTTP error (no error frame after 200). Client wire only: `backends/responses.rs` upstream Codex wire and translate/KV/server-tools machinery untouched. Preflight/harden pass same: one `output_item.added` per tool index (vLLM fragments repeat id/name); a best-effort JSON close of unterminated argument fragments (Codex `Session::handle_function_call` parses args as JSON); flat/nested tool shapes both map; **namespace bundles flatten** (`{type:"namespace",…}` Codex plugin/MCP tool groups → upstream function entries; outbound tool items carry `namespace` for Codex's `(namespace, name)` rollout identity); tool-forced live round trip verified against a LAN DSV4-Flash OpenAI-compat box. **UI commit events** too: terminal assistant message `output_item.added`/`.done` (`phase: final_answer` on clean stops; absent on tool rounds) plus reasoning `.done` — Codex app-server renders the answer/thinking bubble from those, not deltas alone.
+- **grok-build `/v1/responses` search shim stays** — a **direct** hosted-search turn (query as the whole `input` string + only search tools) still runs `[web_search]` and returns its completed citation object; no-tool generation bodies stop hitting the old “search-only; request has no web_search tool” refusal.
+
+### Changed
+- `/v1/responses` gate splits: direct search (string input, search-tool-only) → shim; generation body (input item array) → translated inference — no real request falls through verbatim.
+- Vendor quirks shared by both OpenAI-shaped ingresses via one `sanitize_openai_ingress` (xAI stop/penalty drops; generic/Kimi `reasoning_effort:"none"` drops).
+
 ## [0.4.0] - 2026-09-18
 
 ### Added

@@ -25,6 +25,7 @@ Spock is protocol-compatible with Claude Code’s Anthropic Messages client. Ver
 
 | Spock | Claude Code CLI | Claude Code IDE extension | Host (example) | Status | Notes |
 |---|---|---|---|---|---|
+| **0.5.0** | **2.1.233** | **2.1.233** | VSCodium / VS Code | **OK** | `/v1/responses` Responses-only inference lane (Codex Desktop custom model provider) + preserved grok-build search shim; Anthropic/OpenAI lanes untouched — 181 suite, live smoke on its own LAN OpenAI-compat backend; app bundle rebuild/reopen pending to coexist (2026-09-19) |
 | **0.4.0** | **2.1.233** | **2.1.233** | VSCodium / VS Code | **OK** | `/mcp` web-search MCP server (streamable + legacy SSE); Anthropic/OpenAI lanes untouched — 166 suite + shim canary, 0.3.0 compat row stands (2026-09-18) |
 | **0.3.0** | **2.1.233** | **2.1.233** | VSCodium / VS Code | **OK** | Vision policy + KV sessions + catalog UI (2026-08-24) |
 | **0.2.0** | **2.1.207** | **2.1.207** (`cc_version=2.1.207.6dd`) | VSCodium **1.128.0** (also VS Code) | **OK** | Microcompact + mid-SSE errors + log-file + webview text server tools (2026-07-13) |
@@ -51,7 +52,7 @@ If something breaks after a Claude Code upgrade: note **both** Spock and Claude 
 
 - Server-tool emulation is **opt-in** via `[advisor]` / `[web_search]` in config (defaults off). Without them, `advisor_20260301` / `web_search_*` schemas are stripped for OpenAI-compat upstreams.
 - Advisor runs as a nested review, then comes back as a **text** block (`Advisor review:…`). VSCodium/VS Code 2.1.226 webview has no renderer for `server_tool_use` / `advisor_tool_result` and prints those names as chat lines. Never returned as a client `tool_use` (`No such tool available: advisor`). Pin `[advisor].model` to a **different** route than the executor or the reviewer just continues the agent voice. History that still has the protocol blocks is flattened on the OpenAI-compat path.
-- OpenAI Responses API flag exists but is **not implemented** — leave `use_responses_api = false` (Chat Completions).
+- OpenAI Responses API **upstream** flag exists but is not implemented — leave `use_responses_api = false` (Chat Completions) on api_key backends. **Inbound** `/v1/responses` for Responses-only clients **is** implemented (rebuilds through the routed chat backend; see [Codex Desktop](#codex-desktop--cli--custom-model-providerresponses-only-client)).
 - Client-side microcompact runs when Claude Code sends `context_management` edits; Anthropic passthrough leaves them for real Anthropic.
 
 ---
@@ -231,6 +232,28 @@ Optionally, for an **OpenAI API key** (separate billing, official gateway) use t
 1. `spock login openai` (one-time; browser opens) — or leave it if you already have a Codex login  
 2. Route e.g. `fable = "chatgpt:gpt-5.5"` · `opus = "chatgpt:gpt-5.5"`  
 3. Reload Spock / Save & Apply. Model ids: `gpt-5.5`, `gpt-5.4`, `gpt-5.2`, … (effort `low`…`xhigh` via `reasoning_effort`).
+
+### Codex Desktop / CLI — custom model provider (Responses-only client)
+
+The Codex app can point at **Spock** as a custom OpenAI model provider. Chat Completions is removed in current codex-rs, so it speaks only the Responses wire:
+
+```toml
+# ~/.codex/config.toml
+model = "your-backend:your-model"      # a Spock profile route id (backend:model)
+model_provider = "spock"
+
+[model_providers.spock]
+name = "Spock"
+base_url = "http://127.0.0.1:8048/v1"
+wire_api = "responses"
+```
+
+- **No `env_key`** and no `requires_openai_auth` (default): the loopback listener takes keyless requests, so Codex sends no auth header and the GUI app needs no process env var.
+- Model picker ids come from Spock `/v1/models` (catalog shortlist); a `backend:model` id honors the configured backend — a LAN/local OpenAI-compat model included.
+- `supports_standalone_web_search` defaults false for custom providers — Codex's generation bodies carry **no** hosted `web_search` tool; when a string-input direct-search turn arrives the shim runs.
+- Codex plugin/MCP **namespace** tool bundles (`{type:"namespace",…}`) flatten to upstream function entries and keep the `namespace` field on tool items — strict OpenAI-compat servers (vLLM/DS4) accept only `function` entries in `tools`.
+- Codex app-server commits assistant output/thinking on `response.output_item.added`→`.done` message and reasoning events — Spock emits those at the terminal (deltas alone render nothing in the GUI).
+- Inference needs **Spock with this `/v1/responses` inference proxy** (`0.5.0`+). An app bundle held by an older proxy keeps the refusal `POST /v1/responses is search-only; request has no web_search tool` — rebuild/reopen to pick it up.
 
 ### API Key backends (not OAuth)
 
@@ -453,7 +476,7 @@ spock help
 | `POST /v1/messages` | Anthropic Messages (stream + tools + thinking) |
 | `POST /v1/messages/count_tokens` | Rough estimate (chars/4) |
 | `POST /v1/chat/completions` | OpenAI-style (raw stream passthrough) |
-| `POST /v1/responses` | Search-only (grok-build `web_search`). Runs `[web_search]`; not a general Responses proxy |
+| `POST /v1/responses` | **Responses wire**: grok-build hosted `web_search` direct search (query string as input, search tools only) → `[web_search]` shim object; real generation bodies (input item array, e.g. Codex custom provider) → routed Chat Completions backend, answered as Responses JSON/SSE the client parses |
 | `GET /v1/models` | Curated catalog when configured, else merged backend lists + Claude aliases |
 | `GET /v1/models/{id}` | Never 404s for aliases |
 | `GET /v1/language-models*` | xAI extended list when available |
@@ -536,6 +559,8 @@ Workflows: [`.github/workflows/ci.yml`](.github/workflows/ci.yml), [`.github/wor
 | `tool_choice set but no tools` | Fixed when tools are stripped (server tools); upgrade Spock |
 | Auto Mode “claude-opus-… unavailable” | Often dead **opus** route or (older Spock) `reasoning_effort: none`. Point opus at a live backend; use Spock with the thinking-disabled fix |
 | `upstream 400: … is not a multimodal model` | Text-only backend received a screenshot. Set `text_only = true` on that backend (see [Vision](#vision-for-text-only-backends)); the poisoned session heals on the next request |
+| Codex custom provider answers with search citations / `search-only; no web_search tool` | Old Spock still has the search-only gate. Use **0.5.0+** (`/v1/responses` inference proxy shipped); rebuild `./packaging/macos/build-app.sh` and **Quit Spock → reopen** so the bundled proxy picks it up. |
+| Codex errors “missing env var… `spock`” | GUI app has no process env (`export spock=…` never reaches it). Remove `env_key` from `[model_providers.spock]` — the loopback listener accepts keyless requests; Codex builds the provider without an auth header. |
 | Claude Code `ECONNRESET` / Grok Build `reqwest error stream: error sending request` | Darwin `accept()` used to inherit `O_NONBLOCK` from the listen socket. Rebuild (`./packaging/macos/build-app.sh`) and restart Spock. If it still happens: `spock.log` should now show `route … [openai+stream]` and `spock openai stream: …` instead of a silent drop. Direct LAN vs SSH tunnel is a separate hop. |
 
 Proxy logs each request with the resolved route, e.g.:

@@ -4,7 +4,7 @@ use crate::models::{is_reasoning_model, sanitize_upstream, stop_reason};
 use serde_json::{json, Map, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn short_id(prefix: &str, n: usize) -> String {
+pub fn short_id(prefix: &str, n: usize) -> String {
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())

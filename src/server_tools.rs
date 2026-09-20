@@ -853,19 +853,30 @@ pub fn responses_query(body: &Value) -> Option<&str> {
     }
 }
 
+fn tool_is_web_search(t: &Value) -> bool {
+    let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
+    ty == "web_search"
+        || ty == "web_search_preview"
+        || ty.starts_with("web_search")
+        || t.get("name").and_then(|n| n.as_str()) == Some("web_search")
+}
+
 fn responses_has_web_search_tool(body: &Value) -> bool {
     body.get("tools")
         .and_then(|t| t.as_array())
-        .map(|arr| {
-            arr.iter().any(|t| {
-                let ty = t.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                ty == "web_search"
-                    || ty == "web_search_preview"
-                    || ty.starts_with("web_search")
-                    || t.get("name").and_then(|n| n.as_str()) == Some("web_search")
-            })
-        })
-        .unwrap_or(false)
+        .is_some_and(|arr| arr.iter().any(tool_is_web_search))
+}
+
+/// A **direct** hosted-search turn: `web_search` tool(s) present, `input` is the
+/// whole query as a string, and no non-search tool rides along — grok-build's
+/// POST shape. Real generation bodies carry an input item array (plus function
+/// tools), so this gate false → the inference lane.
+pub fn responses_direct_search(body: &Value) -> bool {
+    matches!(body.get("input"), Some(Value::String(_)))
+        && body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|arr| !arr.is_empty() && arr.iter().all(tool_is_web_search))
 }
 
 /// Search-only OpenAI Responses object for grok-build `web_search`.
@@ -1720,6 +1731,32 @@ mod tests {
         };
         let err = responses_web_search(&cfg, &json!({"input":"hi"})).unwrap_err();
         assert!(err.to_string().contains("search-only"), "{err}");
+    }
+
+    #[test]
+    fn responses_direct_search_gate() {
+        let direct = json!({
+            "input": "  Qwen3.8 27B abliterated  ",
+            "tools": [{ "type": "web_search" }]
+        });
+        assert!(responses_direct_search(&direct));
+        // a real generation body: input item array + function tool alongside
+        let gen_body = json!({
+            "input": [{ "type": "message", "role": "user", "content": "hi" }],
+            "tools": [
+                { "type": "function", "name": "Bash" },
+                { "type": "web_search" }
+            ]
+        });
+        assert!(!responses_direct_search(&gen_body));
+        // string input with NO web tool → inference lane (Responses-only clients)
+        assert!(!responses_direct_search(&json!({"input": "hi"})));
+        // item array carrying only the search tool still generates, not direct searches
+        let item_search = json!({
+            "input": [{ "type": "message", "role": "user", "content": "hi" }],
+            "tools": [{ "type": "web_search" }]
+        });
+        assert!(!responses_direct_search(&item_search));
     }
 
     #[test]

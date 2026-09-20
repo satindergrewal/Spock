@@ -70,7 +70,7 @@ Ship as commented examples + optional Settings “Add preset…” — **no new 
 
 | Vendor / API | Why not free | Scope |
 |---|---|---|
-| **OpenAI Responses API** (`/v1/responses`) | Different request/response + SSE than Chat Completions; some GPT/Codex paths want this | New family or openai dialect flag `api = "responses"` |
+| **OpenAI Responses API** (`/v1/responses`) | Different request/response + SSE than Chat Completions; some GPT/Codex paths want this | **Inbound proxy shipped** (0.5.0: Responses-only clients → routed chat backend); upstream flag `use_responses_api` still off |
 | **Azure OpenAI** | Resource URL + `api-key` header + deployment name in path | openai dialect + deployment routing |
 | **Anthropic direct** | Already Messages-shaped; Spock currently *translates to* OpenAI — passthrough mode would skip translation | Optional `type = "anthropic"` passthrough for dual-stack |
 | **Google Gemini native** | Non-OpenAI schema | Only if OpenAI-compat endpoint is insufficient |
